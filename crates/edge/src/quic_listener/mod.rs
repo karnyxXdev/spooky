@@ -85,6 +85,31 @@ fn is_hop_header(name: &str) -> bool {
     )
 }
 
+fn should_strip_bootstrap_request_header(name: &http::header::HeaderName) -> bool {
+    if name == http::header::CONTENT_LENGTH {
+        return true;
+    }
+
+    if name == http::header::CONNECTION
+        || name == http::header::PROXY_AUTHENTICATE
+        || name == http::header::PROXY_AUTHORIZATION
+        || name == http::header::TE
+        || name == http::header::TRAILER
+        || name == http::header::TRANSFER_ENCODING
+        || name == http::header::UPGRADE
+        || name.as_str().eq_ignore_ascii_case("keep-alive")
+        || name.as_str().eq_ignore_ascii_case("proxy-connection")
+        || name.as_str().eq_ignore_ascii_case("forwarded")
+        || name.as_str().eq_ignore_ascii_case("x-forwarded-for")
+        || name.as_str().eq_ignore_ascii_case("x-forwarded-proto")
+        || name.as_str().eq_ignore_ascii_case("x-forwarded-host")
+    {
+        return true;
+    }
+
+    false
+}
+
 type BootstrapServiceFuture = std::pin::Pin<
     Box<
         dyn std::future::Future<
@@ -3780,14 +3805,7 @@ impl QUICListener {
 
                             for (name, value) in req.headers() {
                                 if name == http::header::HOST
-                                    || name == http::header::CONNECTION
-                                    || name == http::header::UPGRADE
-                                    || name == http::header::PROXY_AUTHORIZATION
-                                    || name.as_str() == "keep-alive"
-                                    || name.as_str() == "proxy-connection"
-                                    || name.as_str() == "te"
-                                    || name.as_str() == "trailers"
-                                    || name.as_str() == "transfer-encoding"
+                                    || should_strip_bootstrap_request_header(name)
                                 {
                                     continue;
                                 }

@@ -23,7 +23,7 @@ use log::{debug, error, info, warn};
 use quiche::Config;
 use quiche::h3::NameValue;
 use rand::RngCore;
-use rustls::ServerConfig as RustlsServerConfig;
+use rustls::{RootCertStore, ServerConfig as RustlsServerConfig, server::WebPkiClientVerifier};
 use serde_json::json;
 use socket2::{Domain, Protocol, Socket, Type};
 use spooky_bridge::h3_to_h2::{ForwardedContext, build_h2_request_for_endpoint};
@@ -3447,7 +3447,7 @@ impl QUICListener {
             ))
         })?;
 
-        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        let server_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
             certs(&mut BufReader::new(cert_bytes.as_slice()))
                 .collect::<Result<_, _>>()
                 .map_err(|err| ProxyError::Tls(format!("failed to parse TLS cert PEM: {}", err)))?;
@@ -3478,9 +3478,64 @@ impl QUICListener {
             }
         };
 
-        let mut tls_config = RustlsServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
+        let builder = if config.listen.tls.client_auth.enabled {
+            let ca_file = config
+                .listen
+                .tls
+                .client_auth
+                .ca_file
+                .as_ref()
+                .ok_or_else(|| {
+                    ProxyError::Tls(
+                        "listen.tls.client_auth.ca_file is required when mTLS is enabled"
+                            .to_string(),
+                    )
+                })?;
+            let ca_bytes = std::fs::read(ca_file).map_err(|err| {
+                ProxyError::Tls(format!(
+                    "failed to read listen.tls.client_auth.ca_file '{}': {}",
+                    ca_file, err
+                ))
+            })?;
+            let client_ca_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+                certs(&mut BufReader::new(ca_bytes.as_slice()))
+                    .collect::<Result<_, _>>()
+                    .map_err(|err| {
+                        ProxyError::Tls(format!(
+                            "failed to parse listen.tls.client_auth.ca_file PEM: {}",
+                            err
+                        ))
+                    })?;
+            let mut roots = RootCertStore::empty();
+            for cert in client_ca_certs {
+                roots.add(cert).map_err(|err| {
+                    ProxyError::Tls(format!(
+                        "failed to add certificate from listen.tls.client_auth.ca_file '{}': {}",
+                        ca_file, err
+                    ))
+                })?;
+            }
+
+            let verifier_builder = WebPkiClientVerifier::builder(Arc::new(roots));
+            let verifier = if config.listen.tls.client_auth.require_client_cert {
+                verifier_builder.build()
+            } else {
+                verifier_builder.allow_unauthenticated().build()
+            }
+            .map_err(|err| {
+                ProxyError::Tls(format!(
+                    "failed to build downstream client certificate verifier: {}",
+                    err
+                ))
+            })?;
+
+            RustlsServerConfig::builder().with_client_cert_verifier(verifier)
+        } else {
+            RustlsServerConfig::builder().with_no_client_auth()
+        };
+
+        let mut tls_config = builder
+            .with_single_cert(server_certs, key)
             .map_err(|err| {
                 ProxyError::Tls(format!("failed to build rustls ServerConfig: {}", err))
             })?;

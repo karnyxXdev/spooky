@@ -117,6 +117,26 @@ fn bootstrap_forwarded_for_value(ip: std::net::IpAddr) -> String {
     }
 }
 
+fn bootstrap_resolution_error_response(reason: &str) -> (StatusCode, &'static [u8]) {
+    if reason.starts_with("no route for ") {
+        return (StatusCode::BAD_GATEWAY, b"no route\n");
+    }
+    if reason.starts_with("pool not found:") {
+        return (StatusCode::BAD_GATEWAY, b"no pool\n");
+    }
+    if reason == "upstream pool lock poisoned" {
+        return (StatusCode::BAD_GATEWAY, b"pool error\n");
+    }
+    if reason == "no servers in upstream" || reason == "invalid server address" {
+        return (StatusCode::SERVICE_UNAVAILABLE, b"no backends\n");
+    }
+    if reason == "no healthy servers" {
+        return (StatusCode::SERVICE_UNAVAILABLE, b"no healthy backends\n");
+    }
+
+    (StatusCode::BAD_GATEWAY, b"route/backend resolution failed\n")
+}
+
 type BootstrapServiceFuture = std::pin::Pin<
     Box<
         dyn std::future::Future<
@@ -3736,42 +3756,17 @@ impl QUICListener {
                                 match resolved {
                                     Ok(value) => value,
                                     Err(ProxyError::Transport(reason)) => {
-                                        if reason.starts_with("no route for ") {
-                                            return bootstrap_error(
-                                                StatusCode::BAD_GATEWAY,
-                                                b"no route\n",
-                                            );
-                                        }
-                                        if reason == "pool not found" || reason.starts_with("pool not found:") {
-                                            return bootstrap_error(
-                                                StatusCode::BAD_GATEWAY,
-                                                b"no pool\n",
-                                            );
-                                        }
-                                        if reason == "upstream pool lock poisoned" {
-                                            return bootstrap_error(
-                                                StatusCode::BAD_GATEWAY,
-                                                b"pool error\n",
-                                            );
-                                        }
-                                        if reason == "no servers in upstream"
-                                            || reason == "no healthy servers"
-                                            || reason == "invalid server address"
+                                        let (status, body) =
+                                            bootstrap_resolution_error_response(&reason);
+                                        if status == StatusCode::BAD_GATEWAY
+                                            && body == b"route/backend resolution failed\n"
                                         {
-                                            return bootstrap_error(
-                                                StatusCode::SERVICE_UNAVAILABLE,
-                                                b"no backends\n",
+                                            warn!(
+                                                "Bootstrap route/backend resolution failed: {}",
+                                                reason
                                             );
                                         }
-
-                                        warn!(
-                                            "Bootstrap route/backend resolution failed: {}",
-                                            reason
-                                        );
-                                        return bootstrap_error(
-                                            StatusCode::BAD_GATEWAY,
-                                            b"route/backend resolution failed\n",
-                                        );
+                                        return bootstrap_error(status, body);
                                     }
                                     Err(err) => {
                                         warn!("Bootstrap route/backend resolution failed: {}", err);

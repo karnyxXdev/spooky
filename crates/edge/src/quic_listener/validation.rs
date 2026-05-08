@@ -136,20 +136,100 @@ pub(super) fn validate_request_headers(
         }
     };
 
-    if method.trim().is_empty() || method.as_bytes().iter().any(|b| b.is_ascii_whitespace()) {
+    validate_request_parts(
+        method,
+        path,
+        authority,
+        host,
+        resilience,
+        RequestPartErrors {
+            invalid_method: b"invalid :method header\n",
+            invalid_path: b"invalid :path header\n",
+            authority_mismatch: b":authority and host headers must match\n",
+        },
+    )
+}
+
+pub(super) fn validate_http_request(
+    req: &http::Request<Incoming>,
+    resilience: &RuntimeResilience,
+) -> Result<RequestValidationResult, (http::StatusCode, &'static [u8], bool)> {
+    let header_count = req.headers().len().saturating_add(2);
+    if header_count > resilience.max_headers_count {
         return Err((
-            http::StatusCode::BAD_REQUEST,
-            b"invalid :method header\n",
+            http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            b"too many request headers\n",
             false,
         ));
     }
 
+    let mut header_bytes = req.method().as_str().len() + req.uri().path().len();
+    let authority = req.uri().authority().map(|a| a.as_str().to_owned());
+    let host = req
+        .headers()
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    if let Some(authority_value) = authority.as_deref() {
+        header_bytes = header_bytes.saturating_add(authority_value.len());
+    }
+    if let Some(host_value) = host.as_deref() {
+        header_bytes =
+            header_bytes.saturating_add(http::header::HOST.as_str().len() + host_value.len());
+    }
+
+    for (name, value) in req.headers() {
+        header_bytes = header_bytes.saturating_add(name.as_str().len() + value.as_bytes().len());
+        if header_bytes > resilience.max_headers_bytes {
+            return Err((
+                http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                b"request headers exceed size limit\n",
+                false,
+            ));
+        }
+    }
+
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+
+    validate_request_parts(
+        req.method().as_str().to_string(),
+        path.to_string(),
+        authority,
+        host,
+        resilience,
+        RequestPartErrors {
+            invalid_method: b"invalid method header\n",
+            invalid_path: b"invalid path header\n",
+            authority_mismatch: b"authority and host headers must match\n",
+        },
+    )
+}
+
+struct RequestPartErrors {
+    invalid_method: &'static [u8],
+    invalid_path: &'static [u8],
+    authority_mismatch: &'static [u8],
+}
+
+fn validate_request_parts(
+    method: String,
+    path: String,
+    authority: Option<String>,
+    host: Option<String>,
+    resilience: &RuntimeResilience,
+    errors: RequestPartErrors,
+) -> Result<RequestValidationResult, (http::StatusCode, &'static [u8], bool)> {
+    if method.trim().is_empty() || method.as_bytes().iter().any(|b| b.is_ascii_whitespace()) {
+        return Err((http::StatusCode::BAD_REQUEST, errors.invalid_method, false));
+    }
+
     if path.is_empty() || !path.starts_with('/') {
-        return Err((
-            http::StatusCode::BAD_REQUEST,
-            b"invalid :path header\n",
-            false,
-        ));
+        return Err((http::StatusCode::BAD_REQUEST, errors.invalid_path, false));
     }
 
     if resilience.enforce_authority_host_match
@@ -162,7 +242,7 @@ pub(super) fn validate_request_headers(
         if normalized_authority != normalized_host {
             return Err((
                 http::StatusCode::BAD_REQUEST,
-                b":authority and host headers must match\n",
+                errors.authority_mismatch,
                 false,
             ));
         }

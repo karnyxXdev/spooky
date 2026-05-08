@@ -23,7 +23,7 @@ use log::{debug, error, info, warn};
 use quiche::Config;
 use quiche::h3::NameValue;
 use rand::RngCore;
-use rustls::ServerConfig as RustlsServerConfig;
+use rustls::{RootCertStore, ServerConfig as RustlsServerConfig, server::WebPkiClientVerifier};
 use serde_json::json;
 use socket2::{Domain, Protocol, Socket, Type};
 use spooky_bridge::h3_to_h2::{ForwardedContext, build_h2_request_for_endpoint};
@@ -75,7 +75,7 @@ use health_check::classify_active_health_check_response;
 pub(crate) use token_bucket::TokenBucket;
 use validation::{
     RequestBufferError, extract_header_value, generated_span_id, generated_trace_id,
-    parse_traceparent, request_content_length, validate_request_headers,
+    parse_traceparent, request_content_length, validate_http_request, validate_request_headers,
 };
 
 fn is_hop_header(name: &str) -> bool {
@@ -83,6 +83,38 @@ fn is_hop_header(name: &str) -> bool {
         name,
         "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade"
     )
+}
+
+fn should_strip_bootstrap_request_header(name: &http::header::HeaderName) -> bool {
+    if name == http::header::CONTENT_LENGTH {
+        return true;
+    }
+
+    if name == http::header::CONNECTION
+        || name == http::header::PROXY_AUTHENTICATE
+        || name == http::header::PROXY_AUTHORIZATION
+        || name == http::header::TE
+        || name == http::header::TRAILER
+        || name == http::header::TRANSFER_ENCODING
+        || name == http::header::UPGRADE
+        || name.as_str().eq_ignore_ascii_case("keep-alive")
+        || name.as_str().eq_ignore_ascii_case("proxy-connection")
+        || name.as_str().eq_ignore_ascii_case("forwarded")
+        || name.as_str().eq_ignore_ascii_case("x-forwarded-for")
+        || name.as_str().eq_ignore_ascii_case("x-forwarded-proto")
+        || name.as_str().eq_ignore_ascii_case("x-forwarded-host")
+    {
+        return true;
+    }
+
+    false
+}
+
+fn bootstrap_forwarded_for_value(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => format!("\"[{}]\"", v6),
+    }
 }
 
 type BootstrapServiceFuture = std::pin::Pin<
@@ -3447,7 +3479,7 @@ impl QUICListener {
             ))
         })?;
 
-        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        let server_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
             certs(&mut BufReader::new(cert_bytes.as_slice()))
                 .collect::<Result<_, _>>()
                 .map_err(|err| ProxyError::Tls(format!("failed to parse TLS cert PEM: {}", err)))?;
@@ -3478,12 +3510,65 @@ impl QUICListener {
             }
         };
 
-        let mut tls_config = RustlsServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|err| {
-                ProxyError::Tls(format!("failed to build rustls ServerConfig: {}", err))
+        let builder = if config.listen.tls.client_auth.enabled {
+            let ca_file = config
+                .listen
+                .tls
+                .client_auth
+                .ca_file
+                .as_ref()
+                .ok_or_else(|| {
+                    ProxyError::Tls(
+                        "listen.tls.client_auth.ca_file is required when mTLS is enabled"
+                            .to_string(),
+                    )
+                })?;
+            let ca_bytes = std::fs::read(ca_file).map_err(|err| {
+                ProxyError::Tls(format!(
+                    "failed to read listen.tls.client_auth.ca_file '{}': {}",
+                    ca_file, err
+                ))
             })?;
+            let client_ca_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+                certs(&mut BufReader::new(ca_bytes.as_slice()))
+                    .collect::<Result<_, _>>()
+                    .map_err(|err| {
+                        ProxyError::Tls(format!(
+                            "failed to parse listen.tls.client_auth.ca_file PEM: {}",
+                            err
+                        ))
+                    })?;
+            let mut roots = RootCertStore::empty();
+            for cert in client_ca_certs {
+                roots.add(cert).map_err(|err| {
+                    ProxyError::Tls(format!(
+                        "failed to add certificate from listen.tls.client_auth.ca_file '{}': {}",
+                        ca_file, err
+                    ))
+                })?;
+            }
+
+            let verifier_builder = WebPkiClientVerifier::builder(Arc::new(roots));
+            let verifier = if config.listen.tls.client_auth.require_client_cert {
+                verifier_builder.build()
+            } else {
+                verifier_builder.allow_unauthenticated().build()
+            }
+            .map_err(|err| {
+                ProxyError::Tls(format!(
+                    "failed to build downstream client certificate verifier: {}",
+                    err
+                ))
+            })?;
+
+            RustlsServerConfig::builder().with_client_cert_verifier(verifier)
+        } else {
+            RustlsServerConfig::builder().with_no_client_auth()
+        };
+
+        let mut tls_config = builder.with_single_cert(server_certs, key).map_err(|err| {
+            ProxyError::Tls(format!("failed to build rustls ServerConfig: {}", err))
+        })?;
 
         tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
@@ -3511,6 +3596,8 @@ impl QUICListener {
 
         let h2_pool = Arc::clone(&shared_state.h2_pool);
         let backend_endpoints = Arc::clone(&shared_state.backend_endpoints);
+        let metrics = Arc::clone(&shared_state.metrics);
+        let resilience = Arc::clone(&shared_state.resilience);
         let upstream_pools = shared_state.upstream_pools.clone();
         let routing_index = RouteIndex::from_upstreams(&config.upstream);
 
@@ -3571,6 +3658,8 @@ impl QUICListener {
                 let alt_svc = alt_svc_value.clone();
                 let h2_pool = Arc::clone(&h2_pool);
                 let backend_endpoints = Arc::clone(&backend_endpoints);
+                let metrics = Arc::clone(&metrics);
+                let resilience = Arc::clone(&resilience);
                 let upstream_pools = upstream_pools.clone();
                 let routing_index = Arc::clone(&routing_index);
 
@@ -3593,26 +3682,37 @@ impl QUICListener {
                         let alt = alt_svc_conn.clone();
                         let h2_pool = Arc::clone(&h2_pool);
                         let backend_endpoints = Arc::clone(&backend_endpoints);
+                        let metrics = Arc::clone(&metrics);
+                        let resilience = Arc::clone(&resilience);
                         let upstream_pools = upstream_pools.clone();
                         let routing_index = Arc::clone(&routing_index);
 
                         Box::pin(async move {
-                            let _method = req.method().to_string();
-                            let path = req
-                                .uri()
-                                .path_and_query()
-                                .map(|pq| pq.as_str().to_owned())
-                                .unwrap_or_else(|| "/".to_string());
-                            let authority = req
-                                .uri()
-                                .authority()
-                                .map(|a| a.as_str().to_owned())
-                                .or_else(|| {
-                                    req.headers()
-                                        .get(http::header::HOST)
-                                        .and_then(|v| v.to_str().ok())
-                                        .map(str::to_owned)
-                                });
+                            let request = match validate_http_request(&req, &resilience) {
+                                Ok(request) => request,
+                                Err((status, body, is_policy)) => {
+                                    metrics.inc_failure();
+                                    metrics.inc_request_validation_reject();
+                                    if is_policy {
+                                        metrics.inc_policy_denied();
+                                    }
+                                    metrics.record_route(
+                                        "unrouted",
+                                        Duration::from_millis(0),
+                                        RouteOutcome::Failure,
+                                    );
+                                    return Ok(Response::builder()
+                                        .status(status)
+                                        .header("alt-svc", &alt)
+                                        .body(Full::new(Bytes::copy_from_slice(body)))
+                                        .unwrap_or_else(|_| {
+                                            Response::new(Full::new(Bytes::new()))
+                                        }));
+                                }
+                            };
+                            let method = request.method;
+                            let path = request.path;
+                            let authority = request.authority;
 
                             // Route lookup
                             let upstream_name = routing_index.lookup(&path, authority.as_deref());
@@ -3706,20 +3806,12 @@ impl QUICListener {
                                     }
                                 };
 
-                            let mut upstream_req = Request::builder()
-                                .method(req.method().clone())
-                                .uri(upstream_uri);
+                            let mut upstream_req =
+                                Request::builder().method(method.as_str()).uri(upstream_uri);
 
                             for (name, value) in req.headers() {
                                 if name == http::header::HOST
-                                    || name == http::header::CONNECTION
-                                    || name == http::header::UPGRADE
-                                    || name == http::header::PROXY_AUTHORIZATION
-                                    || name.as_str() == "keep-alive"
-                                    || name.as_str() == "proxy-connection"
-                                    || name.as_str() == "te"
-                                    || name.as_str() == "trailers"
-                                    || name.as_str() == "transfer-encoding"
+                                    || should_strip_bootstrap_request_header(name)
                                 {
                                     continue;
                                 }
@@ -3729,8 +3821,13 @@ impl QUICListener {
                                 http::header::HOST,
                                 authority.as_deref().unwrap_or(endpoint.authority()),
                             );
-                            upstream_req = upstream_req
-                                .header("forwarded", format!("for={};proto=https", peer.ip()));
+                            upstream_req = upstream_req.header(
+                                "forwarded",
+                                format!(
+                                    "for={};proto=https",
+                                    bootstrap_forwarded_for_value(peer.ip())
+                                ),
+                            );
 
                             let body_bytes = match req.into_body().collect().await {
                                 Ok(collected) => collected.to_bytes(),

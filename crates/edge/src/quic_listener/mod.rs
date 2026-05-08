@@ -117,6 +117,29 @@ fn bootstrap_forwarded_for_value(ip: std::net::IpAddr) -> String {
     }
 }
 
+fn bootstrap_resolution_error_response(reason: &str) -> (StatusCode, &'static [u8]) {
+    if reason.starts_with("no route for ") {
+        return (StatusCode::BAD_GATEWAY, b"no route\n");
+    }
+    if reason.starts_with("pool not found:") {
+        return (StatusCode::BAD_GATEWAY, b"no pool\n");
+    }
+    if reason == "upstream pool lock poisoned" {
+        return (StatusCode::BAD_GATEWAY, b"pool error\n");
+    }
+    if reason == "no servers in upstream" || reason == "invalid server address" {
+        return (StatusCode::SERVICE_UNAVAILABLE, b"no backends\n");
+    }
+    if reason == "no healthy servers" {
+        return (StatusCode::SERVICE_UNAVAILABLE, b"no healthy backends\n");
+    }
+
+    (
+        StatusCode::BAD_GATEWAY,
+        b"route/backend resolution failed\n",
+    )
+}
+
 type BootstrapServiceFuture = std::pin::Pin<
     Box<
         dyn std::future::Future<
@@ -3714,66 +3737,50 @@ impl QUICListener {
                             let path = request.path;
                             let authority = request.authority;
 
-                            // Route lookup
-                            let upstream_name = routing_index.lookup(&path, authority.as_deref());
-                            let upstream_name = match upstream_name {
-                                Some(name) => name.to_string(),
-                                None => {
-                                    return Ok(Response::builder()
-                                        .status(StatusCode::BAD_GATEWAY)
-                                        .header("alt-svc", &alt)
-                                        .body(Full::new(Bytes::from_static(b"no route\n")))
-                                        .unwrap_or_else(|_| {
-                                            Response::new(Full::new(Bytes::from_static(b"error\n")))
-                                        }));
-                                }
+                            let bootstrap_error = |status: StatusCode, body: &'static [u8]| {
+                                Ok(Response::builder()
+                                    .status(status)
+                                    .header("alt-svc", &alt)
+                                    .body(Full::new(Bytes::from_static(body)))
+                                    .unwrap_or_else(|_| {
+                                        Response::new(Full::new(Bytes::from_static(b"error\n")))
+                                    }))
                             };
 
-                            // Pick backend
-                            let backend_addr = {
-                                let pool_lock = match upstream_pools.get(&upstream_name) {
-                                    Some(p) => p,
-                                    None => {
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::BAD_GATEWAY)
-                                            .header("alt-svc", &alt)
-                                            .body(Full::new(Bytes::from_static(b"no pool\n")))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(Full::new(Bytes::from_static(
-                                                    b"error\n",
-                                                )))
-                                            }));
+                            // Preserve the same route-lookup + tie-break semantics as the QUIC
+                            // data plane by delegating bootstrap backend resolution here.
+                            let resolved = Self::resolve_backend(
+                                &method,
+                                &path,
+                                authority.as_deref(),
+                                None,
+                                &upstream_pools,
+                                &routing_index,
+                            );
+                            let (_upstream_name, backend_addr, _backend_index, _pool, _lb, _, _, _) =
+                                match resolved {
+                                    Ok(value) => value,
+                                    Err(ProxyError::Transport(reason)) => {
+                                        let (status, body) =
+                                            bootstrap_resolution_error_response(&reason);
+                                        if status == StatusCode::BAD_GATEWAY
+                                            && body == b"route/backend resolution failed\n"
+                                        {
+                                            warn!(
+                                                "Bootstrap route/backend resolution failed: {}",
+                                                reason
+                                            );
+                                        }
+                                        return bootstrap_error(status, body);
+                                    }
+                                    Err(err) => {
+                                        warn!("Bootstrap route/backend resolution failed: {}", err);
+                                        return bootstrap_error(
+                                            StatusCode::BAD_GATEWAY,
+                                            b"route/backend resolution failed\n",
+                                        );
                                     }
                                 };
-                                let pool = match pool_lock.read() {
-                                    Ok(p) => p,
-                                    Err(_) => {
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::BAD_GATEWAY)
-                                            .header("alt-svc", &alt)
-                                            .body(Full::new(Bytes::from_static(b"pool error\n")))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(Full::new(Bytes::from_static(
-                                                    b"error\n",
-                                                )))
-                                            }));
-                                    }
-                                };
-                                match pool.pool.address(0).map(str::to_owned) {
-                                    Some(addr) => addr,
-                                    None => {
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::SERVICE_UNAVAILABLE)
-                                            .header("alt-svc", &alt)
-                                            .body(Full::new(Bytes::from_static(b"no backends\n")))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(Full::new(Bytes::from_static(
-                                                    b"error\n",
-                                                )))
-                                            }));
-                                    }
-                                }
-                            };
 
                             let endpoint = match backend_endpoints.get(&backend_addr) {
                                 Some(ep) => ep.clone(),
@@ -4067,7 +4074,12 @@ static FALLBACK_RT_THREADS: AtomicUsize = AtomicUsize::new(2);
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, RwLock},
+    };
+
+    use spooky_config::config::{Backend, LoadBalancing, RouteMatch, Upstream};
 
     use crate::REQUEST_ID_COUNTER;
     use crate::cid_radix::CidRadix;
@@ -4089,6 +4101,129 @@ mod tests {
 
     fn cid(bytes: &[u8]) -> Arc<[u8]> {
         Arc::from(bytes)
+    }
+
+    fn test_upstream(lb_type: &str) -> Upstream {
+        Upstream {
+            load_balancing: LoadBalancing {
+                lb_type: lb_type.to_string(),
+                key: None,
+            },
+            route: RouteMatch {
+                host: None,
+                path_prefix: Some("/api".to_string()),
+                method: None,
+            },
+            backends: vec![
+                Backend {
+                    id: "b1".to_string(),
+                    address: "127.0.0.1:7001".to_string(),
+                    weight: 1,
+                    health_check: None,
+                },
+                Backend {
+                    id: "b2".to_string(),
+                    address: "127.0.0.1:7002".to_string(),
+                    weight: 1,
+                    health_check: None,
+                },
+            ],
+        }
+    }
+
+    type TestRoutingContext = (
+        HashMap<String, Arc<RwLock<super::UpstreamPool>>>,
+        super::RouteIndex,
+        Arc<RwLock<super::UpstreamPool>>,
+    );
+
+    fn test_routing_context(lb_type: &str) -> TestRoutingContext {
+        let mut upstreams = HashMap::new();
+        upstreams.insert("api_pool".to_string(), test_upstream(lb_type));
+        let routing_index = super::RouteIndex::from_upstreams(&upstreams);
+        let pool = super::UpstreamPool::from_upstream(upstreams.get("api_pool").expect("upstream"))
+            .expect("pool");
+        let pool = Arc::new(RwLock::new(pool));
+        let mut upstream_pools = HashMap::new();
+        upstream_pools.insert("api_pool".to_string(), Arc::clone(&pool));
+        (upstream_pools, routing_index, pool)
+    }
+
+    #[test]
+    fn resolve_backend_round_robin_is_not_pinned_to_first_backend() {
+        let (upstream_pools, routing_index, _pool) = test_routing_context("round-robin");
+
+        let mut picks = Vec::new();
+        for _ in 0..4 {
+            let (_upstream, backend, _, _, _, _, _, _) = super::QUICListener::resolve_backend(
+                "GET",
+                "/api/items",
+                None,
+                None,
+                &upstream_pools,
+                &routing_index,
+            )
+            .expect("resolve backend");
+            picks.push(backend);
+        }
+
+        assert!(
+            picks.iter().any(|addr| addr == "127.0.0.1:7001")
+                && picks.iter().any(|addr| addr == "127.0.0.1:7002"),
+            "round-robin resolution should not pin all bootstrap picks to the first backend: {:?}",
+            picks
+        );
+    }
+
+    #[test]
+    fn resolve_backend_skips_unhealthy_backends() {
+        let (upstream_pools, routing_index, pool) = test_routing_context("round-robin");
+        {
+            let mut guard = pool.write().expect("pool write");
+            guard.pool.mark_failure(0);
+            guard.pool.mark_failure(0);
+            guard.pool.mark_failure(0);
+        }
+
+        let (_upstream, backend, _, _, _, _, _, _) = super::QUICListener::resolve_backend(
+            "GET",
+            "/api/items",
+            None,
+            None,
+            &upstream_pools,
+            &routing_index,
+        )
+        .expect("resolve backend");
+
+        assert_eq!(
+            backend, "127.0.0.1:7002",
+            "unhealthy backend must be excluded from bootstrap backend selection"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_respects_least_connections_strategy() {
+        let (upstream_pools, routing_index, pool) = test_routing_context("least-connections");
+        {
+            let guard = pool.read().expect("pool read");
+            guard.pool.begin_request(0);
+            guard.pool.begin_request(0);
+        }
+
+        let (_upstream, backend, _, _, _, _, _, _) = super::QUICListener::resolve_backend(
+            "GET",
+            "/api/items",
+            None,
+            None,
+            &upstream_pools,
+            &routing_index,
+        )
+        .expect("resolve backend");
+
+        assert_eq!(
+            backend, "127.0.0.1:7002",
+            "least-connections should prefer lower in-flight backend in bootstrap selection"
+        );
     }
 
     #[test]

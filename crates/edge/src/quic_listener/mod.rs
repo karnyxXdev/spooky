@@ -3603,11 +3603,7 @@ impl QUICListener {
     }
 
     fn build_bootstrap_tls_acceptor(config: &SpookyConfig) -> Result<TlsAcceptor, ProxyError> {
-        Self::build_server_tls_acceptor(
-            config,
-            true,
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-        )
+        Self::build_server_tls_acceptor(config, true, vec![b"h2".to_vec(), b"http/1.1".to_vec()])
     }
 
     fn spawn_bootstrap_tls_listener(

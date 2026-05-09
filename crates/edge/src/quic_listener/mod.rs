@@ -3645,12 +3645,15 @@ impl QUICListener {
                 bind, err
             )));
         }
-        let listener = tokio::net::TcpListener::from_std(std_listener).map_err(|err| {
-            ProxyError::Transport(format!(
-                "failed to register bootstrap TLS listener {}: {}",
-                bind, err
-            ))
-        })?;
+        let listener = {
+            let _guard = handle.enter();
+            tokio::net::TcpListener::from_std(std_listener).map_err(|err| {
+                ProxyError::Transport(format!(
+                    "failed to register bootstrap TLS listener {}: {}",
+                    bind, err
+                ))
+            })?
+        };
 
         let routing_index = Arc::new(routing_index);
 

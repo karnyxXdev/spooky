@@ -3602,16 +3602,12 @@ impl QUICListener {
         config: &SpookyConfig,
         shared_state: &SharedRuntimeState,
     ) -> Result<(), ProxyError> {
-        let acceptor = match Self::build_bootstrap_tls_acceptor(config) {
-            Ok(a) => a,
-            Err(err) => {
-                warn!(
-                    "Bootstrap TLS listener disabled (could not build TLS config): {}",
-                    err
-                );
-                return Ok(());
-            }
-        };
+        let acceptor = Self::build_bootstrap_tls_acceptor(config).map_err(|err| {
+            ProxyError::Tls(format!(
+                "failed to initialize bootstrap TLS listener config: {}",
+                err
+            ))
+        })?;
 
         let bind = format!("{}:{}", config.listen.address, config.listen.port);
         let alt_svc_value = format!("h3=\":{}\"; ma=86400", config.listen.port);
@@ -3630,43 +3626,35 @@ impl QUICListener {
         let handle = match runtime_handle() {
             Some(h) => h,
             None => {
-                warn!("Bootstrap TLS listener disabled (no Tokio runtime available)");
-                return Ok(());
+                return Err(ProxyError::Transport(
+                    "failed to start bootstrap TLS listener: no Tokio runtime available"
+                        .to_string(),
+                ));
             }
         };
 
-        let std_listener = match std::net::TcpListener::bind(&bind) {
-            Ok(l) => l,
-            Err(err) => {
-                warn!(
-                    "Bootstrap TLS listener could not bind TCP {}: {} \
-                    (browser HTTP/3 discovery will not work; Alt-Svc will only come from QUIC responses)",
-                    bind, err
-                );
-                return Ok(());
-            }
-        };
-        if let Err(err) = std_listener.set_nonblocking(true) {
-            warn!(
-                "Bootstrap TLS listener set_nonblocking failed ({}): {}",
+        let std_listener = std::net::TcpListener::bind(&bind).map_err(|err| {
+            ProxyError::Transport(format!(
+                "failed to bind bootstrap TLS listener on {}: {}",
                 bind, err
-            );
-            return Ok(());
+            ))
+        })?;
+        if let Err(err) = std_listener.set_nonblocking(true) {
+            return Err(ProxyError::Transport(format!(
+                "failed to set bootstrap TLS listener nonblocking ({}): {}",
+                bind, err
+            )));
         }
+        let listener = tokio::net::TcpListener::from_std(std_listener).map_err(|err| {
+            ProxyError::Transport(format!(
+                "failed to register bootstrap TLS listener {}: {}",
+                bind, err
+            ))
+        })?;
 
         let routing_index = Arc::new(routing_index);
 
         spawn_supervised_async_task(&handle, "bootstrap-tls-listener", None, async move {
-            let listener = match tokio::net::TcpListener::from_std(std_listener) {
-                Ok(l) => l,
-                Err(err) => {
-                    warn!(
-                        "Bootstrap TLS listener registration failed ({}): {}",
-                        bind, err
-                    );
-                    return;
-                }
-            };
             info!(
                 "Bootstrap TLS listener on https://{} (TCP+TLS) — advertising Alt-Svc: {} (max_connections={}, connection_timeout_ms={})",
                 bind,

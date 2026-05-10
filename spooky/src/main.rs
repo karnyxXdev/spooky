@@ -1,7 +1,7 @@
 //! Spooky HTTP/3 Load Balancer - Main Entry Point
 
-use std::path::Path;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 mod privilege_drop;
 mod runtime_guard;

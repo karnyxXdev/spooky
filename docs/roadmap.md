@@ -143,7 +143,7 @@
 1. Async data plane - unblock main thread
 2. Configuration hot reload - reduce operational friction
 3. Streaming bodies - reduce memory usage
-4. TLS peer verification - production security
+4. mTLS operational tooling - certificate lifecycle automation
 
 ### Medium Priority (3-6 months)
 

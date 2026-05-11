@@ -65,6 +65,7 @@ use crate::{
     outcome_from_status,
     resilience::{RouteQueueRejection, RuntimeResilience},
     route_index::{RouteDecisionReason, RouteIndex, normalize_host_for_routing},
+    types::QuicConnectionErrorSnapshot,
     watchdog::{WatchdogCoordinator, WatchdogRuntimeConfig, now_millis},
 };
 
@@ -891,6 +892,8 @@ impl QUICListener {
             routing_scids: HashSet::from([Arc::from(&scid_bytes[..])]),
             packets_since_rotation: 0,
             last_scid_rotation: Instant::now(),
+            last_peer_error_snapshot: None,
+            last_local_error_snapshot: None,
         };
 
         // Store connection using server's SCID (not client's DCID)
@@ -1243,11 +1246,23 @@ impl QUICListener {
         }
 
         if let Some(err) = connection.quic.peer_error() {
-            error!("QUIC peer error: {:?}", err);
+            maybe_log_quic_connection_error(
+                "peer",
+                connection.peer_address,
+                connection.quic.trace_id(),
+                err,
+                &mut connection.last_peer_error_snapshot,
+            );
         }
 
         if let Some(err) = connection.quic.local_error() {
-            error!("QUIC local error: {:?}", err);
+            maybe_log_quic_connection_error(
+                "local",
+                connection.peer_address,
+                connection.quic.trace_id(),
+                err,
+                &mut connection.last_local_error_snapshot,
+            );
         }
 
         connection.last_activity = Instant::now();
@@ -4350,6 +4365,68 @@ fn classify_retry_reason(err: &ProxyError) -> RetryReason {
         ProxyError::Pool(_) => RetryReason::BackendPool,
         _ => RetryReason::BackendTransport,
     }
+}
+
+fn is_benign_quic_close(err: &quiche::ConnectionError) -> bool {
+    !err.is_app && err.error_code == 0 && err.reason.is_empty()
+}
+
+fn log_quic_connection_error(
+    source: &str,
+    peer: SocketAddr,
+    trace_id: &str,
+    err: &quiche::ConnectionError,
+) {
+    if is_benign_quic_close(err) {
+        debug!(
+            "QUIC {} close without error: peer={} trace_id={} is_app={} error_code={} reason_len={}",
+            source,
+            peer,
+            trace_id,
+            err.is_app,
+            err.error_code,
+            err.reason.len()
+        );
+        return;
+    }
+
+    if err.reason.is_empty() {
+        error!(
+            "QUIC {} error: peer={} trace_id={} is_app={} error_code={}",
+            source, peer, trace_id, err.is_app, err.error_code
+        );
+    } else {
+        error!(
+            "QUIC {} error: peer={} trace_id={} is_app={} error_code={} reason={}",
+            source,
+            peer,
+            trace_id,
+            err.is_app,
+            err.error_code,
+            String::from_utf8_lossy(&err.reason)
+        );
+    }
+}
+
+fn maybe_log_quic_connection_error(
+    source: &str,
+    peer: SocketAddr,
+    trace_id: &str,
+    err: &quiche::ConnectionError,
+    last_logged: &mut Option<QuicConnectionErrorSnapshot>,
+) {
+    let snapshot = QuicConnectionErrorSnapshot {
+        is_app: err.is_app,
+        error_code: err.error_code,
+        reason: err.reason.clone(),
+    };
+
+    if last_logged.as_ref() == Some(&snapshot) {
+        return;
+    }
+
+    *last_logged = Some(snapshot);
+    log_quic_connection_error(source, peer, trace_id, err);
 }
 
 pub fn configure_async_runtime(worker_threads: usize) {

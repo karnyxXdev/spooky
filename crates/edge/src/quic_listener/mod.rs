@@ -18,9 +18,11 @@ use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::{Body, Frame, Incoming};
+use hyper::client::conn::http1 as client_http1;
 use hyper::server::conn::http1;
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
+use hyper::upgrade;
 use hyper_util::rt::TokioIo;
 use log::{debug, error, info, warn};
 use quiche::Config;
@@ -43,7 +45,10 @@ use tokio::sync::{
 use tokio_rustls::TlsAcceptor;
 use tracing::{Instrument, info_span};
 
-use spooky_config::{backend_endpoint::BackendEndpoint, config::Config as SpookyConfig};
+use spooky_config::{
+    backend_endpoint::{BackendEndpoint, BackendScheme},
+    config::Config as SpookyConfig,
+};
 
 use crate::{
     ChannelBody, ForwardResult, HealthClassification, Metrics, OverloadShedReason, QUICListener,
@@ -113,6 +118,37 @@ fn should_strip_bootstrap_request_header(name: &http::header::HeaderName) -> boo
     false
 }
 
+fn header_has_token(value: &http::HeaderValue, token: &str) -> bool {
+    value
+        .to_str()
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(token))
+        })
+        .unwrap_or(false)
+}
+
+fn is_websocket_upgrade_request(req: &Request<Incoming>, use_h2: bool) -> bool {
+    if use_h2 || req.method() != http::Method::GET {
+        return false;
+    }
+    let Some(upgrade_header) = req.headers().get(http::header::UPGRADE) else {
+        return false;
+    };
+    if !upgrade_header
+        .to_str()
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    req.headers()
+        .get(http::header::CONNECTION)
+        .map(|v| header_has_token(v, "upgrade"))
+        .unwrap_or(false)
+}
+
 fn bootstrap_forwarded_for_value(ip: std::net::IpAddr) -> String {
     match ip {
         std::net::IpAddr::V4(v4) => v4.to_string(),
@@ -147,7 +183,9 @@ type BootstrapServiceFuture = std::pin::Pin<
     Box<
         dyn std::future::Future<
                 Output = Result<
-                    hyper::Response<http_body_util::combinators::BoxBody<hyper::body::Bytes, Infallible>>,
+                    hyper::Response<
+                        http_body_util::combinators::BoxBody<hyper::body::Bytes, Infallible>,
+                    >,
                     hyper::Error,
                 >,
             > + Send,
@@ -3758,64 +3796,85 @@ impl QUICListener {
                     let io = TokioIo::new(tls_stream);
                     let alt_svc_conn = alt_svc.clone();
 
-                    let svc = service_fn(move |req: Request<Incoming>| -> BootstrapServiceFuture {
-                        let alt = alt_svc_conn.clone();
-                        let h2_pool = Arc::clone(&h2_pool);
-                        let backend_endpoints = Arc::clone(&backend_endpoints);
-                        let metrics = Arc::clone(&metrics);
-                        let resilience = Arc::clone(&resilience);
-                        let upstream_pools = upstream_pools.clone();
-                        let routing_index = Arc::clone(&routing_index);
-                        let max_request_body_bytes = max_request_body_bytes;
-                        let max_response_body_bytes = max_response_body_bytes;
+                    let svc = service_fn(
+                        move |mut req: Request<Incoming>| -> BootstrapServiceFuture {
+                            let alt = alt_svc_conn.clone();
+                            let h2_pool = Arc::clone(&h2_pool);
+                            let backend_endpoints = Arc::clone(&backend_endpoints);
+                            let metrics = Arc::clone(&metrics);
+                            let resilience = Arc::clone(&resilience);
+                            let upstream_pools = upstream_pools.clone();
+                            let routing_index = Arc::clone(&routing_index);
+                            let max_request_body_bytes = max_request_body_bytes;
+                            let max_response_body_bytes = max_response_body_bytes;
 
-                        Box::pin(async move {
-                            let request = match validate_http_request(&req, &resilience) {
-                                Ok(request) => request,
-                                Err((status, body, is_policy)) => {
-                                    metrics.inc_failure();
-                                    metrics.inc_request_validation_reject();
-                                    if is_policy {
-                                        metrics.inc_policy_denied();
+                            Box::pin(async move {
+                                let is_websocket_upgrade =
+                                    is_websocket_upgrade_request(&req, use_h2);
+                                let client_upgrade = if is_websocket_upgrade {
+                                    Some(upgrade::on(&mut req))
+                                } else {
+                                    None
+                                };
+
+                                let request = match validate_http_request(&req, &resilience) {
+                                    Ok(request) => request,
+                                    Err((status, body, is_policy)) => {
+                                        metrics.inc_failure();
+                                        metrics.inc_request_validation_reject();
+                                        if is_policy {
+                                            metrics.inc_policy_denied();
+                                        }
+                                        metrics.record_route(
+                                            "unrouted",
+                                            Duration::from_millis(0),
+                                            RouteOutcome::Failure,
+                                        );
+                                        return Ok(Response::builder()
+                                            .status(status)
+                                            .header("alt-svc", &alt)
+                                            .body(boxed_full(Bytes::copy_from_slice(body)))
+                                            .unwrap_or_else(|_| {
+                                                Response::new(boxed_full(Bytes::new()))
+                                            }));
                                     }
-                                    metrics.record_route(
-                                        "unrouted",
-                                        Duration::from_millis(0),
-                                        RouteOutcome::Failure,
-                                    );
-                                    return Ok(Response::builder()
+                                };
+                                let method = request.method;
+                                let path = request.path;
+                                let authority = request.authority;
+
+                                let bootstrap_error = |status: StatusCode, body: &'static [u8]| {
+                                    Ok(Response::builder()
                                         .status(status)
                                         .header("alt-svc", &alt)
-                                        .body(boxed_full(Bytes::copy_from_slice(body)))
-                                        .unwrap_or_else(|_| Response::new(boxed_full(Bytes::new()))));
-                                }
-                            };
-                            let method = request.method;
-                            let path = request.path;
-                            let authority = request.authority;
+                                        .body(boxed_full(Bytes::from_static(body)))
+                                        .unwrap_or_else(|_| {
+                                            Response::new(boxed_full(Bytes::from_static(
+                                                b"error\n",
+                                            )))
+                                        }))
+                                };
 
-                            let bootstrap_error = |status: StatusCode, body: &'static [u8]| {
-                                Ok(Response::builder()
-                                    .status(status)
-                                    .header("alt-svc", &alt)
-                                    .body(boxed_full(Bytes::from_static(body)))
-                                    .unwrap_or_else(|_| {
-                                        Response::new(boxed_full(Bytes::from_static(b"error\n")))
-                                    }))
-                            };
-
-                            // Preserve the same route-lookup + tie-break semantics as the QUIC
-                            // data plane by delegating bootstrap backend resolution here.
-                            let resolved = Self::resolve_backend(
-                                &method,
-                                &path,
-                                authority.as_deref(),
-                                None,
-                                &upstream_pools,
-                                &routing_index,
-                            );
-                            let (_upstream_name, backend_addr, _backend_index, _pool, _lb, _, _, _) =
-                                match resolved {
+                                // Preserve the same route-lookup + tie-break semantics as the QUIC
+                                // data plane by delegating bootstrap backend resolution here.
+                                let resolved = Self::resolve_backend(
+                                    &method,
+                                    &path,
+                                    authority.as_deref(),
+                                    None,
+                                    &upstream_pools,
+                                    &routing_index,
+                                );
+                                let (
+                                    _upstream_name,
+                                    backend_addr,
+                                    _backend_index,
+                                    _pool,
+                                    _lb,
+                                    _,
+                                    _,
+                                    _,
+                                ) = match resolved {
                                     Ok(value) => value,
                                     Err(ProxyError::Transport(reason)) => {
                                         let (status, body) =
@@ -3839,23 +3898,26 @@ impl QUICListener {
                                     }
                                 };
 
-                            let endpoint = match backend_endpoints.get(&backend_addr) {
-                                Some(ep) => ep.clone(),
-                                None => {
-                                    return Ok(Response::builder()
-                                        .status(StatusCode::BAD_GATEWAY)
-                                        .header("alt-svc", &alt)
-                                        .body(boxed_full(Bytes::from_static(b"no endpoint\n")))
-                                        .unwrap_or_else(|_| {
-                                            Response::new(boxed_full(Bytes::from_static(b"error\n")))
-                                        }));
-                                }
-                            };
+                                let endpoint = match backend_endpoints.get(&backend_addr) {
+                                    Some(ep) => ep.clone(),
+                                    None => {
+                                        return Ok(Response::builder()
+                                            .status(StatusCode::BAD_GATEWAY)
+                                            .header("alt-svc", &alt)
+                                            .body(boxed_full(Bytes::from_static(b"no endpoint\n")))
+                                            .unwrap_or_else(|_| {
+                                                Response::new(boxed_full(Bytes::from_static(
+                                                    b"error\n",
+                                                )))
+                                            }));
+                                    }
+                                };
 
-                            // Build upstream request
-                            let request_path = if path.is_empty() { "/" } else { &path };
-                            let upstream_uri =
-                                match http::Uri::try_from(endpoint.uri_for_path(request_path)) {
+                                // Build upstream request
+                                let request_path = if path.is_empty() { "/" } else { &path };
+                                let upstream_uri = match http::Uri::try_from(
+                                    endpoint.uri_for_path(request_path),
+                                ) {
                                     Ok(u) => u,
                                     Err(_) => {
                                         return Ok(Response::builder()
@@ -3870,132 +3932,356 @@ impl QUICListener {
                                     }
                                 };
 
-                            let mut upstream_req =
-                                Request::builder().method(method.as_str()).uri(upstream_uri);
+                                let mut upstream_req =
+                                    Request::builder().method(method.as_str()).uri(upstream_uri);
 
-                            for (name, value) in req.headers() {
-                                if name == http::header::HOST
-                                    || should_strip_bootstrap_request_header(name)
-                                {
-                                    continue;
+                                for (name, value) in req.headers() {
+                                    if name == http::header::HOST {
+                                        continue;
+                                    }
+                                    if !is_websocket_upgrade
+                                        && should_strip_bootstrap_request_header(name)
+                                    {
+                                        continue;
+                                    }
+                                    if is_websocket_upgrade
+                                        && (name == http::header::PROXY_AUTHORIZATION
+                                            || name == http::header::PROXY_AUTHENTICATE
+                                            || name
+                                                .as_str()
+                                                .eq_ignore_ascii_case("proxy-connection")
+                                            || name.as_str().eq_ignore_ascii_case("forwarded")
+                                            || name
+                                                .as_str()
+                                                .eq_ignore_ascii_case("x-forwarded-for")
+                                            || name
+                                                .as_str()
+                                                .eq_ignore_ascii_case("x-forwarded-proto")
+                                            || name
+                                                .as_str()
+                                                .eq_ignore_ascii_case("x-forwarded-host"))
+                                    {
+                                        continue;
+                                    }
+                                    upstream_req = upstream_req.header(name, value);
                                 }
-                                upstream_req = upstream_req.header(name, value);
-                            }
-                            upstream_req = upstream_req.header(
-                                http::header::HOST,
-                                authority.as_deref().unwrap_or(endpoint.authority()),
-                            );
-                            upstream_req = upstream_req.header(
-                                "forwarded",
-                                format!(
-                                    "for={};proto=https",
-                                    bootstrap_forwarded_for_value(peer.ip())
-                                ),
-                            );
+                                upstream_req = upstream_req.header(
+                                    http::header::HOST,
+                                    authority.as_deref().unwrap_or(endpoint.authority()),
+                                );
+                                upstream_req = upstream_req.header(
+                                    "forwarded",
+                                    format!(
+                                        "for={};proto=https",
+                                        bootstrap_forwarded_for_value(peer.ip())
+                                    ),
+                                );
 
-                            if let Some(content_length) = req
-                                .headers()
-                                .get(http::header::CONTENT_LENGTH)
-                                .and_then(|v| v.to_str().ok())
-                                .and_then(|s| s.parse::<usize>().ok())
-                                && content_length > max_request_body_bytes
-                            {
-                                return Ok(Response::builder()
-                                    .status(StatusCode::PAYLOAD_TOO_LARGE)
-                                    .header("alt-svc", &alt)
-                                    .body(boxed_full(Bytes::from_static(b"request body too large\n")))
-                                    .unwrap_or_else(|_| {
-                                        Response::new(boxed_full(Bytes::from_static(b"error\n")))
-                                    }));
-                            }
-
-                            let upstream_req = match upstream_req.body(
-                                BootstrapStreamingBody::new(req.into_body())
-                                    .map_err(|never| match never {})
-                                    .boxed(),
-                            ) {
-                                Ok(r) => r,
-                                Err(_) => {
+                                if !is_websocket_upgrade
+                                    && let Some(content_length) = req
+                                        .headers()
+                                        .get(http::header::CONTENT_LENGTH)
+                                        .and_then(|v| v.to_str().ok())
+                                        .and_then(|s| s.parse::<usize>().ok())
+                                    && content_length > max_request_body_bytes
+                                {
                                     return Ok(Response::builder()
-                                        .status(StatusCode::BAD_GATEWAY)
+                                        .status(StatusCode::PAYLOAD_TOO_LARGE)
                                         .header("alt-svc", &alt)
                                         .body(boxed_full(Bytes::from_static(
-                                            b"request build error\n",
+                                            b"request body too large\n",
                                         )))
                                         .unwrap_or_else(|_| {
-                                            Response::new(boxed_full(Bytes::from_static(b"error\n")))
+                                            Response::new(boxed_full(Bytes::from_static(
+                                                b"error\n",
+                                            )))
                                         }));
                                 }
-                            };
-                            let upstream_resp = match tokio::time::timeout(
-                                backend_timeout,
-                                h2_pool.send(&backend_addr, upstream_req),
-                            )
-                            .await
-                            {
-                                Ok(Ok(resp)) => resp,
-                                Ok(Err(err)) => {
-                                    warn!("Bootstrap proxy upstream error: {}", err);
-                                    return Ok(Response::builder()
-                                        .status(StatusCode::BAD_GATEWAY)
-                                        .header("alt-svc", &alt)
-                                        .body(boxed_full(Bytes::from_static(b"upstream error\n")))
-                                        .unwrap_or_else(|_| {
-                                            Response::new(boxed_full(Bytes::from_static(b"error\n")))
-                                        }));
-                                }
-                                Err(_) => {
-                                    return Ok(Response::builder()
-                                        .status(StatusCode::GATEWAY_TIMEOUT)
-                                        .header("alt-svc", &alt)
-                                        .body(boxed_full(Bytes::from_static(b"upstream timeout\n")))
-                                        .unwrap_or_else(|_| {
-                                            Response::new(boxed_full(Bytes::from_static(b"error\n")))
-                                        }));
-                                }
-                            };
 
-                            // Build downstream response with Alt-Svc injected
-                            if let Some(content_length) = upstream_resp
-                                .headers()
-                                .get(http::header::CONTENT_LENGTH)
-                                .and_then(|v| v.to_str().ok())
-                                .and_then(|s| s.parse::<usize>().ok())
-                                && content_length > max_response_body_bytes
-                            {
-                                return Ok(Response::builder()
-                                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                                    .header("alt-svc", &alt)
-                                    .body(boxed_full(Bytes::from_static(
-                                        b"upstream response body too large\n",
-                                    )))
-                                    .unwrap_or_else(|_| {
-                                        Response::new(boxed_full(Bytes::from_static(b"error\n")))
-                                    }));
-                            }
+                                let upstream_req = match if is_websocket_upgrade {
+                                    upstream_req.body(boxed_full(Bytes::new()))
+                                } else {
+                                    upstream_req.body(
+                                        BootstrapStreamingBody::new(req.into_body())
+                                            .map_err(|never| match never {})
+                                            .boxed(),
+                                    )
+                                } {
+                                    Ok(r) => r,
+                                    Err(_) => {
+                                        return Ok(Response::builder()
+                                            .status(StatusCode::BAD_GATEWAY)
+                                            .header("alt-svc", &alt)
+                                            .body(boxed_full(Bytes::from_static(
+                                                b"request build error\n",
+                                            )))
+                                            .unwrap_or_else(|_| {
+                                                Response::new(boxed_full(Bytes::from_static(
+                                                    b"error\n",
+                                                )))
+                                            }));
+                                    }
+                                };
+                                let mut upstream_resp = if is_websocket_upgrade {
+                                    if endpoint.scheme() != BackendScheme::Http {
+                                        return Ok(Response::builder()
+                                            .status(StatusCode::BAD_GATEWAY)
+                                            .header("alt-svc", &alt)
+                                            .body(boxed_full(Bytes::from_static(
+                                                b"websocket bootstrap requires http upstream\n",
+                                            )))
+                                            .unwrap_or_else(|_| {
+                                                Response::new(boxed_full(Bytes::from_static(
+                                                    b"error\n",
+                                                )))
+                                            }));
+                                    }
+                                    let backend_target = endpoint.authority().to_string();
+                                    let upstream_path_uri = match http::Uri::try_from(request_path)
+                                    {
+                                        Ok(uri) => uri,
+                                        Err(_) => {
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::BAD_GATEWAY)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(b"bad uri\n")))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
+                                    };
+                                    let (mut parts, body) = upstream_req.into_parts();
+                                    parts.uri = upstream_path_uri;
+                                    let upstream_req = Request::from_parts(parts, body);
 
-                            let status = upstream_resp.status();
-                            let mut resp_builder = Response::builder().status(status);
-                            for (name, value) in upstream_resp.headers() {
-                                if name == http::header::CONNECTION
-                                    || name.as_str() == "keep-alive"
-                                    || name.as_str() == "transfer-encoding"
-                                    || name.as_str() == "alt-svc"
+                                    let stream = match tokio::time::timeout(
+                                        backend_timeout,
+                                        tokio::net::TcpStream::connect(&backend_target),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(s)) => s,
+                                        Ok(Err(err)) => {
+                                            warn!("Bootstrap WebSocket connect error: {}", err);
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::BAD_GATEWAY)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"upstream error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
+                                        Err(_) => {
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::GATEWAY_TIMEOUT)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"upstream timeout\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
+                                    };
+                                    let io = TokioIo::new(stream);
+                                    let (mut sender, conn) = match client_http1::handshake(io).await
+                                    {
+                                        Ok(v) => v,
+                                        Err(err) => {
+                                            warn!(
+                                                "Bootstrap WebSocket handshake setup failed: {}",
+                                                err
+                                            );
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::BAD_GATEWAY)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"upstream error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
+                                    };
+                                    tokio::spawn(async move {
+                                        let _ = conn.with_upgrades().await;
+                                    });
+                                    match tokio::time::timeout(
+                                        backend_timeout,
+                                        sender.send_request(upstream_req),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(resp)) => resp,
+                                        Ok(Err(err)) => {
+                                            warn!("Bootstrap WebSocket upstream error: {}", err);
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::BAD_GATEWAY)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"upstream error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
+                                        Err(_) => {
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::GATEWAY_TIMEOUT)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"upstream timeout\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
+                                    }
+                                } else {
+                                    match tokio::time::timeout(
+                                        backend_timeout,
+                                        h2_pool.send(&backend_addr, upstream_req),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(resp)) => resp,
+                                        Ok(Err(err)) => {
+                                            warn!("Bootstrap proxy upstream error: {}", err);
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::BAD_GATEWAY)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"upstream error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
+                                        Err(_) => {
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::GATEWAY_TIMEOUT)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"upstream timeout\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
+                                    }
+                                };
+
+                                // Build downstream response with Alt-Svc injected
+                                if let Some(content_length) = upstream_resp
+                                    .headers()
+                                    .get(http::header::CONTENT_LENGTH)
+                                    .and_then(|v| v.to_str().ok())
+                                    .and_then(|s| s.parse::<usize>().ok())
+                                    && content_length > max_response_body_bytes
                                 {
-                                    continue;
+                                    return Ok(Response::builder()
+                                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                                        .header("alt-svc", &alt)
+                                        .body(boxed_full(Bytes::from_static(
+                                            b"upstream response body too large\n",
+                                        )))
+                                        .unwrap_or_else(|_| {
+                                            Response::new(boxed_full(Bytes::from_static(
+                                                b"error\n",
+                                            )))
+                                        }));
                                 }
-                                resp_builder = resp_builder.header(name, value);
-                            }
-                            resp_builder = resp_builder.header("alt-svc", &alt);
-                            let resp_body = BootstrapStreamingBody::new(upstream_resp.into_body())
-                                .map_err(|never| match never {})
-                                .boxed();
 
-                            Ok(resp_builder
-                                .body(resp_body)
-                                .unwrap_or_else(|_| Response::new(boxed_full(Bytes::new()))))
-                        })
-                    });
+                                let status = upstream_resp.status();
+                                let mut resp_builder = Response::builder().status(status);
+                                for (name, value) in upstream_resp.headers() {
+                                    if name == http::header::CONNECTION
+                                        || name.as_str() == "keep-alive"
+                                        || name.as_str() == "transfer-encoding"
+                                        || name.as_str() == "alt-svc"
+                                    {
+                                        continue;
+                                    }
+                                    resp_builder = resp_builder.header(name, value);
+                                }
+                                resp_builder = resp_builder.header("alt-svc", &alt);
+                                if is_websocket_upgrade
+                                    && upstream_resp.status() == StatusCode::SWITCHING_PROTOCOLS
+                                {
+                                    let client_upgrade = match client_upgrade {
+                                        Some(u) => u,
+                                        None => {
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::BAD_GATEWAY)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"upgrade setup error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
+                                    };
+                                    let upstream_upgrade = upgrade::on(&mut upstream_resp);
+                                    tokio::spawn(async move {
+                                        let (client, upstream) = match tokio::try_join!(
+                                            client_upgrade,
+                                            upstream_upgrade
+                                        ) {
+                                            Ok(v) => v,
+                                            Err(err) => {
+                                                debug!(
+                                                    "Bootstrap WebSocket upgrade join failed: {}",
+                                                    err
+                                                );
+                                                return;
+                                            }
+                                        };
+                                        let mut client = TokioIo::new(client);
+                                        let mut upstream = TokioIo::new(upstream);
+                                        let _ = tokio::io::copy_bidirectional(
+                                            &mut client,
+                                            &mut upstream,
+                                        )
+                                        .await;
+                                    });
+                                    return Ok(resp_builder
+                                        .body(boxed_full(Bytes::new()))
+                                        .unwrap_or_else(|_| {
+                                            Response::new(boxed_full(Bytes::new()))
+                                        }));
+                                }
+                                let resp_body =
+                                    BootstrapStreamingBody::new(upstream_resp.into_body())
+                                        .map_err(|never| match never {})
+                                        .boxed();
+
+                                Ok(resp_builder
+                                    .body(resp_body)
+                                    .unwrap_or_else(|_| Response::new(boxed_full(Bytes::new()))))
+                            })
+                        },
+                    );
 
                     if use_h2 {
                         let executor = hyper_util::rt::TokioExecutor::new();
@@ -4010,7 +4296,9 @@ impl QUICListener {
                             }
                         }
                     } else {
-                        let serve = http1::Builder::new().serve_connection(io, svc);
+                        let serve = http1::Builder::new()
+                            .serve_connection(io, svc)
+                            .with_upgrades();
                         match tokio::time::timeout(timeout, serve).await {
                             Ok(Ok(())) => {}
                             Ok(Err(err)) => {

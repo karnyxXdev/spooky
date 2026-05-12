@@ -109,3 +109,6 @@ site/
 deptest/
 
 bench/*
+
+# Packaging 
+*.deb

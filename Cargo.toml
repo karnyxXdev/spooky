@@ -49,4 +49,4 @@ opentelemetry-otlp = { version = "0.28.0", features = ["grpc-tonic", "trace"] }
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "Elastic-2.0"
+license = "GPLv3"

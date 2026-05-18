@@ -264,4 +264,4 @@ cargo clippy
 
 ## License
 
-Elastic License 2.0 (ELv2) - see [LICENSE](LICENSE.md)
+GNU General Public License v3.0 (GPLv3) - see [LICENSE](LICENSE.md)

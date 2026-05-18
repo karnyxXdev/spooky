@@ -111,4 +111,4 @@ See [contributing guide](CONTRIBUTING.md) for development guidelines.
 
 ## License
 
-Elastic License 2.0 (ELv2) — see [LICENSE.md](LICENSE.md)
+GNU General Public License v3.0 (GPLv3) — see [LICENSE.md](LICENSE.md)

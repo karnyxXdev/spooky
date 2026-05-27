@@ -321,7 +321,9 @@ impl QUICListener {
                     b"upstream error\n",
                 )
             }
-            Err(ProxyError::Pool(pool_err)) if Self::is_internal_pool_control_error(&pool_err) => {
+            Err(ProxyError::Pool(pool_err @ PoolError::InflightLimiterClosed))
+            | Err(ProxyError::Pool(pool_err @ PoolError::UnknownBackend(_))) => {
+                debug_assert!(Self::is_internal_pool_control_error(&pool_err));
                 match &pool_err {
                     PoolError::InflightLimiterClosed => {
                         error!("Upstream pool inflight limiter closed");

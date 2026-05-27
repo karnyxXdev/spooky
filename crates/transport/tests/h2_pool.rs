@@ -94,10 +94,7 @@ async fn pool_limits_inflight_per_backend() {
             64,
             Duration::from_secs(30),
             Duration::from_secs(2),
-            TlsClientConfig {
-                verify_certificates: false,
-                ..TlsClientConfig::default()
-            },
+            TlsClientConfig::default(),
         )
         .expect("pool"),
     );
@@ -145,10 +142,7 @@ async fn pool_rejects_unknown_backend() {
         64,
         Duration::from_secs(30),
         Duration::from_secs(2),
-        TlsClientConfig {
-            verify_certificates: false,
-            ..TlsClientConfig::default()
-        },
+        TlsClientConfig::default(),
     )
     .expect("pool");
     let req = Request::builder()
@@ -176,10 +170,7 @@ async fn pool_reports_overload_when_inflight_is_exhausted() {
             64,
             Duration::from_secs(30),
             Duration::from_secs(2),
-            TlsClientConfig {
-                verify_certificates: false,
-                ..TlsClientConfig::default()
-            },
+            TlsClientConfig::default(),
         )
         .expect("pool"),
     );

@@ -61,6 +61,15 @@ async fn wait_for_shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+fn fatal_startup_error(message: &str, logger_ready: bool, exit_code: i32) -> ! {
+    if logger_ready {
+        error!("{}", message);
+    } else {
+        eprintln!("Error: {}", message);
+    }
+    std::process::exit(exit_code);
+}
+
 fn main() {
     // Parse CLI arguments
     let cli = Cli::parse();
@@ -70,11 +79,14 @@ fn main() {
         Some(path) => path,
         None if Path::new(DEFAULT_CONFIG_PATH).exists() => DEFAULT_CONFIG_PATH.to_string(),
         None => {
-            eprintln!(
-                "Error: no --config provided and default config '{}' was not found.",
-                DEFAULT_CONFIG_PATH
+            fatal_startup_error(
+                &format!(
+                    "no --config provided and default config '{}' was not found.",
+                    DEFAULT_CONFIG_PATH
+                ),
+                false,
+                2,
             );
-            std::process::exit(2);
         }
     };
 
@@ -82,21 +94,9 @@ fn main() {
     let config_yaml = match spooky_config::loader::read_config(&config_path) {
         Ok(cfg) => cfg,
         Err(err_msg) => {
-            eprintln!("Error loading config: {}", err_msg);
-            std::process::exit(1);
+            fatal_startup_error(&format!("loading config failed: {}", err_msg), false, 1);
         }
     };
-
-    // Require root only when binding a privileged port (< 1024).
-    let uid = unsafe { libc::getuid() };
-    if uid != 0 && config_yaml.listen.port < 1024 {
-        eprintln!(
-            "Binding privileged port {} requires root or CAP_NET_BIND_SERVICE. \
-Use a port >= 1024 for unprivileged startup.",
-            config_yaml.listen.port,
-        );
-        std::process::exit(1);
-    }
 
     // Initialize the Logger
     spooky_utils::logger::init_logger(
@@ -113,10 +113,22 @@ Use a port >= 1024 for unprivileged startup.",
     );
     runtime_guard::install_panic_hook();
 
+    // Require root only when binding a privileged port (< 1024).
+    let uid = unsafe { libc::getuid() };
+    if uid != 0 && config_yaml.listen.port < 1024 {
+        fatal_startup_error(
+            &format!(
+                "binding privileged port {} requires root or CAP_NET_BIND_SERVICE. Use a port >= 1024 for unprivileged startup.",
+                config_yaml.listen.port
+            ),
+            true,
+            1,
+        );
+    }
+
     // Validate Configurations
     if !validate_config(&config_yaml) {
-        error!("Configuration validation failed. Exiting...");
-        std::process::exit(1);
+        fatal_startup_error("Configuration validation failed. Exiting...", true, 1);
     }
 
     let control_plane_threads = config_yaml.performance.control_plane_threads.max(1);
@@ -130,11 +142,14 @@ Use a port >= 1024 for unprivileged startup.",
     {
         Ok(runtime) => runtime,
         Err(err) => {
-            error!(
-                "Failed to initialize Tokio control-plane runtime (threads={}): {}",
-                control_plane_threads, err
+            fatal_startup_error(
+                &format!(
+                    "Failed to initialize Tokio control-plane runtime (threads={}): {}",
+                    control_plane_threads, err
+                ),
+                true,
+                1,
             );
-            std::process::exit(1);
         }
     };
 
@@ -150,17 +165,8 @@ async fn run(config_yaml: Config, uid: libc::uid_t) {
         }
     };
 
-    let requested_workers = config_yaml.performance.worker_threads.max(1);
+    let worker_count = config_yaml.performance.worker_threads.max(1);
     let shard_count = config_yaml.performance.packet_shards_per_worker.max(1);
-    let worker_count = if requested_workers > 1 && !config_yaml.performance.reuseport {
-        warn!(
-            "reuseport disabled while worker_threads={} configured; running a single data-plane worker",
-            requested_workers
-        );
-        1
-    } else {
-        requested_workers
-    };
     let effective_worker_count = worker_count.saturating_mul(shard_count);
     if let Err(err) =
         QUICListener::spawn_control_plane_tasks(&config_yaml, &shared_state, effective_worker_count)

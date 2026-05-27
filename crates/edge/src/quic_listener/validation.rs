@@ -342,3 +342,77 @@ pub(super) fn generated_trace_id(conn_trace_id: &str, request_id: u64) -> String
 pub(super) fn generated_span_id(request_id: u64) -> String {
     format!("{:016x}", crate::stable_hash64(&request_id.to_be_bytes()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spooky_config::config::Resilience;
+
+    fn runtime_resilience() -> RuntimeResilience {
+        RuntimeResilience::from_config(&Resilience::default(), 1024)
+    }
+
+    fn h3_header(name: &'static [u8], value: &'static [u8]) -> quiche::h3::Header {
+        quiche::h3::Header::new(name, value)
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_method_header() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"GE\xffT"),
+            h3_header(b":path", b"/"),
+            h3_header(b":authority", b"example.com"),
+        ];
+
+        let err = validate_request_headers(&headers, &resilience).unwrap_err();
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"invalid :method header\n");
+        assert!(!err.2);
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_path_header() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"GET"),
+            h3_header(b":path", b"/\xff"),
+            h3_header(b":authority", b"example.com"),
+        ];
+
+        let err = validate_request_headers(&headers, &resilience).unwrap_err();
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"invalid :path header\n");
+        assert!(!err.2);
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_authority_header() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"GET"),
+            h3_header(b":path", b"/"),
+            h3_header(b":authority", b"exa\xffmple.com"),
+        ];
+
+        let err = validate_request_headers(&headers, &resilience).unwrap_err();
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"invalid :authority header\n");
+        assert!(!err.2);
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_host_header() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"GET"),
+            h3_header(b":path", b"/"),
+            h3_header(b"host", b"exa\xffmple.com"),
+        ];
+
+        let err = validate_request_headers(&headers, &resilience).unwrap_err();
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"invalid host header\n");
+        assert!(!err.2);
+    }
+}

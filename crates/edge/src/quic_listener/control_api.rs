@@ -565,3 +565,39 @@ impl QUICListener {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn watchdog_restart_env_keeps_path_when_present() {
+        let env = QUICListener::watchdog_restart_env(
+            Some(OsString::from("/usr/bin:/bin")),
+            "timeout_spike",
+        );
+        let map: HashMap<OsString, OsString> = env.into_iter().collect();
+
+        assert_eq!(
+            map.get(&OsString::from("PATH")),
+            Some(&OsString::from("/usr/bin:/bin"))
+        );
+        assert_eq!(
+            map.get(&OsString::from("SPOOKY_WATCHDOG_REASON")),
+            Some(&OsString::from("timeout_spike"))
+        );
+    }
+
+    #[test]
+    fn watchdog_restart_env_omits_path_when_missing() {
+        let env = QUICListener::watchdog_restart_env(None, "poll_stall");
+        let map: HashMap<OsString, OsString> = env.into_iter().collect();
+
+        assert!(!map.contains_key(&OsString::from("PATH")));
+        assert_eq!(
+            map.get(&OsString::from("SPOOKY_WATCHDOG_REASON")),
+            Some(&OsString::from("poll_stall"))
+        );
+    }
+}

@@ -4692,7 +4692,7 @@ mod tests {
 
     use crate::REQUEST_ID_COUNTER;
     use crate::cid_radix::CidRadix;
-    use http::StatusCode;
+    use http::{HeaderMap, HeaderValue, StatusCode};
 
     use std::collections::HashSet;
     use std::net::SocketAddr;
@@ -4700,7 +4700,8 @@ mod tests {
 
     use super::{
         ConnectionRoutes, TokenBucket, abort_stream, classify_active_health_check_response,
-        purge_connection_routes, resolve_primary_from_radix_prefix, sweep_closed_connections,
+        connection_header_tokens, purge_connection_routes, resolve_primary_from_radix_prefix,
+        should_strip_bootstrap_request_header, sweep_closed_connections,
     };
     type RoutingMaps = (
         HashMap<Arc<[u8]>, Arc<[u8]>>,
@@ -4958,6 +4959,47 @@ mod tests {
             classify_active_health_check_response(StatusCode::BAD_GATEWAY),
             crate::HealthClassification::Failure
         ));
+    }
+
+    #[test]
+    fn bootstrap_connection_header_tokens_are_parsed_case_insensitively() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("keep-alive, X-Secret"),
+        );
+        headers.append(
+            http::header::CONNECTION,
+            HeaderValue::from_static("x-another"),
+        );
+
+        let tokens = connection_header_tokens(&headers);
+        assert!(tokens.contains("keep-alive"));
+        assert!(tokens.contains("x-secret"));
+        assert!(tokens.contains("x-another"));
+    }
+
+    #[test]
+    fn bootstrap_header_filter_strips_connection_nominated_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("keep-alive, x-secret"),
+        );
+        let tokens = connection_header_tokens(&headers);
+
+        let header = http::HeaderName::from_static("x-secret");
+        assert!(should_strip_bootstrap_request_header(&header, &tokens));
+    }
+
+    #[test]
+    fn bootstrap_header_filter_keeps_non_nominated_custom_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONNECTION, HeaderValue::from_static("keep-alive"));
+        let tokens = connection_header_tokens(&headers);
+
+        let header = http::HeaderName::from_static("x-custom-keep");
+        assert!(!should_strip_bootstrap_request_header(&header, &tokens));
     }
 
     #[test]

@@ -39,7 +39,10 @@ impl ControlApiState {
 }
 
 impl QUICListener {
-    fn watchdog_restart_env(path: Option<OsString>, restart_reason: &str) -> Vec<(OsString, OsString)> {
+    fn watchdog_restart_env(
+        path: Option<OsString>,
+        restart_reason: &str,
+    ) -> Vec<(OsString, OsString)> {
         let mut env_vars = Vec::with_capacity(2);
         if let Some(path_value) = path {
             env_vars.push((OsString::from("PATH"), path_value));

@@ -291,9 +291,7 @@ impl QUICListener {
                     b"upstream error\n",
                 )
             }
-            Err(ProxyError::Transport(_))
-            | Err(ProxyError::Pool(PoolError::InflightLimiterClosed))
-            | Err(ProxyError::Pool(PoolError::UnknownBackend(_))) => {
+            Err(ProxyError::Transport(_)) => {
                 error!("Upstream transport error");
                 metrics.inc_health_failure(HealthFailureReason::Transport);
                 if let Some(pool) = &upstream_pool
@@ -304,6 +302,34 @@ impl QUICListener {
                 {
                     Self::log_health_transition(backend_addr, t);
                 }
+                metrics.inc_failure();
+                metrics.inc_backend_error();
+                metrics.record_route(route_label, start.elapsed(), RouteOutcome::BackendError);
+                Self::log_access(req, 502);
+                Self::send_simple_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    http::StatusCode::BAD_GATEWAY,
+                    b"upstream error\n",
+                )
+            }
+            Err(ProxyError::Pool(PoolError::InflightLimiterClosed)) => {
+                error!("Upstream pool inflight limiter closed");
+                metrics.inc_failure();
+                metrics.inc_backend_error();
+                metrics.record_route(route_label, start.elapsed(), RouteOutcome::BackendError);
+                Self::log_access(req, 502);
+                Self::send_simple_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    http::StatusCode::BAD_GATEWAY,
+                    b"upstream error\n",
+                )
+            }
+            Err(ProxyError::Pool(PoolError::UnknownBackend(_))) => {
+                error!("Upstream pool unknown backend");
                 metrics.inc_failure();
                 metrics.inc_backend_error();
                 metrics.record_route(route_label, start.elapsed(), RouteOutcome::BackendError);

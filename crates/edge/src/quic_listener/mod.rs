@@ -94,7 +94,31 @@ fn is_hop_header(name: &str) -> bool {
     )
 }
 
-fn should_strip_bootstrap_request_header(name: &http::header::HeaderName) -> bool {
+fn connection_header_tokens(headers: &http::HeaderMap) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    for value in headers.get_all(http::header::CONNECTION) {
+        let Ok(raw) = value.to_str() else {
+            continue;
+        };
+        for part in raw.split(',') {
+            let token = part.trim().to_ascii_lowercase();
+            if token.is_empty() {
+                continue;
+            }
+            tokens.insert(token);
+        }
+    }
+    tokens
+}
+
+fn should_strip_bootstrap_request_header(
+    name: &http::header::HeaderName,
+    connection_tokens: &HashSet<String>,
+) -> bool {
+    if connection_tokens.contains(name.as_str()) {
+        return true;
+    }
+
     if name == http::header::CONTENT_LENGTH {
         return true;
     }
@@ -4097,12 +4121,17 @@ impl QUICListener {
                                 let mut upstream_req =
                                     Request::builder().method(method.as_str()).uri(upstream_uri);
 
+                                let bootstrap_connection_tokens =
+                                    connection_header_tokens(req.headers());
                                 for (name, value) in req.headers() {
                                     if name == http::header::HOST {
                                         continue;
                                     }
                                     if !is_websocket_upgrade
-                                        && should_strip_bootstrap_request_header(name)
+                                        && should_strip_bootstrap_request_header(
+                                            name,
+                                            &bootstrap_connection_tokens,
+                                        )
                                     {
                                         continue;
                                     }

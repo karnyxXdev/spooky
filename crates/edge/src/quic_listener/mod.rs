@@ -90,7 +90,13 @@ use validation::{
 fn is_hop_header(name: &str) -> bool {
     matches!(
         name,
-        "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade"
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "transfer-encoding"
+            | "upgrade"
+            | "te"
+            | "trailer"
     )
 }
 
@@ -141,6 +147,15 @@ fn should_strip_bootstrap_request_header(
     }
 
     false
+}
+
+fn should_strip_h3_response_header(
+    name: &http::header::HeaderName,
+    connection_tokens: &HashSet<String>,
+) -> bool {
+    connection_tokens.contains(name.as_str())
+        || is_hop_header(name.as_str())
+        || name == http::header::CONTENT_LENGTH
 }
 
 fn header_has_token(value: &http::HeaderValue, token: &str) -> bool {
@@ -2792,9 +2807,9 @@ impl QUICListener {
                         }
 
                         let mut owned_h3_headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                        let response_connection_tokens = connection_header_tokens(&resp_headers);
                         for (name, value) in resp_headers.iter() {
-                            if is_hop_header(name.as_str()) || name == http::header::CONTENT_LENGTH
-                            {
+                            if should_strip_h3_response_header(name, &response_connection_tokens) {
                                 continue;
                             }
                             owned_h3_headers.push((
@@ -4701,7 +4716,8 @@ mod tests {
     use super::{
         ConnectionRoutes, TokenBucket, abort_stream, classify_active_health_check_response,
         connection_header_tokens, purge_connection_routes, resolve_primary_from_radix_prefix,
-        should_strip_bootstrap_request_header, sweep_closed_connections,
+        should_strip_bootstrap_request_header, should_strip_h3_response_header,
+        sweep_closed_connections,
     };
     type RoutingMaps = (
         HashMap<Arc<[u8]>, Arc<[u8]>>,
@@ -5003,6 +5019,28 @@ mod tests {
 
         let header = http::HeaderName::from_static("x-custom-keep");
         assert!(!should_strip_bootstrap_request_header(&header, &tokens));
+    }
+
+    #[test]
+    fn h3_response_filter_strips_te_and_trailer() {
+        let tokens = HashSet::new();
+        assert!(should_strip_h3_response_header(&http::header::TE, &tokens));
+        assert!(should_strip_h3_response_header(
+            &http::header::TRAILER,
+            &tokens
+        ));
+    }
+
+    #[test]
+    fn h3_response_filter_strips_connection_nominated_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("keep-alive, x-internal-hop"),
+        );
+        let tokens = connection_header_tokens(&headers);
+        let nominated = http::HeaderName::from_static("x-internal-hop");
+        assert!(should_strip_h3_response_header(&nominated, &tokens));
     }
 
     #[test]

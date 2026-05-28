@@ -84,7 +84,7 @@ use health_check::classify_active_health_check_response;
 pub(crate) use token_bucket::TokenBucket;
 use validation::{
     RequestBufferError, extract_header_value, generated_span_id, generated_trace_id,
-    parse_traceparent, request_content_length, validate_http_request, validate_request_headers,
+    parse_traceparent, validate_http_request, validate_request_headers,
 };
 
 fn is_hop_header(name: &str) -> bool {
@@ -627,8 +627,8 @@ impl QUICListener {
             request_buffer_global_cap_bytes,
             unknown_length_response_prebuffer_bytes,
             require_client_cert,
-            recv_buf: [0; MAX_DATAGRAM_SIZE_BYTES],
-            send_buf: [0; MAX_DATAGRAM_SIZE_BYTES],
+            recv_buf: Box::new([0; MAX_DATAGRAM_SIZE_BYTES]),
+            send_buf: Box::new([0; MAX_DATAGRAM_SIZE_BYTES]),
             connections: HashMap::new(),
             cid_routes: HashMap::new(),
             peer_routes: HashMap::new(),
@@ -1135,7 +1135,7 @@ impl QUICListener {
         }
 
         // Read a UDP datagram and feed it into quiche.
-        let (len, peer) = match self.socket.recv_from(&mut self.recv_buf) {
+        let (len, peer) = match self.socket.recv_from(self.recv_buf.as_mut_slice()) {
             Ok(v) => v,
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -1196,15 +1196,18 @@ impl QUICListener {
         let dcid = header.dcid.as_ref();
 
         if packet_type == quiche::Type::VersionNegotiation {
-            let len =
-                match quiche::negotiate_version(&header.scid, &header.dcid, &mut self.send_buf) {
-                    Ok(len) => len,
-                    Err(e) => {
-                        error!("Version negotiation failed: {:?}", e);
-                        self.metrics.inc_ingress_version_neg_failed();
-                        return;
-                    }
-                };
+            let len = match quiche::negotiate_version(
+                &header.scid,
+                &header.dcid,
+                self.send_buf.as_mut_slice(),
+            ) {
+                Ok(len) => len,
+                Err(e) => {
+                    error!("Version negotiation failed: {:?}", e);
+                    self.metrics.inc_ingress_version_neg_failed();
+                    return;
+                }
+            };
 
             if let Err(e) = self.socket.send_to(&self.send_buf[..len], peer) {
                 error!("Failed to send version negotiation: {:?}", e);
@@ -1686,6 +1689,7 @@ impl QUICListener {
                     let method = request.method;
                     let path = request.path;
                     let authority = request.authority;
+                    let content_length = request.content_length;
 
                     metrics.inc_total();
                     let request_start = Instant::now();
@@ -1972,7 +1976,6 @@ impl QUICListener {
                                     )
                                 },
                             );
-                            let content_length = request_content_length(&list);
                             let bodyless_mode = content_length.unwrap_or(0) == 0
                                 && (method.eq_ignore_ascii_case("GET")
                                     || method.eq_ignore_ascii_case("HEAD"));
@@ -4046,6 +4049,7 @@ impl QUICListener {
                                 let method = request.method;
                                 let path = request.path;
                                 let authority = request.authority;
+                                let content_length = request.content_length;
 
                                 let bootstrap_error = |status: StatusCode, body: &'static [u8]| {
                                     Ok(Response::builder()
@@ -4185,12 +4189,8 @@ impl QUICListener {
                                 );
 
                                 if !is_websocket_upgrade
-                                    && let Some(content_length) = req
-                                        .headers()
-                                        .get(http::header::CONTENT_LENGTH)
-                                        .and_then(|v| v.to_str().ok())
-                                        .and_then(|s| s.parse::<usize>().ok())
-                                    && content_length > max_request_body_bytes
+                                    && content_length
+                                        .is_some_and(|value| value > max_request_body_bytes)
                                 {
                                     return Ok(Response::builder()
                                         .status(StatusCode::PAYLOAD_TOO_LARGE)

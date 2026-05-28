@@ -1,27 +1,17 @@
 use super::*;
 
+#[derive(Debug)]
 pub(super) struct RequestValidationResult {
     pub(super) method: String,
     pub(super) path: String,
     pub(super) authority: Option<String>,
+    pub(super) content_length: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RequestBufferError {
     StreamCap,
     GlobalCap,
-}
-
-pub(super) fn request_content_length(headers: &[quiche::h3::Header]) -> Option<usize> {
-    for header in headers {
-        if !header.name().eq_ignore_ascii_case(b"content-length") {
-            continue;
-        }
-        let value = std::str::from_utf8(header.value()).ok()?;
-        let parsed = value.trim().parse::<usize>().ok()?;
-        return Some(parsed);
-    }
-    None
 }
 
 pub(super) fn validate_request_headers(
@@ -127,6 +117,8 @@ pub(super) fn validate_request_headers(
         }
     }
 
+    let content_length = parse_h3_content_length(list)?;
+
     let method = match method {
         Some(method) => method,
         None => {
@@ -153,6 +145,7 @@ pub(super) fn validate_request_headers(
         path,
         authority,
         host,
+        content_length,
         resilience,
         RequestPartErrors {
             invalid_method: b"invalid :method header\n",
@@ -215,12 +208,14 @@ pub(super) fn validate_http_request(
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
+    let content_length = parse_http_content_length(req.headers())?;
 
     validate_request_parts(
         req.method().as_str().to_string(),
         path.to_string(),
         authority,
         host,
+        content_length,
         resilience,
         RequestPartErrors {
             invalid_method: b"invalid method header\n",
@@ -250,6 +245,7 @@ fn validate_request_parts(
     path: String,
     authority: Option<String>,
     host: Option<String>,
+    content_length: Option<usize>,
     resilience: &RuntimeResilience,
     errors: RequestPartErrors,
 ) -> Result<RequestValidationResult, (http::StatusCode, &'static [u8], bool)> {
@@ -297,7 +293,67 @@ fn validate_request_parts(
         method,
         path,
         authority: authority.or(host),
+        content_length,
     })
+}
+
+fn parse_content_length_value(raw: &[u8]) -> Option<usize> {
+    let value = std::str::from_utf8(raw).ok()?.trim();
+    if value.is_empty() || !value.as_bytes().iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<usize>().ok()
+}
+
+fn merge_content_length(
+    current: &mut Option<usize>,
+    next: usize,
+) -> Result<(), (http::StatusCode, &'static [u8], bool)> {
+    match *current {
+        None => {
+            *current = Some(next);
+            Ok(())
+        }
+        Some(existing) if existing == next => Ok(()),
+        Some(_) => Err((
+            http::StatusCode::BAD_REQUEST,
+            b"conflicting content-length header\n",
+            false,
+        )),
+    }
+}
+
+const INVALID_CONTENT_LENGTH_ERROR: (http::StatusCode, &[u8], bool) = (
+    http::StatusCode::BAD_REQUEST,
+    b"invalid content-length header\n",
+    false,
+);
+
+fn parse_h3_content_length(
+    headers: &[quiche::h3::Header],
+) -> Result<Option<usize>, (http::StatusCode, &'static [u8], bool)> {
+    let mut content_length = None;
+    for header in headers {
+        if !header.name().eq_ignore_ascii_case(b"content-length") {
+            continue;
+        }
+        let parsed =
+            parse_content_length_value(header.value()).ok_or(INVALID_CONTENT_LENGTH_ERROR)?;
+        merge_content_length(&mut content_length, parsed)?;
+    }
+    Ok(content_length)
+}
+
+fn parse_http_content_length(
+    headers: &http::HeaderMap,
+) -> Result<Option<usize>, (http::StatusCode, &'static [u8], bool)> {
+    let mut content_length = None;
+    for value in headers.get_all(http::header::CONTENT_LENGTH) {
+        let parsed =
+            parse_content_length_value(value.as_bytes()).ok_or(INVALID_CONTENT_LENGTH_ERROR)?;
+        merge_content_length(&mut content_length, parsed)?;
+    }
+    Ok(content_length)
 }
 
 pub(super) fn extract_header_value<'a>(
@@ -434,6 +490,76 @@ mod tests {
         };
         assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
         assert_eq!(err.1, b"invalid host header\n");
+        assert!(!err.2);
+    }
+
+    #[test]
+    fn accepts_consistent_duplicate_content_length_headers() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"POST"),
+            h3_header(b":path", b"/"),
+            h3_header(b":authority", b"example.com"),
+            h3_header(b"content-length", b"10"),
+            h3_header(b"content-length", b"10"),
+        ];
+
+        let request = validate_request_headers(&headers, &resilience)
+            .expect("consistent duplicate content-length should be accepted");
+        assert_eq!(request.content_length, Some(10));
+    }
+
+    #[test]
+    fn rejects_conflicting_duplicate_content_length_headers() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"POST"),
+            h3_header(b":path", b"/"),
+            h3_header(b":authority", b"example.com"),
+            h3_header(b"content-length", b"10"),
+            h3_header(b"content-length", b"11"),
+        ];
+
+        let err = validate_request_headers(&headers, &resilience)
+            .expect_err("conflicting content-length must be rejected");
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"conflicting content-length header\n");
+        assert!(!err.2);
+    }
+
+    #[test]
+    fn rejects_invalid_content_length_header() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"POST"),
+            h3_header(b":path", b"/"),
+            h3_header(b":authority", b"example.com"),
+            h3_header(b"content-length", b"ten"),
+        ];
+
+        let err = validate_request_headers(&headers, &resilience)
+            .expect_err("invalid content-length must be rejected");
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"invalid content-length header\n");
+        assert!(!err.2);
+    }
+
+    #[test]
+    fn http_header_map_rejects_conflicting_content_length_values() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("8"),
+        );
+        headers.append(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("9"),
+        );
+
+        let err = parse_http_content_length(&headers)
+            .expect_err("conflicting content-length must be rejected");
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"conflicting content-length header\n");
         assert!(!err.2);
     }
 }

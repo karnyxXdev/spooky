@@ -8,8 +8,8 @@ use std::time::Instant;
 pub(crate) struct TokenBucket {
     /// Maximum tokens the bucket can hold (burst capacity).
     burst: f64,
-    /// Tokens added per nanosecond (= rate_per_sec / 1_000_000_000).
-    tokens_per_ns: f64,
+    /// Tokens added per second.
+    rate_per_sec: f64,
     /// Current available tokens.
     tokens: f64,
     /// Last time tokens were refilled.
@@ -22,7 +22,7 @@ impl TokenBucket {
         let rate_per_sec = rate_per_sec.max(1) as f64;
         Self {
             burst,
-            tokens_per_ns: rate_per_sec / 1_000_000_000.0,
+            rate_per_sec,
             tokens: burst,
             last_refill: Instant::now(),
         }
@@ -30,14 +30,49 @@ impl TokenBucket {
 
     pub(super) fn try_consume(&mut self) -> bool {
         let now = Instant::now();
-        let elapsed_ns = now.saturating_duration_since(self.last_refill).as_nanos() as f64;
+        // Refill is intentionally bounded by `burst`: after long idle periods, precision
+        // beyond "enough to fill the bucket" is irrelevant and we clamp to capacity.
+        let refill = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64()
+            * self.rate_per_sec;
         self.last_refill = now;
-        self.tokens = (self.tokens + elapsed_ns * self.tokens_per_ns).min(self.burst);
+
+        if refill.is_finite() && refill > 0.0 {
+            self.tokens = (self.tokens + refill).min(self.burst);
+        } else if !refill.is_finite() {
+            self.tokens = self.burst;
+        }
+
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
         } else {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenBucket;
+    use std::time::Duration;
+
+    #[test]
+    fn long_idle_refill_is_capped_to_burst() {
+        let mut tb = TokenBucket::new(1_000, 3);
+        assert!(tb.try_consume());
+        assert!(tb.try_consume());
+        assert!(tb.try_consume());
+        assert!(!tb.try_consume());
+
+        tb.last_refill = tb
+            .last_refill
+            .checked_sub(Duration::from_secs(60))
+            .expect("time subtraction");
+
+        assert!(tb.try_consume(), "long idle should refill bucket");
+        assert!(tb.tokens.is_finite());
+        assert!(tb.tokens <= tb.burst);
     }
 }

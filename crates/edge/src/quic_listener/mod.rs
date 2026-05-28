@@ -1617,7 +1617,7 @@ impl QUICListener {
         tracing_enabled: bool,
         routing_transparency_enabled: bool,
         routing_transparency_include_reason: bool,
-        listen_port: u32,
+        listen_port: u16,
     ) -> Result<(), quiche::h3::Error> {
         let mut body_buf = [0u8; MAX_DATAGRAM_SIZE_BYTES];
 
@@ -2601,7 +2601,7 @@ impl QUICListener {
         max_response_body_bytes: usize,
         unknown_length_response_prebuffer_bytes: usize,
         client_body_idle_timeout: Duration,
-        listen_port: u32,
+        listen_port: u16,
     ) -> Result<(), quiche::h3::Error> {
         let stream_ids: Vec<u64> = streams.keys().copied().collect();
 

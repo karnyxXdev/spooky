@@ -65,6 +65,10 @@ pub(crate) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> Stre
 }
 
 impl QUICListener {
+    fn send_error_health_failure_reason() -> Option<HealthFailureReason> {
+        None
+    }
+
     fn is_internal_pool_control_error(error: &PoolError) -> bool {
         matches!(
             error,
@@ -279,13 +283,15 @@ impl QUICListener {
             Err(ProxyError::Pool(PoolError::Send(ref send_err))) => {
                 // Log the full inner error — commonly exposes TLS/cert/SNI mismatches
                 // that look like transport failures but are actually local config errors.
-                // Do NOT mark the backend unhealthy: the backend may be fully operational;
-                // the connection failure is a proxy-side config issue.
+                // Do NOT mark backend health as failed: the backend may be fully operational;
+                // this path is usually a local proxy configuration/runtime issue.
                 error!(
                     "Upstream send failed for {} (possible TLS/cert/SNI misconfiguration): {}",
                     backend_addr, send_err
                 );
-                metrics.inc_health_failure(HealthFailureReason::Tls);
+                if let Some(reason) = Self::send_error_health_failure_reason() {
+                    metrics.inc_health_failure(reason);
+                }
                 metrics.inc_failure();
                 metrics.inc_backend_error();
                 metrics.record_route(route_label, start.elapsed(), RouteOutcome::BackendError);
@@ -508,5 +514,10 @@ mod tests {
         assert!(!QUICListener::is_internal_pool_control_error(
             &PoolError::CircuitOpen("open".to_string())
         ));
+    }
+
+    #[test]
+    fn send_error_does_not_map_to_backend_health_failure_reason() {
+        assert_eq!(QUICListener::send_error_health_failure_reason(), None);
     }
 }

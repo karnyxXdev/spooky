@@ -4,7 +4,6 @@ use log::{error, info, warn};
 use std::fs::File;
 use std::io::BufReader;
 use std::net::IpAddr;
-use std::path::Path;
 
 pub const VALID_LOG_LEVELS: &[&str] = &[
     "whisper",
@@ -794,22 +793,6 @@ pub fn validate(config: &Config) -> bool {
     }
 
     // --- Validate TLS certs ---
-    if !Path::new(&config.listen.tls.cert).exists() {
-        error!(
-            "TLS certificate file does not exist: {}",
-            config.listen.tls.cert
-        );
-        return false;
-    }
-
-    if !Path::new(&config.listen.tls.key).exists() {
-        error!(
-            "TLS private key file does not exist: {}",
-            config.listen.tls.key
-        );
-        return false;
-    }
-
     if !validate_pem_certificates(&config.listen.tls.cert, "listen.tls.cert") {
         return false;
     }
@@ -833,10 +816,6 @@ pub fn validate(config: &Config) -> bool {
             error!("listen.tls.client_auth.ca_file cannot be empty");
             return false;
         }
-        if !Path::new(ca_file).exists() {
-            error!("listen.tls.client_auth.ca_file does not exist: {}", ca_file);
-            return false;
-        }
         if !validate_pem_certificates(ca_file, "listen.tls.client_auth.ca_file") {
             return false;
         }
@@ -855,10 +834,6 @@ pub fn validate(config: &Config) -> bool {
             error!("upstream_tls.ca_file cannot be empty when provided");
             return false;
         }
-        if !Path::new(ca_file).exists() {
-            error!("upstream_tls.ca_file does not exist: {}", ca_file);
-            return false;
-        }
         if !validate_pem_certificates(ca_file, "upstream_tls.ca_file") {
             return false;
         }
@@ -869,12 +844,14 @@ pub fn validate(config: &Config) -> bool {
             error!("upstream_tls.ca_dir cannot be empty when provided");
             return false;
         }
-        let ca_path = Path::new(ca_dir);
-        if !ca_path.exists() {
-            error!("upstream_tls.ca_dir does not exist: {}", ca_dir);
-            return false;
-        }
-        if !ca_path.is_dir() {
+        let metadata = match std::fs::metadata(ca_dir) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                error!("Cannot stat upstream_tls.ca_dir '{}': {}", ca_dir, err);
+                return false;
+            }
+        };
+        if !metadata.is_dir() {
             error!("upstream_tls.ca_dir must be a directory: {}", ca_dir);
             return false;
         }

@@ -84,7 +84,7 @@ use health_check::classify_active_health_check_response;
 pub(crate) use token_bucket::TokenBucket;
 use validation::{
     RequestBufferError, extract_header_value, generated_span_id, generated_trace_id,
-    parse_traceparent, request_content_length, validate_http_request, validate_request_headers,
+    parse_traceparent, validate_http_request, validate_request_headers,
 };
 
 fn is_hop_header(name: &str) -> bool {
@@ -1690,6 +1690,7 @@ impl QUICListener {
                     let method = request.method;
                     let path = request.path;
                     let authority = request.authority;
+                    let content_length = request.content_length;
 
                     metrics.inc_total();
                     let request_start = Instant::now();
@@ -1976,7 +1977,6 @@ impl QUICListener {
                                     )
                                 },
                             );
-                            let content_length = request_content_length(&list);
                             let bodyless_mode = content_length.unwrap_or(0) == 0
                                 && (method.eq_ignore_ascii_case("GET")
                                     || method.eq_ignore_ascii_case("HEAD"));
@@ -4050,6 +4050,7 @@ impl QUICListener {
                                 let method = request.method;
                                 let path = request.path;
                                 let authority = request.authority;
+                                let content_length = request.content_length;
 
                                 let bootstrap_error = |status: StatusCode, body: &'static [u8]| {
                                     Ok(Response::builder()
@@ -4189,12 +4190,8 @@ impl QUICListener {
                                 );
 
                                 if !is_websocket_upgrade
-                                    && let Some(content_length) = req
-                                        .headers()
-                                        .get(http::header::CONTENT_LENGTH)
-                                        .and_then(|v| v.to_str().ok())
-                                        .and_then(|s| s.parse::<usize>().ok())
-                                    && content_length > max_request_body_bytes
+                                    && content_length
+                                        .is_some_and(|value| value > max_request_body_bytes)
                                 {
                                     return Ok(Response::builder()
                                         .status(StatusCode::PAYLOAD_TOO_LARGE)

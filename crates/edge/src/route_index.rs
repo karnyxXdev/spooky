@@ -507,7 +507,6 @@ pub(crate) fn scan_lookup_for_method<'a>(
             upstream.route.method.as_deref().map(str::trim),
             method.map(str::trim),
         ) {
-            (Some(""), _) => true,
             (Some(route_method), Some(request_method)) => {
                 route_method.eq_ignore_ascii_case(request_method)
             }

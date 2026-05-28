@@ -18,7 +18,8 @@ use log::{error, info, warn};
 
 use spooky_config::validator::validate as validate_config;
 use spooky_edge::{
-    QUICListener, SharedRuntimeState, configure_async_runtime, stable_hash_socket_addr,
+    QUICListener, SharedRuntimeState, configure_async_runtime,
+    constants::MAX_DATAGRAM_SIZE_BYTES, stable_hash_socket_addr,
 };
 
 #[derive(Parser)]
@@ -431,7 +432,7 @@ fn run_sharded_listener_worker(
         shard_handles.push(shard_handle);
     }
 
-    let mut recv_buf = [0u8; 65_535];
+    let mut recv_buf = [0u8; MAX_DATAGRAM_SIZE_BYTES];
     while !worker_shutdown.load(Ordering::Relaxed) {
         match socket.recv_from(&mut recv_buf) {
             Ok((len, peer)) => {

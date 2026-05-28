@@ -90,7 +90,13 @@ use validation::{
 fn is_hop_header(name: &str) -> bool {
     matches!(
         name,
-        "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade"
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "transfer-encoding"
+            | "upgrade"
+            | "te"
+            | "trailer"
     )
 }
 
@@ -141,6 +147,24 @@ fn should_strip_bootstrap_request_header(
     }
 
     false
+}
+
+fn should_strip_h3_response_header(
+    name: &http::header::HeaderName,
+    connection_tokens: &HashSet<String>,
+) -> bool {
+    connection_tokens.contains(name.as_str())
+        || is_hop_header(name.as_str())
+        || name == http::header::CONTENT_LENGTH
+}
+
+fn response_size_exceeded_after_chunk(
+    response_bytes_received: &mut usize,
+    chunk_len: usize,
+    max_response_body_bytes: usize,
+) -> bool {
+    *response_bytes_received = response_bytes_received.saturating_add(chunk_len);
+    *response_bytes_received > max_response_body_bytes
 }
 
 fn header_has_token(value: &http::HeaderValue, token: &str) -> bool {
@@ -2792,9 +2816,9 @@ impl QUICListener {
                         }
 
                         let mut owned_h3_headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                        let response_connection_tokens = connection_header_tokens(&resp_headers);
                         for (name, value) in resp_headers.iter() {
-                            if is_hop_header(name.as_str()) || name == http::header::CONTENT_LENGTH
-                            {
+                            if should_strip_h3_response_header(name, &response_connection_tokens) {
                                 continue;
                             }
                             owned_h3_headers.push((
@@ -2914,8 +2938,9 @@ impl QUICListener {
                             immediate_terminal = true;
                         } else {
                             // Spawn a task that pumps body frames into a ResponseChunk channel.
-                            // Enforces body deadlines; for unknown-length responses it first
-                            // validates total body size against cap before emitting any headers.
+                            // Enforces body deadlines and a hard running body-size cap. For
+                            // unknown-length responses it additionally prebuffers until size
+                            // validation completes before emitting headers.
                             let (chunk_tx, chunk_rx) =
                                 mpsc::channel::<ResponseChunk>(RESPONSE_CHUNK_CHANNEL_CAPACITY);
                             let fail_tx = chunk_tx.clone();
@@ -2963,22 +2988,22 @@ impl QUICListener {
                                                 if !data.is_empty() {
                                                     saw_body_progress = true;
                                                 }
+                                                if response_size_exceeded_after_chunk(
+                                                    &mut response_bytes_received,
+                                                    data.len(),
+                                                    max_response_body_bytes,
+                                                ) {
+                                                    let _ = chunk_tx
+                                                        .send(ResponseChunk::Error(ProxyError::Pool(
+                                                            PoolError::BackendOverloaded(
+                                                                "upstream response body too large"
+                                                                    .into(),
+                                                            ),
+                                                        )))
+                                                        .await;
+                                                    return;
+                                                }
                                                 if defer_headers_until_body_validated {
-                                                    response_bytes_received =
-                                                        response_bytes_received
-                                                            .saturating_add(data.len());
-                                                    if response_bytes_received
-                                                        > max_response_body_bytes
-                                                    {
-                                                        let _ = chunk_tx
-                                                            .send(ResponseChunk::Error(ProxyError::Pool(
-                                                                PoolError::BackendOverloaded(
-                                                                    "upstream response body too large".into(),
-                                                                ),
-                                                            )))
-                                                            .await;
-                                                        return;
-                                                    }
                                                     if response_bytes_received
                                                         > unknown_length_response_prebuffer_bytes
                                                     {
@@ -4701,7 +4726,8 @@ mod tests {
     use super::{
         ConnectionRoutes, TokenBucket, abort_stream, classify_active_health_check_response,
         connection_header_tokens, purge_connection_routes, resolve_primary_from_radix_prefix,
-        should_strip_bootstrap_request_header, sweep_closed_connections,
+        response_size_exceeded_after_chunk, should_strip_bootstrap_request_header,
+        should_strip_h3_response_header, sweep_closed_connections,
     };
     type RoutingMaps = (
         HashMap<Arc<[u8]>, Arc<[u8]>>,
@@ -5003,6 +5029,39 @@ mod tests {
 
         let header = http::HeaderName::from_static("x-custom-keep");
         assert!(!should_strip_bootstrap_request_header(&header, &tokens));
+    }
+
+    #[test]
+    fn h3_response_filter_strips_te_and_trailer() {
+        let tokens = HashSet::new();
+        assert!(should_strip_h3_response_header(&http::header::TE, &tokens));
+        assert!(should_strip_h3_response_header(
+            &http::header::TRAILER,
+            &tokens
+        ));
+    }
+
+    #[test]
+    fn h3_response_filter_strips_connection_nominated_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("keep-alive, x-internal-hop"),
+        );
+        let tokens = connection_header_tokens(&headers);
+        let nominated = http::HeaderName::from_static("x-internal-hop");
+        assert!(should_strip_h3_response_header(&nominated, &tokens));
+    }
+
+    #[test]
+    fn response_size_cap_enforced_as_running_total() {
+        let mut received = 0usize;
+        assert!(!response_size_exceeded_after_chunk(&mut received, 4, 10));
+        assert_eq!(received, 4);
+        assert!(!response_size_exceeded_after_chunk(&mut received, 6, 10));
+        assert_eq!(received, 10);
+        assert!(response_size_exceeded_after_chunk(&mut received, 1, 10));
+        assert_eq!(received, 11);
     }
 
     #[test]

@@ -198,7 +198,10 @@ pub fn validate(config: &Config) -> bool {
 
     // --- Validate listen port ---
     if config.listen.port == 0 {
-        error!("Invalid listen port: {} (must be between 1 and 65535)", config.listen.port);
+        error!(
+            "Invalid listen port: {} (must be between 1 and 65535)",
+            config.listen.port
+        );
         return false;
     }
 

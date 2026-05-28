@@ -18,8 +18,8 @@ use log::{error, info, warn};
 
 use spooky_config::validator::validate as validate_config;
 use spooky_edge::{
-    QUICListener, SharedRuntimeState, configure_async_runtime,
-    constants::MAX_DATAGRAM_SIZE_BYTES, stable_hash_socket_addr,
+    QUICListener, SharedRuntimeState, configure_async_runtime, constants::MAX_DATAGRAM_SIZE_BYTES,
+    stable_hash_socket_addr,
 };
 
 #[derive(Parser)]

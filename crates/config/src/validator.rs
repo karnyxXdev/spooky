@@ -4,7 +4,6 @@ use log::{error, info, warn};
 use std::fs::File;
 use std::io::BufReader;
 use std::net::IpAddr;
-use std::path::Path;
 
 pub const VALID_LOG_LEVELS: &[&str] = &[
     "whisper",
@@ -113,6 +112,33 @@ fn is_loopback_bind_address(raw: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn is_valid_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.as_bytes().iter().all(|byte| {
+            matches!(
+                byte,
+                b'0'..=b'9'
+                    | b'a'..=b'z'
+                    | b'A'..=b'Z'
+                    | b'!'
+                    | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+        })
+}
+
 pub fn validate(config: &Config) -> bool {
     info!("Starting configuration validation...");
 
@@ -171,7 +197,7 @@ pub fn validate(config: &Config) -> bool {
     }
 
     // --- Validate listen port ---
-    if config.listen.port == 0 || config.listen.port > 65535 {
+    if config.listen.port == 0 {
         error!(
             "Invalid listen port: {} (must be between 1 and 65535)",
             config.listen.port
@@ -504,6 +530,17 @@ pub fn validate(config: &Config) -> bool {
     if config
         .resilience
         .protocol
+        .allowed_methods
+        .iter()
+        .any(|method| !is_valid_http_token(method))
+    {
+        error!("resilience.protocol.allowed_methods must contain valid HTTP method tokens");
+        return false;
+    }
+
+    if config
+        .resilience
+        .protocol
         .denied_path_prefixes
         .iter()
         .any(|prefix| prefix.is_empty() || !prefix.starts_with('/'))
@@ -619,13 +656,7 @@ pub fn validate(config: &Config) -> bool {
         return false;
     }
 
-    if config
-        .resilience
-        .watchdog
-        .restart_hook
-        .as_ref()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
+    if config.resilience.watchdog.restart_hook.is_some() {
         error!(
             "resilience.watchdog.restart_hook is deprecated and unsupported; use restart_command instead"
         );
@@ -765,22 +796,6 @@ pub fn validate(config: &Config) -> bool {
     }
 
     // --- Validate TLS certs ---
-    if !Path::new(&config.listen.tls.cert).exists() {
-        error!(
-            "TLS certificate file does not exist: {}",
-            config.listen.tls.cert
-        );
-        return false;
-    }
-
-    if !Path::new(&config.listen.tls.key).exists() {
-        error!(
-            "TLS private key file does not exist: {}",
-            config.listen.tls.key
-        );
-        return false;
-    }
-
     if !validate_pem_certificates(&config.listen.tls.cert, "listen.tls.cert") {
         return false;
     }
@@ -804,10 +819,6 @@ pub fn validate(config: &Config) -> bool {
             error!("listen.tls.client_auth.ca_file cannot be empty");
             return false;
         }
-        if !Path::new(ca_file).exists() {
-            error!("listen.tls.client_auth.ca_file does not exist: {}", ca_file);
-            return false;
-        }
         if !validate_pem_certificates(ca_file, "listen.tls.client_auth.ca_file") {
             return false;
         }
@@ -826,10 +837,6 @@ pub fn validate(config: &Config) -> bool {
             error!("upstream_tls.ca_file cannot be empty when provided");
             return false;
         }
-        if !Path::new(ca_file).exists() {
-            error!("upstream_tls.ca_file does not exist: {}", ca_file);
-            return false;
-        }
         if !validate_pem_certificates(ca_file, "upstream_tls.ca_file") {
             return false;
         }
@@ -840,12 +847,14 @@ pub fn validate(config: &Config) -> bool {
             error!("upstream_tls.ca_dir cannot be empty when provided");
             return false;
         }
-        let ca_path = Path::new(ca_dir);
-        if !ca_path.exists() {
-            error!("upstream_tls.ca_dir does not exist: {}", ca_dir);
-            return false;
-        }
-        if !ca_path.is_dir() {
+        let metadata = match std::fs::metadata(ca_dir) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                error!("Cannot stat upstream_tls.ca_dir '{}': {}", ca_dir, err);
+                return false;
+            }
+        };
+        if !metadata.is_dir() {
             error!("upstream_tls.ca_dir must be a directory: {}", ca_dir);
             return false;
         }
@@ -1388,6 +1397,18 @@ upstream:
         assert!(!validate(&cfg));
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.protocol.allowed_methods = vec!["GE T".to_string()];
+        assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.protocol.allowed_methods = vec!["GET/".to_string()];
+        assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.protocol.allowed_methods = vec!["GE\nT".to_string()];
+        assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.retry_budget.ratio_percent = 101;
         assert!(!validate(&cfg));
 
@@ -1636,6 +1657,24 @@ upstream:
         let (cert, key) = write_test_certs(dir.path());
         let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.watchdog.restart_hook = Some("echo legacy".to_string());
+        assert!(!validate(&cfg));
+    }
+
+    #[test]
+    fn rejects_any_provided_legacy_watchdog_restart_hook_value() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.watchdog.restart_hook = None;
+        assert!(validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.watchdog.restart_hook = Some(String::new());
+        assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.watchdog.restart_hook = Some("   ".to_string());
         assert!(!validate(&cfg));
     }
 

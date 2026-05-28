@@ -1196,19 +1196,18 @@ impl QUICListener {
         let dcid = header.dcid.as_ref();
 
         if packet_type == quiche::Type::VersionNegotiation {
-            let len =
-                match quiche::negotiate_version(
-                    &header.scid,
-                    &header.dcid,
-                    self.send_buf.as_mut_slice(),
-                ) {
-                    Ok(len) => len,
-                    Err(e) => {
-                        error!("Version negotiation failed: {:?}", e);
-                        self.metrics.inc_ingress_version_neg_failed();
-                        return;
-                    }
-                };
+            let len = match quiche::negotiate_version(
+                &header.scid,
+                &header.dcid,
+                self.send_buf.as_mut_slice(),
+            ) {
+                Ok(len) => len,
+                Err(e) => {
+                    error!("Version negotiation failed: {:?}", e);
+                    self.metrics.inc_ingress_version_neg_failed();
+                    return;
+                }
+            };
 
             if let Err(e) = self.socket.send_to(&self.send_buf[..len], peer) {
                 error!("Failed to send version negotiation: {:?}", e);

@@ -32,7 +32,9 @@ pub fn try_init_logger(
     json: bool,
 ) -> LoggerInitStatus {
     let mutex = LOGGER_INIT_MUTEX.get_or_init(|| Mutex::new(()));
-    let _guard = mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     if LOGGER_INITIALIZED.load(Ordering::Acquire) {
         return LoggerInitStatus::AlreadyInitialized;

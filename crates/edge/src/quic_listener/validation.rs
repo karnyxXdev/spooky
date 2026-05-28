@@ -323,6 +323,12 @@ fn merge_content_length(
     }
 }
 
+const INVALID_CONTENT_LENGTH_ERROR: (http::StatusCode, &[u8], bool) = (
+    http::StatusCode::BAD_REQUEST,
+    b"invalid content-length header\n",
+    false,
+);
+
 fn parse_h3_content_length(
     headers: &[quiche::h3::Header],
 ) -> Result<Option<usize>, (http::StatusCode, &'static [u8], bool)> {
@@ -331,13 +337,8 @@ fn parse_h3_content_length(
         if !header.name().eq_ignore_ascii_case(b"content-length") {
             continue;
         }
-        let parsed = parse_content_length_value(header.value()).ok_or_else(|| {
-            (
-                http::StatusCode::BAD_REQUEST,
-                b"invalid content-length header\n" as &'static [u8],
-                false,
-            )
-        })?;
+        let parsed =
+            parse_content_length_value(header.value()).ok_or(INVALID_CONTENT_LENGTH_ERROR)?;
         merge_content_length(&mut content_length, parsed)?;
     }
     Ok(content_length)
@@ -348,13 +349,8 @@ fn parse_http_content_length(
 ) -> Result<Option<usize>, (http::StatusCode, &'static [u8], bool)> {
     let mut content_length = None;
     for value in headers.get_all(http::header::CONTENT_LENGTH) {
-        let parsed = parse_content_length_value(value.as_bytes()).ok_or_else(|| {
-            (
-                http::StatusCode::BAD_REQUEST,
-                b"invalid content-length header\n" as &'static [u8],
-                false,
-            )
-        })?;
+        let parsed =
+            parse_content_length_value(value.as_bytes()).ok_or(INVALID_CONTENT_LENGTH_ERROR)?;
         merge_content_length(&mut content_length, parsed)?;
     }
     Ok(content_length)
@@ -551,8 +547,14 @@ mod tests {
     #[test]
     fn http_header_map_rejects_conflicting_content_length_values() {
         let mut headers = http::HeaderMap::new();
-        headers.append(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("8"));
-        headers.append(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("9"));
+        headers.append(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("8"),
+        );
+        headers.append(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("9"),
+        );
 
         let err = parse_http_content_length(&headers)
             .expect_err("conflicting content-length must be rejected");

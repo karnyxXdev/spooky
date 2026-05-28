@@ -530,9 +530,9 @@ impl QUICListener {
                         continue;
                     }
 
-                    let requested_at = watchdog.restart_requested_at_ms();
-                    let grace_elapsed = requested_at != 0
-                        && now.saturating_sub(requested_at) >= watchdog_config.drain_grace_ms;
+                    let grace_elapsed = watchdog
+                        .restart_requested_elapsed_ms()
+                        .is_some_and(|elapsed| elapsed >= watchdog_config.drain_grace_ms);
                     if !watchdog.workers_drained() && !grace_elapsed {
                         continue;
                     }

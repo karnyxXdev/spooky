@@ -4730,8 +4730,8 @@ mod tests {
         ConnectionRoutes, TokenBucket, abort_stream, classify_active_health_check_response,
         connection_header_tokens, purge_connection_routes, resolve_primary_from_radix_prefix,
         response_size_exceeded_after_chunk, should_strip_bootstrap_request_header,
-        should_strip_bootstrap_response_header,
-        should_strip_h3_response_header, sweep_closed_connections,
+        should_strip_bootstrap_response_header, should_strip_h3_response_header,
+        sweep_closed_connections,
     };
     type RoutingMaps = (
         HashMap<Arc<[u8]>, Arc<[u8]>>,
@@ -5091,10 +5091,7 @@ mod tests {
         let alt_svc = http::HeaderName::from_static("alt-svc");
         assert!(should_strip_bootstrap_response_header(&alt_svc, &tokens));
         let keep_alive = http::HeaderName::from_static("keep-alive");
-        assert!(should_strip_bootstrap_response_header(
-            &keep_alive,
-            &tokens
-        ));
+        assert!(should_strip_bootstrap_response_header(&keep_alive, &tokens));
     }
 
     #[test]

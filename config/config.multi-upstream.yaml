@@ -1,0 +1,296 @@
+# Spooky — multi-upstream production configuration
+# Models a three-pool edge: API service, web frontend, and a catch-all fallback.
+# Routing uses longest-prefix match: /api → api pool, / → web pool (default fallback).
+# This file is self-contained and ready to adapt; swap certs, IPs, and the auth token.
+version: 1
+
+# ---------------------------------------------------------------------------
+# listen — QUIC/HTTP3 ingress socket and TLS identity
+# protocol defaults to http3; explicit here for clarity.
+# ---------------------------------------------------------------------------
+listen:
+  protocol: http3
+  address: "0.0.0.0"        # bind all interfaces; restrict to a VIP in single-NIC setups
+  port: 443
+  tls:
+    cert: /etc/spooky/certs/fullchain.pem   # PEM chain (leaf + intermediates)
+    key:  /etc/spooky/certs/privkey.pem     # PKCS#8 private key (pkcs8 DER or PEM)
+    client_auth:
+      enabled: false             # default — set true to enable mTLS for client certs
+      require_client_cert: false # when enabled=true, connections without a cert are closed
+      ca_file: null              # PEM CA bundle for verifying client certs; null = system store
+
+# ---------------------------------------------------------------------------
+# upstream_tls — how Spooky validates TLS on backend connections
+# verify_certificates and strict_sni are both true by default (safe-by-default).
+# Override per-backend only in break-glass situations.
+# ---------------------------------------------------------------------------
+upstream_tls:
+  verify_certificates: true   # explicitly set — never disable in production
+  strict_sni: true            # sends backend hostname as SNI; required for SNI-based vhosts
+  ca_file: null               # null = use system trust store; set for private PKI
+  ca_dir: null                # alternative: directory of PEM bundles
+
+# ---------------------------------------------------------------------------
+# upstream — pool definitions; keys are arbitrary pool names used in logs/metrics.
+# Route matching is longest-prefix: /api beats / for any request starting with /api.
+# Pools are evaluated in definition order when prefixes are equal length.
+# ---------------------------------------------------------------------------
+upstream:
+
+  # ---- API pool -----------------------------------------------------------
+  # Handles all traffic under /api; uses consistent-hash on x-user-id header
+  # to achieve sticky routing without session cookies.
+  # The third backend carries half the weight (hash ring slots proportional to weight).
+  api:
+    load_balancing:
+      type: consistent-hash
+      hash_on: "header:x-user-id"  # falls back to client IP when header is absent
+
+    route:
+      path_prefix: "/api"   # longest-match; takes priority over the web pool's "/"
+
+    backends:
+      - id: "api-1"
+        address: "10.0.1.11:8443"   # primary — verified HTTPS; no scheme needed
+        weight: 100                  # default unit weight; receives ~40% of ring slots
+        health_check:
+          path: "/api/health"
+          interval: 3000             # explicitly set to 3 s; default in sample is 5 s
+          timeout_ms: 1000
+          failure_threshold: 3       # mark unhealthy after 3 consecutive failures
+          success_threshold: 2       # mark healthy again after 2 consecutive successes
+          cooldown_ms: 5000          # wait 5 s before re-probing after marking unhealthy
+
+      - id: "api-2"
+        address: "10.0.1.12:8443"
+        weight: 100
+        health_check:
+          path: "/api/health"
+          interval: 3000
+          timeout_ms: 1000
+          failure_threshold: 3
+          success_threshold: 2
+          cooldown_ms: 5000
+
+      - id: "api-3"
+        address: "10.0.1.13:8443"
+        weight: 50    # half the ring slots; useful for a canary or under-specced node
+        health_check:
+          path: "/api/health"
+          interval: 3000
+          timeout_ms: 1000
+          failure_threshold: 3
+          success_threshold: 2
+          cooldown_ms: 5000
+
+  # ---- Web frontend pool --------------------------------------------------
+  # Serves the SPA/SSR frontend at /; latency-aware LB shifts traffic away from
+  # slow backends automatically — useful for heterogeneous rendering nodes.
+  # Because /api is longer, all /api/** traffic goes to the api pool above.
+  web:
+    load_balancing:
+      type: latency-aware   # measures p50 response latency per backend; rebalances live
+
+    route:
+      path_prefix: "/"      # catches everything not matched by a longer prefix
+
+    backends:
+      - id: "web-1"
+        address: "10.0.2.21:8443"
+        weight: 100          # equal weight; latency-aware adjusts effective share at runtime
+        health_check:
+          path: "/health"
+          interval: 5000     # 5 s is the sample-config default; kept here intentionally
+          timeout_ms: 1500
+          failure_threshold: 3
+          success_threshold: 2
+          cooldown_ms: 10000
+
+      - id: "web-2"
+        address: "10.0.2.22:8443"
+        weight: 100
+        health_check:
+          path: "/health"
+          interval: 5000
+          timeout_ms: 1500
+          failure_threshold: 3
+          success_threshold: 2
+          cooldown_ms: 10000
+
+# ---------------------------------------------------------------------------
+# load_balancing — global fallback strategy, applied to pools that do not
+# declare their own type. Not reached here because both pools are explicit,
+# but kept so any future pool added without a type gets sane behaviour.
+# ---------------------------------------------------------------------------
+load_balancing:
+  type: round-robin
+
+# ---------------------------------------------------------------------------
+# log — structured JSON to stdout; ship to your log aggregator via container
+# runtime or syslog forwarder. File sink optional; omit path for stdout-only.
+# ---------------------------------------------------------------------------
+log:
+  level: info          # info in prod; bump to debug temporarily via control API
+  format: json         # json | plain — json integrates with Datadog/Loki/CloudWatch
+  file:
+    enabled: true
+    path: /var/log/spooky/spooky.log   # ensure the directory exists and is writable
+
+# ---------------------------------------------------------------------------
+# performance — concurrency limits, timeouts, QUIC tuning
+# Worker and shard counts should be scaled to available CPU cores.
+# Inflight limits enforce back-pressure; adaptive_admission refines them at runtime.
+# ---------------------------------------------------------------------------
+performance:
+  worker_threads: 4               # set to vCPU count; each thread owns a UDP socket via reuseport
+  control_plane_threads: 2        # Tokio threads for health checks, metrics, startup tasks
+  packet_shards_per_worker: 2     # I/O shards per worker; 2 is a good starting point per core
+  packet_shard_queue_capacity: 4096
+  packet_shard_queue_max_bytes: 67108864   # 64 MiB per shard dispatch queue
+  reuseport: true                 # SO_REUSEPORT — required for multi-worker; default true
+
+  # --- inflight limits (back-pressure hierarchy) ---------------------------
+  # Requests are rejected with 503 when any limit is reached before admission.
+  # adaptive_admission tunes global_inflight_limit dynamically within min/max bounds.
+  global_inflight_limit: 4096         # hard cap across all upstreams; explicitly set
+  per_upstream_inflight_limit: 1024   # per named pool; protects each service independently
+  per_backend_inflight_limit: 64      # per individual backend host; prevents pile-on on one node
+
+  # --- timeouts ------------------------------------------------------------
+  backend_timeout_ms: 3000             # total time to receive response headers from backend
+  backend_connect_timeout_ms: 500      # TCP/TLS handshake budget per backend connection
+  backend_body_idle_timeout_ms: 3000   # max idle gap between body chunks from backend
+  backend_body_total_timeout_ms: 60000 # wall-clock budget for the full response body
+  backend_total_request_timeout_ms: 65000  # absolute per-request budget including retries
+  shutdown_drain_timeout_ms: 10000     # wait up to 10 s for in-flight requests on SIGTERM
+
+  # --- connection rate and QUIC tuning ------------------------------------
+  new_connections_per_sec: 2000    # token-bucket refill rate for new QUIC connections
+  new_connections_burst: 500       # burst headroom above steady-state rate
+  max_active_connections: 20000    # hard cap on live QUIC connections per worker
+  quic_max_idle_timeout_ms: 10000  # close idle QUIC connections after 10 s
+  quic_initial_max_data: 10000000          # connection-level flow-control window (bytes)
+  quic_initial_max_stream_data: 1000000    # per-stream window; must be <= max_data
+  quic_initial_max_streams_bidi: 200       # max concurrent streams per connection
+  max_request_body_bytes: 10485760         # 10 MiB client body cap; returns 413 on breach
+  max_response_body_bytes: 104857600       # 100 MiB response cap; returns 502 on breach
+
+  # --- H2 connection pool (backend side) ----------------------------------
+  h2_pool_max_idle_per_backend: 256   # idle H2 connections kept warm per backend
+  h2_pool_idle_timeout_ms: 90000      # evict idle H2 connections after 90 s
+
+# ---------------------------------------------------------------------------
+# observability — metrics scrape endpoint and control API
+# Both bind only on loopback; expose via an authenticated sidecar if remote access
+# is needed. auth_token for the control API should be a 256-bit random value.
+# ---------------------------------------------------------------------------
+observability:
+  metrics:
+    enabled: true
+    required: true          # set required=true in prod so a bind failure causes a hard start failure
+    address: "127.0.0.1"
+    port: 9901
+    path: "/metrics"        # Prometheus-format scrape endpoint
+    max_connections: 512
+    connection_timeout_ms: 30000
+
+  control_api:
+    enabled: true
+    required: true          # fail fast on bind failure; prevents running without observability
+    address: "127.0.0.1"
+    port: 9902
+    health_path: "/health"
+    ready_path: "/ready"
+    runtime_path: "/admin/runtime"
+    restart_path: "/admin/runtime/restart"
+    # Generate with: openssl rand -hex 32
+    # Store in a secrets manager and inject via environment substitution or a mounted secret.
+    auth_token: "change-me-use-openssl-rand-hex-32"
+    max_connections: 256
+    connection_timeout_ms: 30000
+
+  tracing:
+    enabled: false          # default; enable and set otlp_endpoint when OTLP collector is present
+    service_name: "spooky"
+    otlp_endpoint: null     # e.g. "http://otel-collector.infra.svc:4317"
+    sample_ratio: 0.1       # 10% sampling in prod; raise to 1.0 only for debugging
+
+# ---------------------------------------------------------------------------
+# resilience — admission control, circuit breaking, brownout shedding
+# These layers compose: adaptive_admission limits overall concurrency, circuit_breaker
+# isolates failing backends, and brownout protects core_routes when overloaded.
+# ---------------------------------------------------------------------------
+resilience:
+
+  # --- adaptive admission --------------------------------------------------
+  # Continuously adjusts the effective in-flight cap between min_limit and max_limit
+  # based on observed tail latency. Prevents latency cliff under sustained overload.
+  # max_limit is bounded by performance.global_inflight_limit (4096) above.
+  adaptive_admission:
+    enabled: true
+    min_limit: 256       # never drop below 256 concurrent requests (explicitly set; sample default is 64)
+    max_limit: 4096      # ceiling matches global_inflight_limit; omit to inherit it automatically
+    decrease_step: 16    # reduce cap by 16 when high latency is detected
+    increase_step: 8     # grow cap by 8 per interval when latency is healthy
+    high_latency_ms: 200 # trigger threshold; tune to your SLA p99 target
+
+  # --- circuit breaker -----------------------------------------------------
+  # Trips per backend: after failure_threshold consecutive failures the backend is
+  # placed in OPEN state for open_ms ms, then half-open probes resume.
+  # This prevents cascading — a dead backend stops receiving traffic immediately.
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 3      # trip after 3 consecutive errors (explicitly set; sample default is 5)
+    open_ms: 30000            # stay open for 30 s before attempting half-open probes
+    half_open_max_probes: 2   # allow 2 probe requests before fully closing
+
+  # --- brownout (graceful degradation) ------------------------------------
+  # When the global inflight count exceeds trigger_inflight_percent of the cap,
+  # requests to non-core routes are shed with 503+Retry-After.
+  # core_routes names the upstream pool keys that must keep serving under pressure.
+  # Shedding stops once inflight falls below recover_inflight_percent.
+  brownout:
+    enabled: true
+    trigger_inflight_percent: 90   # begin shedding at 90% of global_inflight_limit
+    recover_inflight_percent: 60   # stop shedding once back below 60% (hysteresis)
+    core_routes:
+      - api   # API pool is protected; requests to /api are never shed during brownout
+      - web   # Web pool is also protected; adjust to shed web if API has higher SLA priority
+
+  # --- route queue ---------------------------------------------------------
+  route_queue:
+    default_cap: 512     # per-pool queue depth before 503 is returned
+    global_cap: 2048     # total queued requests across all pools
+    shed_retry_after_seconds: 1
+
+  # --- protocol guardrails ------------------------------------------------
+  protocol:
+    allow_0rtt: false                   # default false — 0-RTT replays are a security risk
+    early_data_safe_methods: ["GET", "HEAD"]
+    max_headers_count: 128
+    max_headers_bytes: 16384
+    enforce_authority_host_match: true  # reject requests where :authority != Host header
+
+  # --- retry budget -------------------------------------------------------
+  # Caps the total retry volume as a fraction of real requests to avoid amplification.
+  retry_budget:
+    enabled: true
+    ratio_percent: 20   # at most 20% of requests may be retries at any moment
+
+  # --- hedging ------------------------------------------------------------
+  hedging:
+    enabled: false   # default; enable for latency-sensitive reads once baseline is established
+    delay_ms: 75
+    safe_methods: ["GET", "HEAD"]
+
+# ---------------------------------------------------------------------------
+# security — privilege drop after socket bind
+# Spooky binds :443 as root, then drops to this user/group before serving traffic.
+# The user and group must exist on the host (created by the install package).
+# ---------------------------------------------------------------------------
+security:
+  privileges:
+    enabled: true
+    user: "spooky"    # matches the system user created by the spooky package
+    group: "spooky"

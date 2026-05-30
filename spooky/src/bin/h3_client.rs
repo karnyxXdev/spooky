@@ -71,6 +71,10 @@ fn emit_request_result(ok: bool, latency_ns: u128, report_latency: bool) {
     }
 }
 
+fn should_retry_request(attempts_started: usize, max_request_retries: usize) -> bool {
+    attempts_started <= max_request_retries
+}
+
 fn open_connection(
     config: &mut quiche::Config,
     host: &str,
@@ -105,6 +109,7 @@ fn flush_egress(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn retry_or_fail_request(
     request_id: usize,
     request_attempts: &[usize],
@@ -115,8 +120,7 @@ fn retry_or_fail_request(
     completed: &mut usize,
     report_latency: bool,
 ) {
-    let should_retry = request_attempts[request_id] <= max_request_retries;
-    if should_retry {
+    if should_retry_request(request_attempts[request_id], max_request_retries) {
         pending.push_back(request_id);
         return;
     }
@@ -217,8 +221,7 @@ fn run_client(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let Some(request_id) = pending.pop_front() else {
                     break;
                 };
-                let first_start_ref =
-                    request_started[request_id].get_or_insert_with(Instant::now);
+                let first_start_ref = request_started[request_id].get_or_insert_with(Instant::now);
                 let first_start = *first_start_ref;
 
                 let req = vec![
@@ -439,4 +442,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     run_client(&cli)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_retry_request;
+
+    #[test]
+    fn retry_budget_interpretation_is_stable() {
+        assert!(!should_retry_request(1, 0));
+        assert!(should_retry_request(1, 1));
+        assert!(!should_retry_request(2, 1));
+        assert!(should_retry_request(3, 3));
+    }
 }

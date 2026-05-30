@@ -56,11 +56,10 @@ use crate::{
     SharedRuntimeState, StreamPhase, UpstreamResult,
     cid_radix::CidRadix,
     constants::{
-        DEFAULT_SCID_LEN_BYTES, MAX_DATAGRAM_SIZE_BYTES, MAX_UDP_PAYLOAD_BYTES,
-        MIN_SCID_LEN_BYTES, REQUEST_CHUNK_BYTES_LIMIT,
-        REQUEST_CHUNK_CHANNEL_CAPACITY, RESET_TOKEN_LEN_BYTES, RESPONSE_CHUNK_BYTES_LIMIT,
-        RESPONSE_CHUNK_CHANNEL_CAPACITY, SCID_ROTATION_PACKET_THRESHOLD, UDP_READ_TIMEOUT_MS,
-        scid_rotation_interval,
+        DEFAULT_SCID_LEN_BYTES, MAX_DATAGRAM_SIZE_BYTES, MAX_UDP_PAYLOAD_BYTES, MIN_SCID_LEN_BYTES,
+        REQUEST_CHUNK_BYTES_LIMIT, REQUEST_CHUNK_CHANNEL_CAPACITY, RESET_TOKEN_LEN_BYTES,
+        RESPONSE_CHUNK_BYTES_LIMIT, RESPONSE_CHUNK_CHANNEL_CAPACITY,
+        SCID_ROTATION_PACKET_THRESHOLD, UDP_READ_TIMEOUT_MS, scid_rotation_interval,
     },
     outcome_from_status,
     resilience::{RouteQueueRejection, RuntimeResilience},
@@ -1914,8 +1913,9 @@ impl QUICListener {
                                 }
                                 Err(_) => {
                                     metrics.inc_failure();
-                                    metrics
-                                        .inc_overload_shed_reason(OverloadShedReason::GlobalInflight);
+                                    metrics.inc_overload_shed_reason(
+                                        OverloadShedReason::GlobalInflight,
+                                    );
                                     metrics.record_route(
                                         &upstream_name,
                                         request_start.elapsed(),
@@ -1935,43 +1935,21 @@ impl QUICListener {
                                 }
                             };
 
-                            let upstream_permit =
-                                match upstream_inflight.get(&upstream_name).cloned() {
-                                    Some(semaphore) => match Self::try_acquire_owned_with_micro_wait(
-                                        semaphore,
-                                        inflight_acquire_wait,
-                                    ) {
-                                        Ok((permit, waited)) => {
-                                            if waited {
-                                                metrics.inc_inflight_wait_admit_upstream();
-                                            }
-                                            permit
+                            let upstream_permit = match upstream_inflight
+                                .get(&upstream_name)
+                                .cloned()
+                            {
+                                Some(semaphore) => match Self::try_acquire_owned_with_micro_wait(
+                                    semaphore,
+                                    inflight_acquire_wait,
+                                ) {
+                                    Ok((permit, waited)) => {
+                                        if waited {
+                                            metrics.inc_inflight_wait_admit_upstream();
                                         }
-                                        Err(_) => {
-                                            drop(global_permit);
-                                            metrics.inc_failure();
-                                            metrics.inc_overload_shed_reason(
-                                                OverloadShedReason::UpstreamInflight,
-                                            );
-                                            metrics.record_route(
-                                                &upstream_name,
-                                                request_start.elapsed(),
-                                                RouteOutcome::OverloadShed,
-                                            );
-                                            Self::send_overload_response(
-                                                h3,
-                                                &mut connection.quic,
-                                                stream_id,
-                                                b"upstream overloaded, retry later\n",
-                                                resilience.shed_retry_after_seconds,
-                                            )?;
-                                            resilience
-                                                .adaptive_admission
-                                                .observe(request_start.elapsed(), true);
-                                            continue;
-                                        }
-                                    },
-                                    None => {
+                                        permit
+                                    }
+                                    Err(_) => {
                                         drop(global_permit);
                                         metrics.inc_failure();
                                         metrics.inc_overload_shed_reason(
@@ -1982,19 +1960,43 @@ impl QUICListener {
                                             request_start.elapsed(),
                                             RouteOutcome::OverloadShed,
                                         );
-                                        Self::send_simple_response(
+                                        Self::send_overload_response(
                                             h3,
                                             &mut connection.quic,
                                             stream_id,
-                                            http::StatusCode::SERVICE_UNAVAILABLE,
-                                            b"upstream admission limiter unavailable\n",
+                                            b"upstream overloaded, retry later\n",
+                                            resilience.shed_retry_after_seconds,
                                         )?;
                                         resilience
                                             .adaptive_admission
                                             .observe(request_start.elapsed(), true);
                                         continue;
                                     }
-                                };
+                                },
+                                None => {
+                                    drop(global_permit);
+                                    metrics.inc_failure();
+                                    metrics.inc_overload_shed_reason(
+                                        OverloadShedReason::UpstreamInflight,
+                                    );
+                                    metrics.record_route(
+                                        &upstream_name,
+                                        request_start.elapsed(),
+                                        RouteOutcome::OverloadShed,
+                                    );
+                                    Self::send_simple_response(
+                                        h3,
+                                        &mut connection.quic,
+                                        stream_id,
+                                        http::StatusCode::SERVICE_UNAVAILABLE,
+                                        b"upstream admission limiter unavailable\n",
+                                    )?;
+                                    resilience
+                                        .adaptive_admission
+                                        .observe(request_start.elapsed(), true);
+                                    continue;
+                                }
+                            };
 
                             let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
                             let incoming_traceparent = extract_header_value(&list, b"traceparent")
@@ -5664,7 +5666,7 @@ mod tests {
 
     use crate::resilience::{AdaptiveAdmission, RouteQueueLimiter};
     use crate::{RequestEnvelope, StreamPhase};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
     use tokio::sync::{Semaphore, mpsc, oneshot};
 
     fn make_envelope(phase: StreamPhase) -> RequestEnvelope {
@@ -5902,5 +5904,42 @@ mod tests {
     fn traceparent_parser_rejects_invalid_value() {
         let parsed = super::parse_traceparent("00-xyz-123-01");
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn inflight_micro_wait_acquires_when_permit_recovers() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let held = semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("acquire initial permit");
+        let semaphore_for_task = Arc::clone(&semaphore);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2));
+            drop(held);
+        });
+
+        let acquired = super::QUICListener::try_acquire_owned_with_micro_wait(
+            semaphore_for_task,
+            Duration::from_millis(10),
+        );
+        assert!(acquired.is_ok());
+        let (_, waited) = acquired.expect("permit should be acquired");
+        assert!(waited, "acquire should report that it waited");
+    }
+
+    #[test]
+    fn inflight_micro_wait_times_out_without_permit() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let _held = semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("acquire initial permit");
+
+        let acquired = super::QUICListener::try_acquire_owned_with_micro_wait(
+            Arc::clone(&semaphore),
+            Duration::from_millis(1),
+        );
+        assert!(acquired.is_err());
     }
 }

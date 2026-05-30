@@ -56,8 +56,8 @@ use crate::{
     SharedRuntimeState, StreamPhase, UpstreamResult,
     cid_radix::CidRadix,
     constants::{
-        DEFAULT_SCID_LEN_BYTES, MAX_DATAGRAM_SIZE_BYTES, MAX_STREAMS_PER_CONNECTION,
-        MAX_UDP_PAYLOAD_BYTES, MIN_SCID_LEN_BYTES, REQUEST_CHUNK_BYTES_LIMIT,
+        DEFAULT_SCID_LEN_BYTES, MAX_DATAGRAM_SIZE_BYTES, MAX_UDP_PAYLOAD_BYTES,
+        MIN_SCID_LEN_BYTES, REQUEST_CHUNK_BYTES_LIMIT,
         REQUEST_CHUNK_CHANNEL_CAPACITY, RESET_TOKEN_LEN_BYTES, RESPONSE_CHUNK_BYTES_LIMIT,
         RESPONSE_CHUNK_CHANNEL_CAPACITY, SCID_ROTATION_PACKET_THRESHOLD, UDP_READ_TIMEOUT_MS,
         scid_rotation_interval,
@@ -586,6 +586,10 @@ impl QUICListener {
             Duration::from_millis(config.performance.backend_total_request_timeout_ms);
         let drain_timeout = Duration::from_millis(config.performance.shutdown_drain_timeout_ms);
         let max_active_connections = config.performance.max_active_connections.max(1);
+        let max_streams_per_connection =
+            usize::try_from(config.performance.quic_initial_max_streams_bidi)
+                .unwrap_or(usize::MAX)
+                .max(1);
         let max_request_body_bytes = config.performance.max_request_body_bytes;
         let max_response_body_bytes = config.performance.max_response_body_bytes;
         let request_buffer_global_cap_bytes = config.performance.request_buffer_global_cap_bytes;
@@ -622,6 +626,7 @@ impl QUICListener {
             client_body_idle_timeout,
             backend_total_request_timeout,
             max_active_connections,
+            max_streams_per_connection,
             max_request_body_bytes,
             max_response_body_bytes,
             request_buffer_global_cap_bytes,
@@ -1400,6 +1405,7 @@ impl QUICListener {
                 self.config.observability.routing.enabled,
                 self.config.observability.routing.include_reason,
                 self.config.listen.port,
+                self.max_streams_per_connection,
             )
         {
             error!("HTTP/3 handling failed: {:?}", e);
@@ -1645,6 +1651,7 @@ impl QUICListener {
         routing_transparency_enabled: bool,
         routing_transparency_include_reason: bool,
         listen_port: u16,
+        max_streams_per_connection: usize,
     ) -> Result<(), quiche::h3::Error> {
         let mut body_buf = [0u8; MAX_DATAGRAM_SIZE_BYTES];
 
@@ -2313,10 +2320,10 @@ impl QUICListener {
                     // transport layer allows even if a race or misconfiguration
                     // delivers a stream-open event before the flow-control frame
                     // reaches the client.
-                    if connection.streams.len() >= MAX_STREAMS_PER_CONNECTION {
+                    if connection.streams.len() >= max_streams_per_connection {
                         warn!(
                             "stream limit reached ({} streams), rejecting stream {}",
-                            MAX_STREAMS_PER_CONNECTION, stream_id
+                            max_streams_per_connection, stream_id
                         );
                         // Dropping the permits and body_tx here releases inflight
                         // semaphore slots and signals the upstream task to abort.

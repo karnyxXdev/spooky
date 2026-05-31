@@ -13,6 +13,7 @@ use hyper::{Request, rt::Executor};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 
+use log::warn;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
@@ -99,7 +100,7 @@ impl H2Client {
 
 fn build_tls_config(tls: &TlsClientConfig) -> Result<ClientConfig, String> {
     if !tls.verify_certificates {
-        eprintln!(
+        warn!(
             "upstream TLS certificate verification is disabled (upstream_tls.verify_certificates=false); this is insecure and should only be used in trusted environments"
         );
         let mut cfg = ClientConfig::builder()

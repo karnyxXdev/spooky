@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendScheme {
     Http,
@@ -98,6 +100,52 @@ fn normalize_authority(authority: &str, scheme: BackendScheme) -> String {
     authority.to_string()
 }
 
+
+fn validate_dns_hostname(host: &str) -> Result<(), String> {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return Err("backend host is empty".to_string());
+    }
+
+    // Fast-path valid IP literals and localhost aliases.
+    if trimmed.eq_ignore_ascii_case("localhost") || trimmed.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+
+    let without_trailing_dot = trimmed.trim_end_matches('.');
+    if without_trailing_dot.is_empty() {
+        return Err("backend host is invalid".to_string());
+    }
+
+    // Enforce IDNA/UTS#46 conversion and reject malformed Unicode hostnames.
+    let ascii = idna::domain_to_ascii(without_trailing_dot)
+        .map_err(|_| "backend host is not a valid IDNA/DNS hostname".to_string())?;
+
+    if ascii.len() > 253 {
+        return Err("backend host exceeds maximum length (253)".to_string());
+    }
+
+    for label in ascii.split('.') {
+        if label.is_empty() {
+            return Err("backend host contains empty DNS label".to_string());
+        }
+        if label.len() > 63 {
+            return Err("backend host contains DNS label longer than 63 characters".to_string());
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("backend host DNS labels must not start or end with '-'".to_string());
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err("backend host contains invalid DNS label characters".to_string());
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_authority(authority: &str) -> Result<(), String> {
     if authority.chars().any(|ch| ch.is_ascii_whitespace()) {
         return Err("backend authority must not contain whitespace".to_string());
@@ -133,6 +181,8 @@ fn validate_authority(authority: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("backend host is empty".to_string());
     }
+
+    validate_dns_hostname(host)?;
 
     if port_str.is_empty() {
         return Err("backend port is empty".to_string());
@@ -188,6 +238,22 @@ mod tests {
         assert!(BackendEndpoint::parse("127.0.0.1:abc").is_err());
         assert!(BackendEndpoint::parse("::1:443").is_err());
         assert!(BackendEndpoint::parse("https://:443").is_err());
+    }
+
+
+    #[test]
+    fn parse_rejects_malformed_dns_hostnames() {
+        assert!(BackendEndpoint::parse("bad_host:443").is_err());
+        assert!(BackendEndpoint::parse("-bad.example.com:443").is_err());
+        assert!(BackendEndpoint::parse("bad-.example.com:443").is_err());
+        assert!(BackendEndpoint::parse("a..b.example.com:443").is_err());
+    }
+
+    #[test]
+    fn parse_accepts_idna_hostname() {
+        let endpoint = BackendEndpoint::parse("bücher.example:443").expect("idna host");
+        assert_eq!(endpoint.scheme(), BackendScheme::Https);
+        assert_eq!(endpoint.authority(), "bücher.example:443");
     }
 
     #[test]

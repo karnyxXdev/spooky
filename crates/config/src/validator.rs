@@ -1,6 +1,7 @@
 use crate::backend_endpoint::{BackendEndpoint, BackendScheme};
 use crate::config::{CURRENT_CONFIG_VERSION, Config, SUPPORTED_CONFIG_VERSIONS};
 use log::{error, info, warn};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::IpAddr;
@@ -137,6 +138,35 @@ fn is_valid_http_token(value: &str) -> bool {
                     | b'~'
             )
         })
+}
+
+
+
+fn normalize_route_host(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let host = if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            &rest[..end]
+        } else {
+            trimmed
+        }
+    } else if let Some((candidate_host, candidate_port)) = trimmed.rsplit_once(':') {
+        if !candidate_host.contains(':') && candidate_port.chars().all(|c| c.is_ascii_digit()) {
+            candidate_host
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn normalized_route_method(method: Option<&str>) -> Option<String> {
+    method
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_uppercase())
 }
 
 pub fn validate(config: &Config) -> bool {
@@ -898,8 +928,28 @@ pub fn validate(config: &Config) -> bool {
         return false;
     }
 
-    let mut seen_backend_origins: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
+    let mut seen_route_matchers: HashMap<(Option<String>, Option<String>, Option<String>), String> =
+        HashMap::new();
+
+    for (upstream_name, upstream) in &config.upstream {
+        let route_key = (
+            upstream.route.host.as_deref().map(normalize_route_host),
+            upstream.route.path_prefix.clone(),
+            normalized_route_method(upstream.route.method.as_deref()),
+        );
+
+        if let Some(existing_upstream) =
+            seen_route_matchers.insert(route_key.clone(), upstream_name.clone())
+        {
+            error!(
+                "Ambiguous route matcher detected: upstream '{}' conflicts with upstream '{}' for host={:?} path_prefix={:?} method={:?}",
+                upstream_name, existing_upstream, route_key.0, route_key.1, route_key.2
+            );
+            return false;
+        }
+    }
+
+    let mut seen_backend_origins: HashMap<String, (String, String)> = HashMap::new();
 
     for (upstream_name, upstream) in &config.upstream {
         if upstream_name.is_empty() {
@@ -1691,4 +1741,78 @@ upstream:
         cfg.security.privileges.group = " ".to_string();
         assert!(!validate(&cfg));
     }
+
+
+    #[test]
+    fn rejects_ambiguous_route_matchers_with_same_host_path_and_method() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        {
+            let upstream = cfg.upstream.get_mut("test_upstream").expect("upstream");
+            upstream.route.host = Some("API.EXAMPLE.COM:443".to_string());
+            upstream.route.path_prefix = Some("/api".to_string());
+            upstream.route.method = Some("get".to_string());
+            upstream.backends[0].address = "127.0.0.1:9001".to_string();
+        }
+
+        let duplicate = Upstream {
+            load_balancing: LoadBalancing {
+                lb_type: "round-robin".to_string(),
+                key: None,
+            },
+            route: RouteMatch {
+                host: Some("api.example.com".to_string()),
+                path_prefix: Some("/api".to_string()),
+                method: Some("GET".to_string()),
+            },
+            backends: vec![Backend {
+                id: "backend-2".to_string(),
+                address: "127.0.0.1:9002".to_string(),
+                weight: 1,
+                health_check: None,
+            }],
+        };
+        cfg.upstream.insert("test_upstream_2".to_string(), duplicate);
+
+        assert!(!validate(&cfg));
+    }
+
+    #[test]
+    fn allows_same_host_and_path_when_methods_differ() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        {
+            let upstream = cfg.upstream.get_mut("test_upstream").expect("upstream");
+            upstream.route.host = Some("api.example.com".to_string());
+            upstream.route.path_prefix = Some("/api".to_string());
+            upstream.route.method = Some("GET".to_string());
+            upstream.backends[0].address = "127.0.0.1:9001".to_string();
+        }
+
+        let post_route = Upstream {
+            load_balancing: LoadBalancing {
+                lb_type: "round-robin".to_string(),
+                key: None,
+            },
+            route: RouteMatch {
+                host: Some("api.example.com".to_string()),
+                path_prefix: Some("/api".to_string()),
+                method: Some("POST".to_string()),
+            },
+            backends: vec![Backend {
+                id: "backend-2".to_string(),
+                address: "127.0.0.1:9002".to_string(),
+                weight: 1,
+                health_check: None,
+            }],
+        };
+        cfg.upstream.insert("test_upstream_2".to_string(), post_route);
+
+        assert!(validate(&cfg));
+    }
+
 }

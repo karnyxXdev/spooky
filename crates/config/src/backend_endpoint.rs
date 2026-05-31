@@ -100,7 +100,6 @@ fn normalize_authority(authority: &str, scheme: BackendScheme) -> String {
     authority.to_string()
 }
 
-
 fn validate_dns_hostname(host: &str) -> Result<(), String> {
     let trimmed = host.trim();
     if trimmed.is_empty() {
@@ -239,7 +238,6 @@ mod tests {
         assert!(BackendEndpoint::parse("::1:443").is_err());
         assert!(BackendEndpoint::parse("https://:443").is_err());
     }
-
 
     #[test]
     fn parse_rejects_malformed_dns_hostnames() {

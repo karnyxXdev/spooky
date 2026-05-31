@@ -140,8 +140,6 @@ fn is_valid_http_token(value: &str) -> bool {
         })
 }
 
-
-
 fn normalize_route_host(raw: &str) -> String {
     let trimmed = raw.trim();
     let host = if let Some(rest) = trimmed.strip_prefix('[') {
@@ -1743,7 +1741,6 @@ upstream:
         assert!(!validate(&cfg));
     }
 
-
     #[test]
     fn rejects_ambiguous_route_matchers_with_same_host_path_and_method() {
         let dir = tempdir().expect("tempdir");
@@ -1775,7 +1772,8 @@ upstream:
                 health_check: None,
             }],
         };
-        cfg.upstream.insert("test_upstream_2".to_string(), duplicate);
+        cfg.upstream
+            .insert("test_upstream_2".to_string(), duplicate);
 
         assert!(!validate(&cfg));
     }
@@ -1811,9 +1809,9 @@ upstream:
                 health_check: None,
             }],
         };
-        cfg.upstream.insert("test_upstream_2".to_string(), post_route);
+        cfg.upstream
+            .insert("test_upstream_2".to_string(), post_route);
 
         assert!(validate(&cfg));
     }
-
 }

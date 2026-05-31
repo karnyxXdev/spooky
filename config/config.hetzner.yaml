@@ -1,0 +1,189 @@
+version: 1
+
+# Hetzner benchmark profile (validated against host audit on 2026-05-30):
+# - Intel Xeon E5-1620 v2
+# - 4 physical cores / 8 logical CPUs
+# - 32 GiB RAM
+#
+# This profile is tuned for benchmark/load-matrix runs on Hetzner.
+# It is safe for same-host or remote load generation.
+
+listen:
+  protocol: http3
+  address: "0.0.0.0"
+  port: 9889
+  tls:
+    cert: certs/proxy-fullchain.pem
+    key: certs/proxy-key-pkcs8.pem
+    client_auth:
+      enabled: false
+      require_client_cert: false
+      ca_file: null
+
+upstream:
+  default:
+    load_balancing:
+      type: round-robin
+    route:
+      path_prefix: "/"
+    backends:
+      - id: "backend1"
+        # Explicit cleartext for local benchmark backends.
+        address: "http://127.0.0.1:8080"
+        weight: 100
+      - id: "backend2"
+        address: "http://127.0.0.1:8081"
+        weight: 100
+
+upstream_tls:
+  # Upstream is http:// in this benchmark profile.
+  verify_certificates: false
+  strict_sni: false
+  ca_file: null
+  ca_dir: null
+
+log:
+  # Reduce log overhead during throughput tests.
+  level: warn
+  format: plain
+  file:
+    enabled: false
+    path: /var/log/spooky/spooky.log
+
+performance:
+  # Derived from host: 4 physical cores.
+  worker_threads: 4
+  control_plane_threads: 2
+  packet_shards_per_worker: 1
+
+  packet_shard_queue_capacity: 4096
+  packet_shard_queue_max_bytes: 134217728
+
+  reuseport: true
+  pin_workers: false
+
+  # Balanced defaults for 4 physical cores.
+  global_inflight_limit: 4096
+  per_upstream_inflight_limit: 2048
+  per_backend_inflight_limit: 128
+
+  backend_timeout_ms: 2000
+  backend_connect_timeout_ms: 500
+  backend_body_idle_timeout_ms: 2000
+  backend_body_total_timeout_ms: 30000
+  backend_total_request_timeout_ms: 35000
+  client_body_idle_timeout_ms: 10000
+  shutdown_drain_timeout_ms: 5000
+
+  # Sized for 32 GiB host and high packet rates.
+  udp_recv_buffer_bytes: 33554432
+  udp_send_buffer_bytes: 33554432
+
+  h2_pool_max_idle_per_backend: 256
+  h2_pool_idle_timeout_ms: 90000
+
+  new_connections_per_sec: 5000
+  new_connections_burst: 1500
+  max_active_connections: 25000
+
+  quic_max_idle_timeout_ms: 5000
+  quic_initial_max_data: 10000000
+  quic_initial_max_stream_data: 1000000
+  quic_initial_max_streams_bidi: 100
+  quic_initial_max_streams_uni: 100
+
+  max_request_body_bytes: 1000000
+  max_response_body_bytes: 104857600
+  request_buffer_global_cap_bytes: 67108864
+  unknown_length_response_prebuffer_bytes: 2097152
+
+observability:
+  metrics:
+    enabled: false
+    required: false
+    address: "127.0.0.1"
+    port: 9901
+    path: "/metrics"
+    max_connections: 512
+    connection_timeout_ms: 30000
+  control_api:
+    enabled: false
+    required: false
+    address: "127.0.0.1"
+    port: 9902
+    health_path: "/healthz"
+    ready_path: "/ready"
+    runtime_path: "/admin/runtime"
+    restart_path: "/admin/runtime/restart"
+    auth_token: null
+    max_connections: 256
+    connection_timeout_ms: 30000
+  tracing:
+    enabled: false
+    service_name: "spooky"
+    otlp_endpoint: null
+    sample_ratio: 1.0
+  routing:
+    enabled: false
+    include_reason: true
+    expose_header: false
+    header_name: "x-spooky-route-decision"
+
+resilience:
+  adaptive_admission:
+    enabled: true
+    min_limit: 128
+    max_limit: 4096
+    decrease_step: 32
+    increase_step: 16
+    high_latency_ms: 300
+  route_queue:
+    default_cap: 1024
+    global_cap: 4096
+    shed_retry_after_seconds: 1
+    caps: {}
+  protocol:
+    allow_0rtt: false
+    early_data_safe_methods: ["GET", "HEAD"]
+    max_headers_count: 128
+    max_headers_bytes: 16384
+    enforce_authority_host_match: true
+    allowed_methods: []
+    denied_path_prefixes: []
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5
+    open_ms: 10000
+    half_open_max_probes: 2
+  hedging:
+    enabled: false
+    delay_ms: 75
+    safe_methods: ["GET", "HEAD"]
+    route_allowlist: []
+  retry_budget:
+    enabled: true
+    ratio_percent: 20
+    per_route_ratio_percent: {}
+  brownout:
+    enabled: true
+    trigger_inflight_percent: 90
+    recover_inflight_percent: 60
+    core_routes: []
+  watchdog:
+    enabled: false
+    check_interval_ms: 1000
+    poll_stall_timeout_ms: 5000
+    timeout_error_rate_percent: 60
+    min_requests_per_window: 20
+    overload_inflight_percent: 95
+    unhealthy_consecutive_windows: 3
+    drain_grace_ms: 8000
+    restart_cooldown_ms: 120000
+    restart_command: []
+
+security:
+  privileges:
+    # Keep disabled for benchmark runs started by regular user accounts.
+    enabled: false
+    user: "nobody"
+    group: "nogroup"

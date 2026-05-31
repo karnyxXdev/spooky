@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::{SocketAddr, UdpSocket},
     time::{Duration, Instant},
 };
@@ -44,10 +44,24 @@ struct Cli {
     /// Suppress response headers/body output.
     #[arg(long)]
     quiet: bool,
+
+    /// Per-attempt timeout in milliseconds for in-flight requests.
+    #[arg(long, default_value_t = REQUEST_TIMEOUT_SECS * 1000)]
+    request_timeout_ms: u64,
+
+    /// Additional retries for transport-level request failures.
+    #[arg(long, default_value_t = 0)]
+    max_request_retries: usize,
+
+    /// Additional connection re-establishment attempts.
+    #[arg(long, default_value_t = 0)]
+    max_connection_retries: usize,
 }
 
-struct RequestState {
-    start: Instant,
+struct InflightRequest {
+    request_id: usize,
+    first_start: Instant,
+    attempt_start: Instant,
     body: Vec<u8>,
 }
 
@@ -55,6 +69,68 @@ fn emit_request_result(ok: bool, latency_ns: u128, report_latency: bool) {
     if report_latency {
         println!("{} {}", if ok { 1 } else { 0 }, latency_ns);
     }
+}
+
+fn should_retry_request(attempts_started: usize, max_request_retries: usize) -> bool {
+    attempts_started <= max_request_retries
+}
+
+fn open_connection(
+    config: &mut quiche::Config,
+    host: &str,
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
+) -> Result<quiche::Connection, Box<dyn std::error::Error>> {
+    let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
+    rand::thread_rng().fill_bytes(&mut scid_bytes);
+    let scid = quiche::ConnectionId::from_ref(&scid_bytes);
+    Ok(quiche::connect(
+        Some(host),
+        &scid,
+        local_addr,
+        peer_addr,
+        config,
+    )?)
+}
+
+fn flush_egress(
+    conn: &mut quiche::Connection,
+    socket: &UdpSocket,
+    out: &mut [u8],
+) -> Result<(), quiche::Error> {
+    loop {
+        match conn.send(out) {
+            Ok((write, send_info)) => {
+                let _ = socket.send_to(&out[..write], send_info.to);
+            }
+            Err(quiche::Error::Done) => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retry_or_fail_request(
+    request_id: usize,
+    request_attempts: &[usize],
+    request_started: &[Option<Instant>],
+    pending: &mut VecDeque<usize>,
+    max_request_retries: usize,
+    failures: &mut usize,
+    completed: &mut usize,
+    report_latency: bool,
+) {
+    if should_retry_request(request_attempts[request_id], max_request_retries) {
+        pending.push_back(request_id);
+        return;
+    }
+
+    *failures = failures.saturating_add(1);
+    *completed = completed.saturating_add(1);
+    let latency_ns = request_started[request_id]
+        .map(|start| start.elapsed().as_nanos())
+        .unwrap_or(0);
+    emit_request_result(false, latency_ns, report_latency);
 }
 
 fn run_client(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -78,40 +154,32 @@ fn run_client(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     config.enable_early_data();
     config.verify_peer(!cli.insecure);
 
-    let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
-    rand::thread_rng().fill_bytes(&mut scid_bytes);
-    let scid = quiche::ConnectionId::from_ref(&scid_bytes);
-
-    let mut conn = quiche::connect(Some(&cli.host), &scid, local_addr, peer_addr, &mut config)?;
+    let mut conn = open_connection(&mut config, &cli.host, local_addr, peer_addr)?;
     let mut h3_conn: Option<quiche::h3::Connection> = None;
 
     let mut out = [0u8; MAX_DATAGRAM_SIZE_BYTES];
     let mut buf = [0u8; MAX_DATAGRAM_SIZE_BYTES];
 
-    let mut next_request_idx = 0usize;
+    let mut reconnect_attempts = 0usize;
+    let mut pending: VecDeque<usize> = (0..cli.requests).collect();
+    let mut request_attempts = vec![0usize; cli.requests];
+    let mut request_started: Vec<Option<Instant>> = vec![None; cli.requests];
     let mut completed = 0usize;
     let mut failures = 0usize;
     let mut last_error: Option<String> = None;
-    let mut inflight: HashMap<u64, RequestState> = HashMap::new();
-    let per_request_timeout = Duration::from_secs(REQUEST_TIMEOUT_SECS);
+    let mut inflight: HashMap<u64, InflightRequest> = HashMap::new();
+    let per_request_timeout = Duration::from_millis(cli.request_timeout_ms);
 
     // Kick off handshake packet(s).
-    let (write, send_info) = conn.send(&mut out)?;
-    socket.send_to(&out[..write], send_info.to)?;
+    let _ = flush_egress(&mut conn, &socket, &mut out);
 
     while completed < cli.requests {
+        let mut reconnect_requested = false;
+
         // Flush pending egress packets.
-        loop {
-            match conn.send(&mut out) {
-                Ok((write, send_info)) => {
-                    let _ = socket.send_to(&out[..write], send_info.to);
-                }
-                Err(quiche::Error::Done) => break,
-                Err(e) => {
-                    last_error = Some(format!("send failed: {e:?}"));
-                    break;
-                }
-            }
+        if let Err(e) = flush_egress(&mut conn, &socket, &mut out) {
+            last_error = Some(format!("send failed: {e:?}"));
+            reconnect_requested = true;
         }
 
         let timeout = conn
@@ -149,7 +217,13 @@ fn run_client(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(h3) = h3_conn.as_mut() {
             // Submit more requests on the same connection up to stream concurrency cap.
-            while next_request_idx < cli.requests && inflight.len() < cli.parallel_streams {
+            while inflight.len() < cli.parallel_streams {
+                let Some(request_id) = pending.pop_front() else {
+                    break;
+                };
+                let first_start_ref = request_started[request_id].get_or_insert_with(Instant::now);
+                let first_start = *first_start_ref;
+
                 let req = vec![
                     quiche::h3::Header::new(b":method", b"GET"),
                     quiche::h3::Header::new(b":scheme", b"https"),
@@ -160,25 +234,36 @@ fn run_client(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                 match h3.send_request(&mut conn, &req, true) {
                     Ok(stream_id) => {
+                        request_attempts[request_id] =
+                            request_attempts[request_id].saturating_add(1);
                         inflight.insert(
                             stream_id,
-                            RequestState {
-                                start: Instant::now(),
+                            InflightRequest {
+                                request_id,
+                                first_start,
+                                attempt_start: Instant::now(),
                                 body: Vec::new(),
                             },
                         );
-                        next_request_idx = next_request_idx.saturating_add(1);
                     }
                     Err(quiche::h3::Error::Done) | Err(quiche::h3::Error::StreamBlocked) => {
+                        pending.push_front(request_id);
                         break;
                     }
                     Err(e) => {
-                        // Count this unsent request as failed and move on.
-                        failures = failures.saturating_add(1);
-                        completed = completed.saturating_add(1);
-                        next_request_idx = next_request_idx.saturating_add(1);
+                        request_attempts[request_id] =
+                            request_attempts[request_id].saturating_add(1);
                         last_error = Some(format!("send_request failed: {e:?}"));
-                        emit_request_result(false, 0, cli.report_latency);
+                        retry_or_fail_request(
+                            request_id,
+                            &request_attempts,
+                            &request_started,
+                            &mut pending,
+                            cli.max_request_retries,
+                            &mut failures,
+                            &mut completed,
+                            cli.report_latency,
+                        );
                     }
                 }
             }
@@ -205,19 +290,25 @@ fn run_client(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             Err(quiche::h3::Error::Done) => break,
                             Err(e) => {
                                 if let Some(state) = inflight.remove(&stream_id) {
-                                    let latency_ns = state.start.elapsed().as_nanos();
-                                    failures = failures.saturating_add(1);
-                                    completed = completed.saturating_add(1);
-                                    emit_request_result(false, latency_ns, cli.report_latency);
+                                    last_error = Some(format!("recv_body failed: {e:?}"));
+                                    retry_or_fail_request(
+                                        state.request_id,
+                                        &request_attempts,
+                                        &request_started,
+                                        &mut pending,
+                                        cli.max_request_retries,
+                                        &mut failures,
+                                        &mut completed,
+                                        cli.report_latency,
+                                    );
                                 }
-                                last_error = Some(format!("recv_body failed: {e:?}"));
                                 break;
                             }
                         }
                     },
                     Ok((stream_id, quiche::h3::Event::Finished)) => {
                         if let Some(state) = inflight.remove(&stream_id) {
-                            let latency_ns = state.start.elapsed().as_nanos();
+                            let latency_ns = state.first_start.elapsed().as_nanos();
                             completed = completed.saturating_add(1);
                             emit_request_result(true, latency_ns, cli.report_latency);
 
@@ -232,19 +323,25 @@ fn run_client(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Ok((stream_id, quiche::h3::Event::Reset(_))) => {
-                        let latency_ns = inflight
-                            .remove(&stream_id)
-                            .map(|state| state.start.elapsed().as_nanos())
-                            .unwrap_or(0);
-                        failures = failures.saturating_add(1);
-                        completed = completed.saturating_add(1);
-                        emit_request_result(false, latency_ns, cli.report_latency);
+                        if let Some(state) = inflight.remove(&stream_id) {
+                            retry_or_fail_request(
+                                state.request_id,
+                                &request_attempts,
+                                &request_started,
+                                &mut pending,
+                                cli.max_request_retries,
+                                &mut failures,
+                                &mut completed,
+                                cli.report_latency,
+                            );
+                        }
                     }
                     Ok((_stream_id, quiche::h3::Event::PriorityUpdate)) => {}
                     Ok((_stream_id, quiche::h3::Event::GoAway)) => {}
                     Err(quiche::h3::Error::Done) => break,
                     Err(e) => {
                         last_error = Some(format!("h3 poll failed: {e:?}"));
+                        reconnect_requested = true;
                         break;
                     }
                 }
@@ -254,35 +351,63 @@ fn run_client(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         // Per-request timeout enforcement for in-flight streams.
         let mut timed_out = Vec::new();
         for (stream_id, state) in &inflight {
-            if state.start.elapsed() > per_request_timeout {
+            if state.attempt_start.elapsed() > per_request_timeout {
                 timed_out.push(*stream_id);
             }
         }
         for stream_id in timed_out {
             if let Some(state) = inflight.remove(&stream_id) {
-                let latency_ns = state.start.elapsed().as_nanos();
-                failures = failures.saturating_add(1);
-                completed = completed.saturating_add(1);
-                emit_request_result(false, latency_ns, cli.report_latency);
+                retry_or_fail_request(
+                    state.request_id,
+                    &request_attempts,
+                    &request_started,
+                    &mut pending,
+                    cli.max_request_retries,
+                    &mut failures,
+                    &mut completed,
+                    cli.report_latency,
+                );
             }
         }
 
         if conn.is_closed() {
-            // Fail any remaining in-flight and unsent requests.
+            reconnect_requested = true;
+        }
+
+        if reconnect_requested && completed < cli.requests {
             for (_stream_id, state) in inflight.drain() {
-                failures = failures.saturating_add(1);
-                completed = completed.saturating_add(1);
-                emit_request_result(false, state.start.elapsed().as_nanos(), cli.report_latency);
+                retry_or_fail_request(
+                    state.request_id,
+                    &request_attempts,
+                    &request_started,
+                    &mut pending,
+                    cli.max_request_retries,
+                    &mut failures,
+                    &mut completed,
+                    cli.report_latency,
+                );
             }
 
-            if completed < cli.requests {
-                let remaining = cli.requests - completed;
-                failures = failures.saturating_add(remaining);
-                for _ in 0..remaining {
-                    emit_request_result(false, 0, cli.report_latency);
-                }
-                completed = cli.requests;
+            if completed >= cli.requests {
+                break;
             }
+
+            if reconnect_attempts >= cli.max_connection_retries {
+                while let Some(request_id) = pending.pop_front() {
+                    failures = failures.saturating_add(1);
+                    completed = completed.saturating_add(1);
+                    let latency_ns = request_started[request_id]
+                        .map(|start| start.elapsed().as_nanos())
+                        .unwrap_or(0);
+                    emit_request_result(false, latency_ns, cli.report_latency);
+                }
+                break;
+            }
+
+            reconnect_attempts = reconnect_attempts.saturating_add(1);
+            conn = open_connection(&mut config, &cli.host, local_addr, peer_addr)?;
+            h3_conn = None;
+            let _ = flush_egress(&mut conn, &socket, &mut out);
         }
     }
 
@@ -312,5 +437,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--parallel-streams must be >= 1".into());
     }
 
+    if cli.request_timeout_ms == 0 {
+        return Err("--request-timeout-ms must be >= 1".into());
+    }
+
     run_client(&cli)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_retry_request;
+
+    #[test]
+    fn retry_budget_interpretation_is_stable() {
+        assert!(!should_retry_request(1, 0));
+        assert!(should_retry_request(1, 1));
+        assert!(!should_retry_request(2, 1));
+        assert!(should_retry_request(3, 3));
+    }
 }

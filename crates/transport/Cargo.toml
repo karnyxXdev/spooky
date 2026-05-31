@@ -10,6 +10,7 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 hyper-rustls.workspace = true
+log.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 tokio.workspace = true

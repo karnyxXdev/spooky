@@ -169,6 +169,8 @@ fn normalized_route_method(method: Option<&str>) -> Option<String> {
         .map(|value| value.to_ascii_uppercase())
 }
 
+type RouteMatcherKey = (Option<String>, Option<String>, Option<String>);
+
 pub fn validate(config: &Config) -> bool {
     info!("Starting configuration validation...");
 
@@ -928,8 +930,7 @@ pub fn validate(config: &Config) -> bool {
         return false;
     }
 
-    let mut seen_route_matchers: HashMap<(Option<String>, Option<String>, Option<String>), String> =
-        HashMap::new();
+    let mut seen_route_matchers: HashMap<RouteMatcherKey, String> = HashMap::new();
 
     for (upstream_name, upstream) in &config.upstream {
         let route_key = (

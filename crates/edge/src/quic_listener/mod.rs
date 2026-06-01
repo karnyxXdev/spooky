@@ -219,7 +219,8 @@ fn is_connect_tunnel_response(method: &str, status: StatusCode) -> bool {
 
 fn can_poll_upstream_result(req: &RequestEnvelope) -> bool {
     if is_connect_method(&req.method)
-        && (req.phase == StreamPhase::ReceivingRequest || req.phase == StreamPhase::AwaitingUpstream)
+        && (req.phase == StreamPhase::ReceivingRequest
+            || req.phase == StreamPhase::AwaitingUpstream)
     {
         return true;
     }
@@ -2838,8 +2839,9 @@ impl QUICListener {
             // oversized requests must still be able to terminate with 413 even if
             // upstream produced an early response. CONNECT is the exception:
             // successful CONNECT establishes a tunnel and must not wait for request FIN.
-            let can_poll_upstream =
-                streams.get(&stream_id).is_some_and(can_poll_upstream_result);
+            let can_poll_upstream = streams
+                .get(&stream_id)
+                .is_some_and(can_poll_upstream_result);
 
             // upstream_ready: Option<UpstreamResult>
             //   None          → oneshot not yet resolved (or not eligible), skip
@@ -5002,12 +5004,12 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::{
-        ConnectionRoutes, TokenBucket, abort_stream, classify_active_health_check_response,
-        can_poll_upstream_result, collect_h3_trailers, connection_header_tokens,
-        is_connect_tunnel_response, purge_connection_routes,
-        resolve_primary_from_radix_prefix, response_size_exceeded_after_chunk,
-        should_strip_bootstrap_request_header, should_strip_bootstrap_response_header,
-        should_strip_h3_response_header, sweep_closed_connections,
+        ConnectionRoutes, TokenBucket, abort_stream, can_poll_upstream_result,
+        classify_active_health_check_response, collect_h3_trailers, connection_header_tokens,
+        is_connect_tunnel_response, purge_connection_routes, resolve_primary_from_radix_prefix,
+        response_size_exceeded_after_chunk, should_strip_bootstrap_request_header,
+        should_strip_bootstrap_response_header, should_strip_h3_response_header,
+        sweep_closed_connections,
     };
     type RoutingMaps = (
         HashMap<Arc<[u8]>, Arc<[u8]>>,
@@ -5581,8 +5583,14 @@ mod tests {
     #[test]
     fn connect_tunnel_response_detected_only_for_success_status() {
         assert!(is_connect_tunnel_response("CONNECT", StatusCode::OK));
-        assert!(is_connect_tunnel_response("connect", StatusCode::NO_CONTENT));
-        assert!(!is_connect_tunnel_response("CONNECT", StatusCode::BAD_GATEWAY));
+        assert!(is_connect_tunnel_response(
+            "connect",
+            StatusCode::NO_CONTENT
+        ));
+        assert!(!is_connect_tunnel_response(
+            "CONNECT",
+            StatusCode::BAD_GATEWAY
+        ));
         assert!(!is_connect_tunnel_response("GET", StatusCode::OK));
     }
 

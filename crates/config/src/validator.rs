@@ -158,10 +158,7 @@ fn is_valid_connect_authority(value: &str) -> bool {
         if !suffix.starts_with(':') || suffix.len() <= 1 {
             return false;
         }
-        return suffix[1..]
-            .parse::<u16>()
-            .ok()
-            .is_some_and(|port| port > 0);
+        return suffix[1..].parse::<u16>().ok().is_some_and(|port| port > 0);
     }
 
     let Some((host, port)) = trimmed.rsplit_once(':') else {
@@ -634,7 +631,11 @@ pub fn validate(config: &Config) -> bool {
 
     if !config.resilience.protocol.allow_connect
         && (!config.resilience.protocol.connect_allowed_ports.is_empty()
-            || !config.resilience.protocol.connect_allowed_authorities.is_empty())
+            || !config
+                .resilience
+                .protocol
+                .connect_allowed_authorities
+                .is_empty())
     {
         error!(
             "resilience.protocol.connect_allowed_ports/connect_allowed_authorities require allow_connect=true"
@@ -646,8 +647,7 @@ pub fn validate(config: &Config) -> bool {
         .resilience
         .protocol
         .connect_allowed_ports
-        .iter()
-        .any(|port| *port == 0)
+        .contains(&0)
     {
         error!("resilience.protocol.connect_allowed_ports must contain ports in range 1-65535");
         return false;
@@ -1395,11 +1395,12 @@ upstream:
         assert_eq!(cfg.resilience.protocol.max_headers_bytes, 16 * 1024);
         assert!(cfg.resilience.protocol.enforce_authority_host_match);
         assert!(cfg.resilience.protocol.connect_allowed_ports.is_empty());
-        assert!(cfg
-            .resilience
-            .protocol
-            .connect_allowed_authorities
-            .is_empty());
+        assert!(
+            cfg.resilience
+                .protocol
+                .connect_allowed_authorities
+                .is_empty()
+        );
         assert!(!cfg.resilience.watchdog.enabled);
         assert_eq!(cfg.resilience.watchdog.check_interval_ms, 1_000);
         assert_eq!(cfg.observability.control_api.max_connections, 256);

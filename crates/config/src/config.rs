@@ -42,6 +42,7 @@ use crate::default::{
     resilience_default_cb_failure_threshold, resilience_default_cb_half_open_max_probes,
     resilience_default_cb_open_ms, resilience_default_hedging_delay_ms,
     resilience_default_hedging_enabled, resilience_default_protocol_allow_0rtt,
+    resilience_default_protocol_allow_connect,
     resilience_default_protocol_enforce_authority_host_match,
     resilience_default_protocol_max_headers_bytes, resilience_default_protocol_max_headers_count,
     resilience_default_retry_budget_enabled, resilience_default_retry_budget_ratio_percent,
@@ -589,6 +590,8 @@ impl Default for RouteQueue {
 pub struct ProtocolPolicy {
     #[serde(default = "resilience_default_protocol_allow_0rtt")]
     pub allow_0rtt: bool,
+    #[serde(default = "resilience_default_protocol_allow_connect")]
+    pub allow_connect: bool,
     #[serde(default)]
     pub early_data_safe_methods: Vec<String>,
     #[serde(default = "resilience_default_protocol_max_headers_count")]
@@ -601,12 +604,17 @@ pub struct ProtocolPolicy {
     pub allowed_methods: Vec<String>,
     #[serde(default)]
     pub denied_path_prefixes: Vec<String>,
+    #[serde(default)]
+    pub connect_allowed_ports: Vec<u16>,
+    #[serde(default)]
+    pub connect_allowed_authorities: Vec<String>,
 }
 
 impl Default for ProtocolPolicy {
     fn default() -> Self {
         Self {
             allow_0rtt: resilience_default_protocol_allow_0rtt(),
+            allow_connect: resilience_default_protocol_allow_connect(),
             early_data_safe_methods: vec!["GET".to_string(), "HEAD".to_string()],
             max_headers_count: resilience_default_protocol_max_headers_count(),
             max_headers_bytes: resilience_default_protocol_max_headers_bytes(),
@@ -614,6 +622,8 @@ impl Default for ProtocolPolicy {
             ),
             allowed_methods: Vec::new(),
             denied_path_prefixes: Vec::new(),
+            connect_allowed_ports: Vec::new(),
+            connect_allowed_authorities: Vec::new(),
         }
     }
 }

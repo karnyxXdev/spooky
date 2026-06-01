@@ -129,9 +129,25 @@ pub(super) fn validate_request_headers(
             ));
         }
     };
-    let path = match path {
-        Some(path) => path,
-        None => {
+    let is_connect = method.eq_ignore_ascii_case("CONNECT");
+    let path = match (is_connect, path) {
+        (true, Some(path)) if path.is_empty() => {
+            return Err((
+                http::StatusCode::BAD_REQUEST,
+                b"invalid CONNECT :path header\n",
+                false,
+            ));
+        }
+        (true, Some(_)) => {
+            return Err((
+                http::StatusCode::BAD_REQUEST,
+                b"invalid CONNECT :path header\n",
+                false,
+            ));
+        }
+        (true, None) => "/".to_string(),
+        (false, Some(path)) => path,
+        (false, None) => {
             return Err((
                 http::StatusCode::BAD_REQUEST,
                 b"missing :path header\n",
@@ -151,6 +167,8 @@ pub(super) fn validate_request_headers(
             invalid_method: b"invalid :method header\n",
             invalid_path: b"invalid :path header\n",
             authority_mismatch: b":authority and host headers must match\n",
+            connect_path_not_allowed: b"invalid CONNECT :path header\n",
+            connect_authority_required: b"CONNECT requires authority host:port\n",
         },
     )
 }
@@ -221,6 +239,8 @@ pub(super) fn validate_http_request(
             invalid_method: b"invalid method header\n",
             invalid_path: b"invalid path header\n",
             authority_mismatch: b"authority and host headers must match\n",
+            connect_path_not_allowed: b"invalid CONNECT path\n",
+            connect_authority_required: b"CONNECT requires authority host:port\n",
         },
     )
 }
@@ -238,6 +258,8 @@ struct RequestPartErrors {
     invalid_method: &'static [u8],
     invalid_path: &'static [u8],
     authority_mismatch: &'static [u8],
+    connect_path_not_allowed: &'static [u8],
+    connect_authority_required: &'static [u8],
 }
 
 fn validate_request_parts(
@@ -249,11 +271,20 @@ fn validate_request_parts(
     resilience: &RuntimeResilience,
     errors: RequestPartErrors,
 ) -> Result<RequestValidationResult, (http::StatusCode, &'static [u8], bool)> {
+    let is_connect = method.eq_ignore_ascii_case("CONNECT");
     if method.trim().is_empty() || method.as_bytes().iter().any(|b| b.is_ascii_whitespace()) {
         return Err((http::StatusCode::BAD_REQUEST, errors.invalid_method, false));
     }
 
-    if path.is_empty() || !path.starts_with('/') {
+    if is_connect {
+        if !path.is_empty() && path != "/" {
+            return Err((
+                http::StatusCode::BAD_REQUEST,
+                errors.connect_path_not_allowed,
+                false,
+            ));
+        }
+    } else if path.is_empty() || !path.starts_with('/') {
         return Err((http::StatusCode::BAD_REQUEST, errors.invalid_path, false));
     }
 
@@ -281,7 +312,20 @@ fn validate_request_parts(
         ));
     }
 
-    if resilience.path_denied(&path) {
+    if is_connect {
+        let connect_authority = authority.as_deref().or(host.as_deref()).ok_or((
+            http::StatusCode::BAD_REQUEST,
+            errors.connect_authority_required,
+            false,
+        ))?;
+        if !resilience.connect_allowed(connect_authority) {
+            return Err((
+                http::StatusCode::FORBIDDEN,
+                b"CONNECT target denied by policy\n",
+                true,
+            ));
+        }
+    } else if resilience.path_denied(&path) {
         return Err((
             http::StatusCode::FORBIDDEN,
             b"request path blocked by policy\n",
@@ -561,5 +605,61 @@ mod tests {
         assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
         assert_eq!(err.1, b"conflicting content-length header\n");
         assert!(!err.2);
+    }
+
+    #[test]
+    fn connect_without_path_is_accepted_when_policy_allows_target() {
+        let mut cfg = Resilience::default();
+        cfg.protocol.allow_connect = true;
+        cfg.protocol.connect_allowed_authorities = vec!["proxy.example.com:443".to_string()];
+        let resilience = RuntimeResilience::from_config(&cfg, 1024);
+        let headers = vec![
+            h3_header(b":method", b"CONNECT"),
+            h3_header(b":authority", b"proxy.example.com:443"),
+        ];
+
+        let request =
+            validate_request_headers(&headers, &resilience).expect("CONNECT request should pass");
+        assert_eq!(request.method, "CONNECT");
+        assert_eq!(request.path, "/");
+        assert_eq!(request.authority.as_deref(), Some("proxy.example.com:443"));
+    }
+
+    #[test]
+    fn connect_missing_authority_is_rejected() {
+        let mut cfg = Resilience::default();
+        cfg.protocol.allow_connect = true;
+        let resilience = RuntimeResilience::from_config(&cfg, 1024);
+        let headers = vec![h3_header(b":method", b"CONNECT")];
+
+        let err = validate_request_headers(&headers, &resilience)
+            .expect_err("CONNECT without authority must be rejected");
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"CONNECT requires authority host:port\n");
+        assert!(!err.2);
+    }
+
+    #[test]
+    fn connect_is_denied_when_policy_disables_or_blocks_target() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"CONNECT"),
+            h3_header(b":authority", b"proxy.example.com:443"),
+        ];
+        let err = validate_request_headers(&headers, &resilience)
+            .expect_err("CONNECT should be denied by default policy");
+        assert_eq!(err.0, http::StatusCode::FORBIDDEN);
+        assert_eq!(err.1, b"CONNECT target denied by policy\n");
+        assert!(err.2);
+
+        let mut cfg = Resilience::default();
+        cfg.protocol.allow_connect = true;
+        cfg.protocol.connect_allowed_ports = vec![8443];
+        let resilience = RuntimeResilience::from_config(&cfg, 1024);
+        let err = validate_request_headers(&headers, &resilience)
+            .expect_err("CONNECT should be denied when port is not allowlisted");
+        assert_eq!(err.0, http::StatusCode::FORBIDDEN);
+        assert_eq!(err.1, b"CONNECT target denied by policy\n");
+        assert!(err.2);
     }
 }

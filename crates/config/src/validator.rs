@@ -875,7 +875,10 @@ pub fn validate(config: &Config) -> bool {
         let sni_name = match normalize_sni_server_name(&entry.server_name) {
             Some(sni) => sni,
             None => {
-                error!("{field_prefix}.server_name '{}' is not a valid DNS hostname", entry.server_name);
+                error!(
+                    "{field_prefix}.server_name '{}' is not a valid DNS hostname",
+                    entry.server_name
+                );
                 return false;
             }
         };

@@ -4016,7 +4016,8 @@ impl QUICListener {
         for (idx, entry) in config.listen.tls.certificates.iter().enumerate() {
             let cert_field = format!("listen.tls.certificates[{idx}].cert");
             let key_field = format!("listen.tls.certificates[{idx}].key");
-            let certified = Self::load_certified_key(&entry.cert, &entry.key, &cert_field, &key_field)?;
+            let certified =
+                Self::load_certified_key(&entry.cert, &entry.key, &cert_field, &key_field)?;
 
             sni_resolver
                 .add(entry.server_name.as_str(), certified.clone())
@@ -4952,11 +4953,7 @@ mod tests {
         }
     }
 
-    fn write_test_cert_for_name(
-        dir: &Path,
-        cert_name: &str,
-        dns_name: &str,
-    ) -> (String, String) {
+    fn write_test_cert_for_name(dir: &Path, cert_name: &str, dns_name: &str) -> (String, String) {
         let mut params = CertificateParams::new(vec![dns_name.to_string()]);
         params
             .subject_alt_names
@@ -4975,7 +4972,11 @@ mod tests {
         )
     }
 
-    fn tls_test_config(cert: String, key: String, certificates: Vec<TlsCertificate>) -> SpookyConfigConfig {
+    fn tls_test_config(
+        cert: String,
+        key: String,
+        certificates: Vec<TlsCertificate>,
+    ) -> SpookyConfigConfig {
         let mut upstreams = HashMap::new();
         upstreams.insert("api".to_string(), test_upstream("round-robin"));
         SpookyConfigConfig {
@@ -5046,11 +5047,8 @@ mod tests {
             }],
         );
 
-        let acceptor = super::QUICListener::build_server_tls_acceptor(
-            &config,
-            false,
-            vec![b"h2".to_vec()],
-        );
+        let acceptor =
+            super::QUICListener::build_server_tls_acceptor(&config, false, vec![b"h2".to_vec()]);
         assert!(acceptor.is_ok());
     }
 
@@ -5068,13 +5066,10 @@ mod tests {
             }],
         );
 
-        let err = super::QUICListener::build_server_tls_acceptor(
-            &config,
-            false,
-            vec![b"h2".to_vec()],
-        )
-        .err()
-        .expect("mismatched SNI cert mapping should fail");
+        let err =
+            super::QUICListener::build_server_tls_acceptor(&config, false, vec![b"h2".to_vec()])
+                .err()
+                .expect("mismatched SNI cert mapping should fail");
         assert!(
             err.to_string()
                 .contains("failed to add SNI certificate mapping"),

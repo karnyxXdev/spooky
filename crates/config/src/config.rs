@@ -141,7 +141,7 @@ pub struct Tls {
     #[serde(default)]
     pub cert: String, // "/path/to/cert"
     #[serde(default)]
-    pub key: String,  // "/path/to/key"
+    pub key: String, // "/path/to/key"
     #[serde(default)]
     pub certificates: Vec<TlsCertificate>, // SNI keyed certificate set
     #[serde(default)]

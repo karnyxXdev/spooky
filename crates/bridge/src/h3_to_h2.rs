@@ -53,11 +53,8 @@ pub fn build_h2_request_for_endpoint(
     forwarded_ctx: ForwardedContext<'_>,
 ) -> Result<Request<BoxBody<Bytes, Infallible>>, BridgeError> {
     let method = Method::from_bytes(method.as_bytes()).map_err(|_| BridgeError::InvalidMethod)?;
-    let request_path = if path.is_empty() { "/" } else { path };
-    let uri = endpoint.uri_for_path(request_path);
-    let uri = Uri::try_from(uri).map_err(|_| BridgeError::InvalidUri)?;
-
-    let mut builder = Request::builder().method(method).uri(uri);
+    let is_connect = method == Method::CONNECT;
+    let mut builder = Request::builder().method(method.clone());
     let connection_tokens = connection_header_tokens(headers);
     let mut host_from_headers: Option<String> = None;
 
@@ -86,6 +83,15 @@ pub fn build_h2_request_for_endpoint(
         .or(host_from_headers.as_deref())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(endpoint.authority());
+
+    let uri = if is_connect {
+        Uri::try_from(host_value).map_err(|_| BridgeError::InvalidUri)?
+    } else {
+        let request_path = if path.is_empty() { "/" } else { path };
+        let uri = endpoint.uri_for_path(request_path);
+        Uri::try_from(uri).map_err(|_| BridgeError::InvalidUri)?
+    };
+    builder = builder.uri(uri);
     builder = builder.header(http::header::HOST, host_value);
 
     if let Some(len) = content_length
@@ -360,6 +366,32 @@ mod tests {
         assert_eq!(
             req.headers().get("forwarded").and_then(|h| h.to_str().ok()),
             Some("for=\"[2001:db8::1]\";proto=https;host=\"api.example.com\"")
+        );
+    }
+
+    #[test]
+    fn connect_uses_authority_form_request_target() {
+        let req = build_h2_request(
+            "proxy.internal:8443",
+            "CONNECT",
+            "/",
+            &[],
+            Empty::<Bytes>::new().boxed(),
+            None,
+            ForwardedContext {
+                client_addr: "203.0.113.8:44321".parse().expect("client"),
+                request_authority: Some("target.example.com:443"),
+                request_id: 0,
+                traceparent: None,
+            },
+        )
+        .expect("request");
+
+        assert_eq!(req.method(), http::Method::CONNECT);
+        assert_eq!(req.uri().to_string(), "target.example.com:443");
+        assert_eq!(
+            req.headers().get(HOST).and_then(|h| h.to_str().ok()),
+            Some("target.example.com:443")
         );
     }
 }

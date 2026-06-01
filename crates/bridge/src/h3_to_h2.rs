@@ -10,7 +10,10 @@ use http_body_util::combinators::BoxBody;
 use quiche::h3::NameValue;
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
-    config::{ForwardedHeaderPolicy, ForwardedHeaderPolicyMode, UpstreamHostPolicy, UpstreamHostPolicyMode},
+    config::{
+        ForwardedHeaderPolicy, ForwardedHeaderPolicyMode, UpstreamHostPolicy,
+        UpstreamHostPolicyMode,
+    },
 };
 
 pub use spooky_errors::BridgeError;
@@ -37,7 +40,6 @@ pub struct ForwardedHeaderValues {
     pub x_forwarded_proto: Option<HeaderValue>,
     pub x_forwarded_host: Option<HeaderValue>,
 }
-
 
 /// Build an HTTP/2 request with a pre-boxed streaming body.
 /// `content_length` is `Some(n)` only when the full length is known upfront
@@ -379,7 +381,10 @@ mod tests {
     use quiche::h3::Header;
     use spooky_config::{
         backend_endpoint::BackendEndpoint,
-        config::{ForwardedHeaderPolicy, ForwardedHeaderPolicyMode, UpstreamHostPolicy, UpstreamHostPolicyMode},
+        config::{
+            ForwardedHeaderPolicy, ForwardedHeaderPolicyMode, UpstreamHostPolicy,
+            UpstreamHostPolicyMode,
+        },
     };
 
     use super::{
@@ -549,7 +554,9 @@ mod tests {
 
         assert_eq!(
             req.headers().get("forwarded").and_then(|h| h.to_str().ok()),
-            Some("for=1.2.3.4;proto=http;host=\"old.example\", for=203.0.113.55;proto=https;host=\"api.example.com\"")
+            Some(
+                "for=1.2.3.4;proto=http;host=\"old.example\", for=203.0.113.55;proto=https;host=\"api.example.com\""
+            )
         );
         assert_eq!(
             req.headers()

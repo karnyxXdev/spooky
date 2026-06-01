@@ -241,7 +241,6 @@ pub struct ForwardedHeaderPolicy {
     pub mode: ForwardedHeaderPolicyMode,
 }
 
-
 #[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamHostPolicy {

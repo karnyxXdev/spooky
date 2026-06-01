@@ -37,7 +37,8 @@ use rustls::{
 use serde_json::json;
 use socket2::{Domain, Protocol, Socket, Type};
 use spooky_bridge::h3_to_h2::{
-    ForwardedContext, ForwardedHeaderChains, build_forwarded_header_values, build_h2_request_for_endpoint_with_host_policy, resolve_upstream_host_value,
+    ForwardedContext, ForwardedHeaderChains, build_forwarded_header_values,
+    build_h2_request_for_endpoint_with_host_policy, resolve_upstream_host_value,
 };
 use spooky_errors::{PoolError, ProxyError, is_retryable};
 use spooky_lb::{HealthFailureReason, HealthTransition, UpstreamPool};
@@ -4497,26 +4498,17 @@ impl QUICListener {
                                         forwarded_from_headers.push(value.as_bytes().to_vec());
                                         continue;
                                     }
-                                    if name
-                                        .as_str()
-                                        .eq_ignore_ascii_case("x-forwarded-for")
-                                    {
+                                    if name.as_str().eq_ignore_ascii_case("x-forwarded-for") {
                                         x_forwarded_for_from_headers
                                             .push(value.as_bytes().to_vec());
                                         continue;
                                     }
-                                    if name
-                                        .as_str()
-                                        .eq_ignore_ascii_case("x-forwarded-proto")
-                                    {
+                                    if name.as_str().eq_ignore_ascii_case("x-forwarded-proto") {
                                         x_forwarded_proto_from_headers
                                             .push(value.as_bytes().to_vec());
                                         continue;
                                     }
-                                    if name
-                                        .as_str()
-                                        .eq_ignore_ascii_case("x-forwarded-host")
-                                    {
+                                    if name.as_str().eq_ignore_ascii_case("x-forwarded-host") {
                                         x_forwarded_host_from_headers
                                             .push(value.as_bytes().to_vec());
                                         continue;
@@ -4550,7 +4542,8 @@ impl QUICListener {
                                     }
                                     upstream_req = upstream_req.header(name, value);
                                 }
-                                upstream_req = upstream_req.header(http::header::HOST, upstream_host);
+                                upstream_req =
+                                    upstream_req.header(http::header::HOST, upstream_host);
 
                                 let forwarded_policy = forwarded_header_policies
                                     .get(&upstream_name)

@@ -4883,10 +4883,17 @@ static FALLBACK_RT_THREADS: AtomicUsize = AtomicUsize::new(2);
 mod tests {
     use std::{
         collections::HashMap,
+        path::Path,
         sync::{Arc, RwLock},
     };
 
-    use spooky_config::config::{Backend, LoadBalancing, RouteMatch, Upstream};
+    use rcgen::{Certificate, CertificateParams, SanType};
+    use spooky_config::config::{
+        Backend, ClientAuth, Config as SpookyConfigConfig, Listen, LoadBalancing, Log,
+        Observability, Performance, Resilience, RouteMatch, Security, Tls, TlsCertificate,
+        Upstream, UpstreamTls,
+    };
+    use tempfile::tempdir;
 
     use crate::REQUEST_ID_COUNTER;
     use crate::cid_radix::CidRadix;
@@ -4943,6 +4950,135 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn write_test_cert_for_name(
+        dir: &Path,
+        cert_name: &str,
+        dns_name: &str,
+    ) -> (String, String) {
+        let mut params = CertificateParams::new(vec![dns_name.to_string()]);
+        params
+            .subject_alt_names
+            .push(SanType::DnsName(dns_name.to_string()));
+        let cert = Certificate::from_params(params).expect("failed to build cert");
+
+        let cert_path = dir.join(format!("{cert_name}.pem"));
+        let key_path = dir.join(format!("{cert_name}.key.pem"));
+
+        std::fs::write(&cert_path, cert.serialize_pem().expect("serialize cert"))
+            .expect("write cert");
+        std::fs::write(&key_path, cert.serialize_private_key_pem()).expect("write key");
+        (
+            cert_path.to_string_lossy().to_string(),
+            key_path.to_string_lossy().to_string(),
+        )
+    }
+
+    fn tls_test_config(cert: String, key: String, certificates: Vec<TlsCertificate>) -> SpookyConfigConfig {
+        let mut upstreams = HashMap::new();
+        upstreams.insert("api".to_string(), test_upstream("round-robin"));
+        SpookyConfigConfig {
+            version: 1,
+            listen: Listen {
+                protocol: "http3".to_string(),
+                port: 9889,
+                address: "127.0.0.1".to_string(),
+                tls: Tls {
+                    cert,
+                    key,
+                    certificates,
+                    client_auth: ClientAuth::default(),
+                },
+            },
+            upstream: upstreams,
+            load_balancing: Some(LoadBalancing {
+                lb_type: "round-robin".to_string(),
+                key: None,
+            }),
+            upstream_tls: UpstreamTls::default(),
+            log: Log::default(),
+            performance: Performance::default(),
+            observability: Observability::default(),
+            resilience: Resilience::default(),
+            security: Security::default(),
+        }
+    }
+
+    #[test]
+    fn default_tls_pair_uses_first_sni_entry_when_legacy_pair_is_missing() {
+        let dir = tempdir().expect("tempdir");
+        let (api_cert, api_key) = write_test_cert_for_name(dir.path(), "api", "api.example.com");
+        let (www_cert, www_key) = write_test_cert_for_name(dir.path(), "www", "www.example.com");
+        let config = tls_test_config(
+            String::new(),
+            String::new(),
+            vec![
+                TlsCertificate {
+                    server_name: "api.example.com".to_string(),
+                    cert: api_cert.clone(),
+                    key: api_key.clone(),
+                },
+                TlsCertificate {
+                    server_name: "www.example.com".to_string(),
+                    cert: www_cert,
+                    key: www_key,
+                },
+            ],
+        );
+
+        let pair = super::QUICListener::default_tls_cert_pair(&config).expect("default pair");
+        assert_eq!(pair.0, api_cert);
+        assert_eq!(pair.1, api_key);
+    }
+
+    #[test]
+    fn build_server_tls_acceptor_accepts_sni_certs_without_legacy_pair() {
+        let dir = tempdir().expect("tempdir");
+        let (api_cert, api_key) = write_test_cert_for_name(dir.path(), "api", "api.example.com");
+        let config = tls_test_config(
+            String::new(),
+            String::new(),
+            vec![TlsCertificate {
+                server_name: "api.example.com".to_string(),
+                cert: api_cert,
+                key: api_key,
+            }],
+        );
+
+        let acceptor = super::QUICListener::build_server_tls_acceptor(
+            &config,
+            false,
+            vec![b"h2".to_vec()],
+        );
+        assert!(acceptor.is_ok());
+    }
+
+    #[test]
+    fn build_server_tls_acceptor_rejects_mismatched_sni_certificate_mapping() {
+        let dir = tempdir().expect("tempdir");
+        let (api_cert, api_key) = write_test_cert_for_name(dir.path(), "api", "api.example.com");
+        let config = tls_test_config(
+            String::new(),
+            String::new(),
+            vec![TlsCertificate {
+                server_name: "other.example.com".to_string(),
+                cert: api_cert,
+                key: api_key,
+            }],
+        );
+
+        let err = super::QUICListener::build_server_tls_acceptor(
+            &config,
+            false,
+            vec![b"h2".to_vec()],
+        )
+        .expect_err("mismatched SNI cert mapping should fail");
+        assert!(
+            err.to_string()
+                .contains("failed to add SNI certificate mapping"),
+            "unexpected error: {err}"
+        );
     }
 
     type TestRoutingContext = (

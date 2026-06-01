@@ -8,7 +8,10 @@ use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, Request, Uri};
 use http_body_util::combinators::BoxBody;
 use quiche::h3::NameValue;
-use spooky_config::backend_endpoint::BackendEndpoint;
+use spooky_config::{
+    backend_endpoint::BackendEndpoint,
+    config::{UpstreamHostPolicy, UpstreamHostPolicyMode},
+};
 
 pub use spooky_errors::BridgeError;
 
@@ -52,6 +55,29 @@ pub fn build_h2_request_for_endpoint(
     content_length: Option<usize>,
     forwarded_ctx: ForwardedContext<'_>,
 ) -> Result<Request<BoxBody<Bytes, Infallible>>, BridgeError> {
+    build_h2_request_for_endpoint_with_host_policy(
+        endpoint,
+        &UpstreamHostPolicy::default(),
+        method,
+        path,
+        headers,
+        body,
+        content_length,
+        forwarded_ctx,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_h2_request_for_endpoint_with_host_policy(
+    endpoint: &BackendEndpoint,
+    host_policy: &UpstreamHostPolicy,
+    method: &str,
+    path: &str,
+    headers: &[quiche::h3::Header],
+    body: BoxBody<Bytes, Infallible>,
+    content_length: Option<usize>,
+    forwarded_ctx: ForwardedContext<'_>,
+) -> Result<Request<BoxBody<Bytes, Infallible>>, BridgeError> {
     let method = Method::from_bytes(method.as_bytes()).map_err(|_| BridgeError::InvalidMethod)?;
     let is_connect = method == Method::CONNECT;
     let mut builder = Request::builder().method(method.clone());
@@ -78,11 +104,12 @@ pub fn build_h2_request_for_endpoint(
         builder = builder.header(header_name, header_value);
     }
 
-    let host_value = forwarded_ctx
-        .request_authority
-        .or(host_from_headers.as_deref())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(endpoint.authority());
+    let host_value = resolve_upstream_host_value(
+        endpoint,
+        host_policy,
+        forwarded_ctx.request_authority,
+        host_from_headers.as_deref(),
+    )?;
 
     let uri = if is_connect {
         Uri::try_from(host_value).map_err(|_| BridgeError::InvalidUri)?
@@ -146,6 +173,26 @@ pub fn build_h2_request_for_endpoint(
         );
 
     builder.body(body).map_err(BridgeError::Build)
+}
+
+pub fn resolve_upstream_host_value<'a>(
+    endpoint: &'a BackendEndpoint,
+    host_policy: &'a UpstreamHostPolicy,
+    request_authority: Option<&'a str>,
+    host_header: Option<&'a str>,
+) -> Result<&'a str, BridgeError> {
+    match host_policy.mode {
+        UpstreamHostPolicyMode::PassThrough => Ok(request_authority
+            .or(host_header)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(endpoint.authority())),
+        UpstreamHostPolicyMode::Rewrite => host_policy
+            .host
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(BridgeError::InvalidHeader),
+        UpstreamHostPolicyMode::Upstream => Ok(endpoint.authority()),
+    }
 }
 
 fn connection_header_tokens(headers: &[quiche::h3::Header]) -> HashSet<String> {
@@ -213,8 +260,14 @@ mod tests {
     use http::header::HOST;
     use http_body_util::{BodyExt, Empty};
     use quiche::h3::Header;
+    use spooky_config::{
+        backend_endpoint::BackendEndpoint,
+        config::{UpstreamHostPolicy, UpstreamHostPolicyMode},
+    };
 
-    use super::{ForwardedContext, build_h2_request};
+    use super::{
+        ForwardedContext, build_h2_request, build_h2_request_for_endpoint_with_host_policy,
+    };
 
     #[test]
     fn defaults_to_https_origin_for_host_port_backend() {
@@ -366,6 +419,72 @@ mod tests {
         assert_eq!(
             req.headers().get("forwarded").and_then(|h| h.to_str().ok()),
             Some("for=\"[2001:db8::1]\";proto=https;host=\"api.example.com\"")
+        );
+    }
+
+    #[test]
+    fn host_policy_rewrite_uses_configured_host() {
+        let endpoint = BackendEndpoint::parse("backend.internal:443").expect("endpoint");
+        let policy = UpstreamHostPolicy {
+            mode: UpstreamHostPolicyMode::Rewrite,
+            host: Some("origin.example.com".to_string()),
+        };
+        let req = build_h2_request_for_endpoint_with_host_policy(
+            &endpoint,
+            &policy,
+            "GET",
+            "/",
+            &[],
+            Empty::<Bytes>::new().boxed(),
+            None,
+            ForwardedContext {
+                client_addr: "203.0.113.10:44321".parse().expect("client"),
+                request_authority: Some("api.example.com"),
+                request_id: 0,
+                traceparent: None,
+            },
+        )
+        .expect("request");
+
+        assert_eq!(
+            req.headers().get(HOST).and_then(|h| h.to_str().ok()),
+            Some("origin.example.com")
+        );
+        assert_eq!(
+            req.headers()
+                .get("x-forwarded-host")
+                .and_then(|h| h.to_str().ok()),
+            Some("origin.example.com")
+        );
+    }
+
+    #[test]
+    fn host_policy_upstream_uses_backend_authority() {
+        let endpoint = BackendEndpoint::parse("backend.internal:8443").expect("endpoint");
+        let policy = UpstreamHostPolicy {
+            mode: UpstreamHostPolicyMode::Upstream,
+            host: None,
+        };
+        let req = build_h2_request_for_endpoint_with_host_policy(
+            &endpoint,
+            &policy,
+            "GET",
+            "/",
+            &[],
+            Empty::<Bytes>::new().boxed(),
+            None,
+            ForwardedContext {
+                client_addr: "203.0.113.10:44321".parse().expect("client"),
+                request_authority: Some("api.example.com"),
+                request_id: 0,
+                traceparent: None,
+            },
+        )
+        .expect("request");
+
+        assert_eq!(
+            req.headers().get(HOST).and_then(|h| h.to_str().ok()),
+            Some("backend.internal:8443")
         );
     }
 

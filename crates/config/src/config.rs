@@ -198,9 +198,36 @@ pub struct Upstream {
     #[serde(default = "get_default_load_balancing")]
     pub load_balancing: LoadBalancing,
 
+    #[serde(default)]
+    pub host_policy: UpstreamHostPolicy,
+
     pub route: RouteMatch, // Route matching criteria for this upstream
 
     pub backends: Vec<Backend>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamHostPolicyMode {
+    #[default]
+    #[serde(alias = "pass-through")]
+    PassThrough,
+    Rewrite,
+    #[serde(
+        alias = "static_upstream",
+        alias = "static-upstream",
+        alias = "upstream-host"
+    )]
+    Upstream,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamHostPolicy {
+    #[serde(default)]
+    pub mode: UpstreamHostPolicyMode,
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

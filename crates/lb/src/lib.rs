@@ -1024,6 +1024,7 @@ mod tests {
                 lb_type: "round-robin".to_string(),
                 key: None,
             },
+            host_policy: Default::default(),
             route: RouteMatch {
                 path_prefix: Some("/".to_string()),
                 ..Default::default()

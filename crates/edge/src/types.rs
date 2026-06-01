@@ -1,6 +1,9 @@
 use bytes::Bytes;
 use core::net::SocketAddr;
-use spooky_config::{backend_endpoint::BackendEndpoint, config::Config};
+use spooky_config::{
+    backend_endpoint::BackendEndpoint,
+    config::{Config, UpstreamHostPolicy},
+};
 use spooky_errors::ProxyError;
 use spooky_lb::UpstreamPool;
 use spooky_transport::h2_pool::H2Pool;
@@ -24,6 +27,7 @@ use crate::watchdog::WatchdogCoordinator;
 pub struct SharedRuntimeState {
     pub(crate) h2_pool: Arc<H2Pool>,
     pub(crate) backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+    pub(crate) upstream_host_policies: Arc<HashMap<String, UpstreamHostPolicy>>,
     pub(crate) upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
     pub(crate) upstream_inflight: HashMap<String, Arc<Semaphore>>,
     pub(crate) global_inflight: Arc<Semaphore>,
@@ -75,6 +79,7 @@ pub struct QUICListener {
     pub h3_config: Arc<quiche::h3::Config>,
     pub h2_pool: Arc<H2Pool>,
     pub backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+    pub upstream_host_policies: Arc<HashMap<String, UpstreamHostPolicy>>,
     pub upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
     pub upstream_inflight: HashMap<String, Arc<Semaphore>>,
     pub global_inflight: Arc<Semaphore>,

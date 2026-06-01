@@ -89,6 +89,7 @@ fn make_config(
                 lb_type: lb_type.to_string(),
                 key: None,
             },
+            host_policy: Default::default(),
             route: RouteMatch {
                 path_prefix: Some("/".to_string()),
                 ..Default::default()

@@ -179,6 +179,18 @@ fn should_strip_h3_response_header(
         || name == http::header::CONTENT_LENGTH
 }
 
+fn collect_h3_trailers(trailers: &http::HeaderMap) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let connection_tokens = connection_header_tokens(trailers);
+    let mut out = Vec::with_capacity(trailers.len());
+    for (name, value) in trailers.iter() {
+        if should_strip_h3_response_header(name, &connection_tokens) {
+            continue;
+        }
+        out.push((name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()));
+    }
+    out
+}
+
 fn should_strip_bootstrap_response_header(
     name: &http::header::HeaderName,
     connection_tokens: &HashSet<String>,
@@ -2709,6 +2721,7 @@ impl QUICListener {
     ///      store `response_chunk_rx`, transition to SendingResponse.
     /// 4. Flush `response_chunk_rx` chunks into H3 (`try_recv` loop).
     ///    - `Data`  → `h3.send_body(..., false)`
+    ///    - `Trailers` → `h3.send_additional_headers(..., false)`
     ///    - `End`   → `h3.send_body(..., true)`, mark Completed
     ///    - `Error` → send 502, mark Failed
     /// 5. Remove streams in terminal phase (Completed / Failed).
@@ -3085,8 +3098,8 @@ impl QUICListener {
                                                 .await;
                                             return;
                                         }
-                                        Ok(Some(Ok(f))) => {
-                                            if let Ok(data) = f.into_data() {
+                                        Ok(Some(Ok(f))) => match f.into_data() {
+                                            Ok(data) => {
                                                 if !data.is_empty() {
                                                     saw_body_progress = true;
                                                 }
@@ -3147,8 +3160,23 @@ impl QUICListener {
                                                     }
                                                 }
                                             }
-                                            // skip trailers / other frame types
-                                        }
+                                            Err(frame) => {
+                                                if let Ok(trailers) = frame.into_trailers() {
+                                                    let trailer_headers =
+                                                        collect_h3_trailers(&trailers);
+                                                    if !trailer_headers.is_empty()
+                                                        && chunk_tx
+                                                            .send(ResponseChunk::Trailers {
+                                                                headers: trailer_headers,
+                                                            })
+                                                            .await
+                                                            .is_err()
+                                                    {
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                        },
                                         Ok(Some(Err(_))) => {
                                             let _ = chunk_tx
                                                 .send(ResponseChunk::Error(ProxyError::Transport(
@@ -3355,6 +3383,46 @@ impl QUICListener {
                                 Err(err) => {
                                     error!(
                                         "HTTP/3 send_body data protocol error on stream {}: {:?}",
+                                        stream_id, err
+                                    );
+                                    req.phase = StreamPhase::Failed;
+                                    metrics.inc_failure();
+                                    metrics.inc_backend_error();
+                                    let route_label =
+                                        req.upstream_name.as_deref().unwrap_or("unrouted");
+                                    metrics.record_route(
+                                        route_label,
+                                        req.start.elapsed(),
+                                        RouteOutcome::BackendError,
+                                    );
+                                    resilience
+                                        .adaptive_admission
+                                        .observe(req.start.elapsed(), true);
+                                    terminal = true;
+                                    break;
+                                }
+                            }
+                        }
+                        ResponseChunk::Trailers { headers } => {
+                            let mut h3_headers = Vec::with_capacity(headers.len());
+                            for (name, value) in &headers {
+                                h3_headers.push(quiche::h3::Header::new(name, value));
+                            }
+                            match h3.send_additional_headers(
+                                quic,
+                                stream_id,
+                                &h3_headers,
+                                true,
+                                false,
+                            ) {
+                                Ok(_) => {}
+                                Err(quiche::h3::Error::StreamBlocked) => {
+                                    req.pending_chunk = Some(ResponseChunk::Trailers { headers });
+                                    break;
+                                }
+                                Err(err) => {
+                                    error!(
+                                        "HTTP/3 send_additional_headers protocol error on stream {}: {:?}",
                                         stream_id, err
                                     );
                                     req.phase = StreamPhase::Failed;
@@ -4906,10 +4974,10 @@ mod tests {
 
     use super::{
         ConnectionRoutes, TokenBucket, abort_stream, classify_active_health_check_response,
-        connection_header_tokens, purge_connection_routes, resolve_primary_from_radix_prefix,
-        response_size_exceeded_after_chunk, should_strip_bootstrap_request_header,
-        should_strip_bootstrap_response_header, should_strip_h3_response_header,
-        sweep_closed_connections,
+        collect_h3_trailers, connection_header_tokens, purge_connection_routes,
+        resolve_primary_from_radix_prefix, response_size_exceeded_after_chunk,
+        should_strip_bootstrap_request_header, should_strip_bootstrap_response_header,
+        should_strip_h3_response_header, sweep_closed_connections,
     };
     type RoutingMaps = (
         HashMap<Arc<[u8]>, Arc<[u8]>>,
@@ -5345,6 +5413,58 @@ mod tests {
             &http::header::TRAILER,
             &tokens
         ));
+    }
+
+    #[test]
+    fn h3_trailer_collection_preserves_end_to_end_trailers() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert(
+            http::HeaderName::from_static("grpc-status"),
+            HeaderValue::from_static("0"),
+        );
+        trailers.insert(
+            http::HeaderName::from_static("grpc-message"),
+            HeaderValue::from_static("ok"),
+        );
+        let collected = collect_h3_trailers(&trailers);
+        assert_eq!(collected.len(), 2);
+        assert!(
+            collected
+                .iter()
+                .any(|(k, v)| k.as_slice() == b"grpc-status" && v.as_slice() == b"0")
+        );
+        assert!(
+            collected
+                .iter()
+                .any(|(k, v)| k.as_slice() == b"grpc-message" && v.as_slice() == b"ok")
+        );
+    }
+
+    #[test]
+    fn h3_trailer_collection_strips_hop_by_hop_and_content_length() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from_static("123"),
+        );
+        trailers.insert(http::header::TE, HeaderValue::from_static("trailers"));
+        trailers.insert(http::header::TRAILER, HeaderValue::from_static("x-next"));
+        trailers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("x-hop-token"),
+        );
+        trailers.insert(
+            http::HeaderName::from_static("x-hop-token"),
+            HeaderValue::from_static("secret"),
+        );
+        trailers.insert(
+            http::HeaderName::from_static("grpc-status"),
+            HeaderValue::from_static("0"),
+        );
+        let collected = collect_h3_trailers(&trailers);
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].0.as_slice(), b"grpc-status");
+        assert_eq!(collected[0].1.as_slice(), b"0");
     }
 
     #[test]

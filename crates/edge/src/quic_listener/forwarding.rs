@@ -327,15 +327,12 @@ impl QUICListener {
                 let failure_reason = Self::send_error_health_failure_reason(send_err);
                 error!(
                     "Upstream send failed for {} (health_reason={:?}): {}",
-                    backend_addr,
-                    failure_reason,
-                    send_err_detail
+                    backend_addr, failure_reason, send_err_detail
                 );
                 metrics.inc_health_failure(failure_reason);
                 if let Some(pool) = &upstream_pool
                     && let Some(t) = pool.write().ok().and_then(|mut p| {
-                        p.pool
-                            .mark_request_failure(backend_index, failure_reason)
+                        p.pool.mark_request_failure(backend_index, failure_reason)
                     })
                 {
                     Self::log_health_transition(backend_addr, t);

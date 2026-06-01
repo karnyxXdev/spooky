@@ -263,6 +263,10 @@ pub fn resilience_default_protocol_enforce_authority_host_match() -> bool {
     true
 }
 
+pub fn resilience_default_protocol_allow_connect() -> bool {
+    false
+}
+
 pub fn resilience_default_cb_enabled() -> bool {
     true
 }

@@ -140,6 +140,39 @@ fn is_valid_http_token(value: &str) -> bool {
         })
 }
 
+fn is_valid_connect_authority(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        let host = &rest[..end];
+        if host.is_empty() {
+            return false;
+        }
+        let suffix = &rest[end + 1..];
+        if !suffix.starts_with(':') || suffix.len() <= 1 {
+            return false;
+        }
+        return suffix[1..]
+            .parse::<u16>()
+            .ok()
+            .is_some_and(|port| port > 0);
+    }
+
+    let Some((host, port)) = trimmed.rsplit_once(':') else {
+        return false;
+    };
+    if host.is_empty() || host.contains(':') {
+        return false;
+    }
+    port.parse::<u16>().ok().is_some_and(|value| value > 0)
+}
+
 fn normalize_route_host(raw: &str) -> String {
     let trimmed = raw.trim();
     let host = if let Some(rest) = trimmed.strip_prefix('[') {
@@ -596,6 +629,40 @@ pub fn validate(config: &Config) -> bool {
         .any(|prefix| prefix.is_empty() || !prefix.starts_with('/'))
     {
         error!("resilience.protocol.denied_path_prefixes must contain '/'-prefixed paths");
+        return false;
+    }
+
+    if !config.resilience.protocol.allow_connect
+        && (!config.resilience.protocol.connect_allowed_ports.is_empty()
+            || !config.resilience.protocol.connect_allowed_authorities.is_empty())
+    {
+        error!(
+            "resilience.protocol.connect_allowed_ports/connect_allowed_authorities require allow_connect=true"
+        );
+        return false;
+    }
+
+    if config
+        .resilience
+        .protocol
+        .connect_allowed_ports
+        .iter()
+        .any(|port| *port == 0)
+    {
+        error!("resilience.protocol.connect_allowed_ports must contain ports in range 1-65535");
+        return false;
+    }
+
+    if config
+        .resilience
+        .protocol
+        .connect_allowed_authorities
+        .iter()
+        .any(|authority| !is_valid_connect_authority(authority))
+    {
+        error!(
+            "resilience.protocol.connect_allowed_authorities must contain authority-form host:port targets"
+        );
         return false;
     }
 
@@ -1323,9 +1390,16 @@ upstream:
         assert_eq!(cfg.resilience.route_queue.global_cap, 2048);
         assert_eq!(cfg.resilience.route_queue.shed_retry_after_seconds, 1);
         assert!(!cfg.resilience.protocol.allow_0rtt);
+        assert!(!cfg.resilience.protocol.allow_connect);
         assert_eq!(cfg.resilience.protocol.max_headers_count, 128);
         assert_eq!(cfg.resilience.protocol.max_headers_bytes, 16 * 1024);
         assert!(cfg.resilience.protocol.enforce_authority_host_match);
+        assert!(cfg.resilience.protocol.connect_allowed_ports.is_empty());
+        assert!(cfg
+            .resilience
+            .protocol
+            .connect_allowed_authorities
+            .is_empty());
         assert!(!cfg.resilience.watchdog.enabled);
         assert_eq!(cfg.resilience.watchdog.check_interval_ms, 1_000);
         assert_eq!(cfg.observability.control_api.max_connections, 256);
@@ -1516,6 +1590,26 @@ upstream:
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.protocol.denied_path_prefixes = vec!["admin".to_string()];
         assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.protocol.connect_allowed_ports = vec![443];
+        assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.protocol.allow_connect = true;
+        cfg.resilience.protocol.connect_allowed_ports = vec![0];
+        assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.protocol.allow_connect = true;
+        cfg.resilience.protocol.connect_allowed_authorities = vec!["example.com".to_string()];
+        assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.protocol.allow_connect = true;
+        cfg.resilience.protocol.connect_allowed_authorities = vec!["example.com:443".to_string()];
+        cfg.resilience.protocol.connect_allowed_ports = vec![443];
+        assert!(validate(&cfg));
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.protocol.allowed_methods = vec!["".to_string()];

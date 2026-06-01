@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use spooky_config::config::Upstream;
@@ -31,12 +32,12 @@ fn host_has_uppercase_ascii(host: &str) -> bool {
     host.bytes().any(|byte| byte.is_ascii_uppercase())
 }
 
-pub(crate) fn normalize_host_for_routing(raw: &str) -> Option<String> {
+pub(crate) fn normalize_host_for_routing(raw: &str) -> Option<Cow<'_, str>> {
     let host = parsed_host_for_routing(raw)?;
     if host_has_uppercase_ascii(host) {
-        Some(host.to_ascii_lowercase())
+        Some(Cow::Owned(host.to_ascii_lowercase()))
     } else {
-        Some(host.to_string())
+        Some(Cow::Borrowed(host))
     }
 }
 
@@ -46,17 +47,34 @@ enum ConfiguredHostPattern {
     WildcardSuffix(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfiguredHostPatternRef<'a> {
+    Exact(&'a str),
+    WildcardSuffix(&'a str),
+}
+
 fn parse_configured_host_pattern(raw: &str) -> Option<ConfiguredHostPattern> {
     let normalized = normalize_host_for_routing(raw)?;
     let Some(wildcard_suffix) = normalized.strip_prefix("*.") else {
-        return Some(ConfiguredHostPattern::Exact(normalized));
+        return Some(ConfiguredHostPattern::Exact(normalized.into_owned()));
     };
     if wildcard_suffix.is_empty() || wildcard_suffix.contains('*') {
-        return Some(ConfiguredHostPattern::Exact(format!("*.{wildcard_suffix}")));
+        return Some(ConfiguredHostPattern::Exact(normalized.into_owned()));
     }
     Some(ConfiguredHostPattern::WildcardSuffix(
         wildcard_suffix.to_string(),
     ))
+}
+
+fn parse_configured_host_pattern_ref(raw: &str) -> Option<ConfiguredHostPatternRef<'_>> {
+    let host = parsed_host_for_routing(raw)?;
+    let Some(wildcard_suffix) = host.strip_prefix("*.") else {
+        return Some(ConfiguredHostPatternRef::Exact(host));
+    };
+    if wildcard_suffix.is_empty() || wildcard_suffix.contains('*') {
+        return Some(ConfiguredHostPatternRef::Exact(host));
+    }
+    Some(ConfiguredHostPatternRef::WildcardSuffix(wildcard_suffix))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -353,7 +371,9 @@ impl RouteIndex {
     ) -> Option<&'a str> {
         let host_best = host
             .and_then(normalize_host_for_routing)
-            .and_then(|normalized_host| self.lookup_host_candidate(path, normalized_host, method));
+            .and_then(|normalized_host| {
+                self.lookup_host_candidate(path, normalized_host.as_ref(), method)
+            });
 
         if let Some(best) = host_best
             && best.route.path_len >= self.default_max_path_len
@@ -391,7 +411,9 @@ impl RouteIndex {
     ) -> Option<RouteDecision<'a>> {
         let host_best = host
             .and_then(normalize_host_for_routing)
-            .and_then(|normalized_host| self.lookup_host_candidate(path, normalized_host, method));
+            .and_then(|normalized_host| {
+                self.lookup_host_candidate(path, normalized_host.as_ref(), method)
+            });
 
         let default_best = self
             .default_trie
@@ -486,12 +508,12 @@ impl RouteIndex {
     fn lookup_host_candidate(
         &self,
         path: &str,
-        normalized_host: String,
+        normalized_host: &str,
         method: Option<&str>,
     ) -> Option<RouteCandidate> {
         let exact_best = self
             .host_tries
-            .get(normalized_host.as_str())
+            .get(normalized_host)
             .and_then(|host_trie| host_trie.longest_prefix(path, method, &self.upstream_methods))
             .map(|route| RouteCandidate {
                 route,
@@ -500,7 +522,7 @@ impl RouteIndex {
             });
 
         let mut wildcard_best: Option<RouteCandidate> = None;
-        let mut remaining = normalized_host.as_str();
+        let mut remaining = normalized_host;
         while let Some(dot_idx) = remaining.find('.') {
             let suffix = &remaining[dot_idx + 1..];
             if suffix.is_empty() {
@@ -664,20 +686,24 @@ pub(crate) fn scan_lookup_for_method<'a>(
                 (None, _) => (true, HostMatchKind::Default, 0usize),
                 (Some(_), None) => (false, HostMatchKind::Default, 0usize),
                 (Some(route_host), Some(request_host)) => {
-                    match parse_configured_host_pattern(route_host) {
-                        Some(ConfiguredHostPattern::Exact(route_host_exact)) => (
+                    match parse_configured_host_pattern_ref(route_host) {
+                        Some(ConfiguredHostPatternRef::Exact(route_host_exact)) => (
                             route_host_exact.eq_ignore_ascii_case(request_host),
                             HostMatchKind::Exact,
                             0,
                         ),
-                        Some(ConfiguredHostPattern::WildcardSuffix(suffix)) => (
-                            request_host.len() > suffix.len() + 1
-                                && request_host.ends_with(&suffix)
-                                && request_host.as_bytes()[request_host.len() - suffix.len() - 1]
-                                    == b'.',
-                            HostMatchKind::Wildcard,
-                            suffix.len(),
-                        ),
+                        Some(ConfiguredHostPatternRef::WildcardSuffix(suffix)) => {
+                            let suffix_start = request_host.len().saturating_sub(suffix.len());
+                            (
+                                request_host.len() > suffix.len() + 1
+                                    && request_host
+                                        .get(suffix_start..)
+                                        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+                                    && request_host.as_bytes()[suffix_start - 1] == b'.',
+                                HostMatchKind::Wildcard,
+                                suffix.len(),
+                            )
+                        }
                         None => (false, HostMatchKind::Default, 0usize),
                     }
                 }

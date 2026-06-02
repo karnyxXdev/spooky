@@ -18,6 +18,11 @@ upstream:
       type: round-robin
     route:
       path_prefix: "/"
+    host_policy:
+      mode: pass-through   # pass-through | rewrite | upstream
+      # host: "origin.example.com"  # required when mode: rewrite
+    forwarded_headers:
+      mode: append         # append | preserve | overwrite
     backends:
       - id: "backend1"
         address: "backend.internal.example:8443" # verified HTTPS by default (no scheme needed)

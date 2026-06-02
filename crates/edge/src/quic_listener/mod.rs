@@ -36,7 +36,10 @@ use rustls::{
 };
 use serde_json::json;
 use socket2::{Domain, Protocol, Socket, Type};
-use spooky_bridge::h3_to_h2::{ForwardedContext, build_h2_request_for_endpoint};
+use spooky_bridge::h3_to_h2::{
+    ForwardedContext, ForwardedHeaderChains, build_forwarded_header_values,
+    build_h2_request_for_endpoint_with_host_policy, resolve_upstream_host_value,
+};
 use spooky_errors::{PoolError, ProxyError, is_retryable};
 use spooky_lb::{HealthFailureReason, HealthTransition, UpstreamPool};
 use spooky_transport::h2_client::{H2Client, TlsClientConfig};
@@ -52,7 +55,7 @@ use tracing::{Instrument, info_span};
 
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
-    config::Config as SpookyConfig,
+    config::{Config as SpookyConfig, ForwardedHeaderPolicy, UpstreamHostPolicy},
 };
 
 use crate::{
@@ -260,13 +263,6 @@ fn is_websocket_upgrade_request(req: &Request<Incoming>, use_h2: bool) -> bool {
         .get(http::header::CONNECTION)
         .map(|v| header_has_token(v, "upgrade"))
         .unwrap_or(false)
-}
-
-fn bootstrap_forwarded_for_value(ip: std::net::IpAddr) -> String {
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.to_string(),
-        std::net::IpAddr::V6(v6) => format!("\"[{}]\"", v6),
-    }
 }
 
 fn extract_cookie_value(cookie_header: &str, cookie_name: &str) -> Option<String> {
@@ -579,6 +575,20 @@ impl QUICListener {
                     })
                     .collect(),
             ),
+            forwarded_header_policies: Arc::new(
+                config
+                    .upstream
+                    .iter()
+                    .map(|(name, upstream)| (name.clone(), upstream.forwarded_headers.clone()))
+                    .collect(),
+            ),
+            upstream_host_policies: Arc::new(
+                config
+                    .upstream
+                    .iter()
+                    .map(|(name, upstream)| (name.clone(), upstream.host_policy.clone()))
+                    .collect(),
+            ),
             upstream_pools,
             upstream_inflight,
             global_inflight: Arc::new(Semaphore::new(global_inflight_limit)),
@@ -701,6 +711,8 @@ impl QUICListener {
             h3_config,
             h2_pool: Arc::clone(&shared_state.h2_pool),
             backend_endpoints: Arc::clone(&shared_state.backend_endpoints),
+            upstream_host_policies: Arc::clone(&shared_state.upstream_host_policies),
+            forwarded_header_policies: Arc::clone(&shared_state.forwarded_header_policies),
             upstream_pools: shared_state.upstream_pools.clone(),
             upstream_inflight: shared_state.upstream_inflight.clone(),
             global_inflight: Arc::clone(&shared_state.global_inflight),
@@ -1514,6 +1526,8 @@ impl QUICListener {
                 &mut connection,
                 Arc::clone(&h2_pool),
                 Arc::clone(&self.backend_endpoints),
+                Arc::clone(&self.upstream_host_policies),
+                Arc::clone(&self.forwarded_header_policies),
                 &self.upstream_pools,
                 &self.upstream_inflight,
                 Arc::clone(&self.global_inflight),
@@ -1759,6 +1773,8 @@ impl QUICListener {
         connection: &mut QuicConnection,
         h2_pool: Arc<H2Pool>,
         backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+        upstream_host_policies: Arc<HashMap<String, UpstreamHostPolicy>>,
+        forwarded_header_policies: Arc<HashMap<String, ForwardedHeaderPolicy>>,
         upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
         upstream_inflight: &HashMap<String, Arc<Semaphore>>,
         global_inflight: Arc<Semaphore>,
@@ -2146,8 +2162,18 @@ impl QUICListener {
                                     continue;
                                 }
                             };
-                            let request = match build_h2_request_for_endpoint(
+                            let host_policy = upstream_host_policies
+                                .get(&upstream_name)
+                                .cloned()
+                                .unwrap_or_default();
+                            let forwarded_header_policy = forwarded_header_policies
+                                .get(&upstream_name)
+                                .cloned()
+                                .unwrap_or_default();
+                            let request = match build_h2_request_for_endpoint_with_host_policy(
                                 &backend_endpoint,
+                                &host_policy,
+                                &forwarded_header_policy,
                                 &method,
                                 &path,
                                 &list,
@@ -2205,6 +2231,8 @@ impl QUICListener {
                                     client_addr: connection.peer_address,
                                     request_id,
                                     traceparent: traceparent.as_deref().map(Arc::<str>::from),
+                                    host_policy: host_policy.clone(),
+                                    forwarded_header_policy: forwarded_header_policy.clone(),
                                 })
                             });
                             let trace_span_for_upstream = trace_span.clone();
@@ -4186,6 +4214,8 @@ impl QUICListener {
 
         let h2_pool = Arc::clone(&shared_state.h2_pool);
         let backend_endpoints = Arc::clone(&shared_state.backend_endpoints);
+        let upstream_host_policies = Arc::clone(&shared_state.upstream_host_policies);
+        let forwarded_header_policies = Arc::clone(&shared_state.forwarded_header_policies);
         let metrics = Arc::clone(&shared_state.metrics);
         let resilience = Arc::clone(&shared_state.resilience);
         let upstream_pools = shared_state.upstream_pools.clone();
@@ -4258,6 +4288,8 @@ impl QUICListener {
                 let alt_svc = alt_svc_value.clone();
                 let h2_pool = Arc::clone(&h2_pool);
                 let backend_endpoints = Arc::clone(&backend_endpoints);
+                let upstream_host_policies = Arc::clone(&upstream_host_policies);
+                let forwarded_header_policies = Arc::clone(&forwarded_header_policies);
                 let metrics = Arc::clone(&metrics);
                 let resilience = Arc::clone(&resilience);
                 let upstream_pools = upstream_pools.clone();
@@ -4287,6 +4319,8 @@ impl QUICListener {
                             let alt = alt_svc_conn.clone();
                             let h2_pool = Arc::clone(&h2_pool);
                             let backend_endpoints = Arc::clone(&backend_endpoints);
+                            let upstream_host_policies = Arc::clone(&upstream_host_policies);
+                            let forwarded_header_policies = Arc::clone(&forwarded_header_policies);
                             let metrics = Arc::clone(&metrics);
                             let resilience = Arc::clone(&resilience);
                             let upstream_pools = upstream_pools.clone();
@@ -4359,8 +4393,8 @@ impl QUICListener {
                                     &routing_index,
                                     Some(&lb_header_lookup),
                                 );
-                                let backend_addr = match resolved {
-                                    Ok(value) => value.backend_addr,
+                                let (backend_addr, upstream_name) = match resolved {
+                                    Ok(value) => (value.backend_addr, value.upstream_name),
                                     Err(ProxyError::Transport(reason)) => {
                                         let (status, body) =
                                             bootstrap_resolution_error_response(&reason);
@@ -4417,13 +4451,66 @@ impl QUICListener {
                                     }
                                 };
 
+                                let host_policy = upstream_host_policies
+                                    .get(&upstream_name)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let request_host = req
+                                    .headers()
+                                    .get(http::header::HOST)
+                                    .and_then(|value| value.to_str().ok());
+                                let upstream_host = match resolve_upstream_host_value(
+                                    &endpoint,
+                                    &host_policy,
+                                    authority.as_deref(),
+                                    request_host,
+                                ) {
+                                    Ok(host) => host,
+                                    Err(_) => {
+                                        return Ok(Response::builder()
+                                            .status(StatusCode::BAD_REQUEST)
+                                            .header("alt-svc", &alt)
+                                            .body(boxed_full(Bytes::from_static(
+                                                b"invalid host policy\n",
+                                            )))
+                                            .unwrap_or_else(|_| {
+                                                Response::new(boxed_full(Bytes::from_static(
+                                                    b"error\n",
+                                                )))
+                                            }));
+                                    }
+                                };
+
                                 let mut upstream_req =
                                     Request::builder().method(method.as_str()).uri(upstream_uri);
 
                                 let bootstrap_connection_tokens =
                                     connection_header_tokens(req.headers());
+                                let mut forwarded_from_headers: Vec<Vec<u8>> = Vec::new();
+                                let mut x_forwarded_for_from_headers: Vec<Vec<u8>> = Vec::new();
+                                let mut x_forwarded_proto_from_headers: Vec<Vec<u8>> = Vec::new();
+                                let mut x_forwarded_host_from_headers: Vec<Vec<u8>> = Vec::new();
                                 for (name, value) in req.headers() {
                                     if name == http::header::HOST {
+                                        continue;
+                                    }
+                                    if name.as_str().eq_ignore_ascii_case("forwarded") {
+                                        forwarded_from_headers.push(value.as_bytes().to_vec());
+                                        continue;
+                                    }
+                                    if name.as_str().eq_ignore_ascii_case("x-forwarded-for") {
+                                        x_forwarded_for_from_headers
+                                            .push(value.as_bytes().to_vec());
+                                        continue;
+                                    }
+                                    if name.as_str().eq_ignore_ascii_case("x-forwarded-proto") {
+                                        x_forwarded_proto_from_headers
+                                            .push(value.as_bytes().to_vec());
+                                        continue;
+                                    }
+                                    if name.as_str().eq_ignore_ascii_case("x-forwarded-host") {
+                                        x_forwarded_host_from_headers
+                                            .push(value.as_bytes().to_vec());
                                         continue;
                                     }
                                     if !is_websocket_upgrade
@@ -4455,17 +4542,52 @@ impl QUICListener {
                                     }
                                     upstream_req = upstream_req.header(name, value);
                                 }
-                                upstream_req = upstream_req.header(
-                                    http::header::HOST,
-                                    authority.as_deref().unwrap_or(endpoint.authority()),
-                                );
-                                upstream_req = upstream_req.header(
-                                    "forwarded",
-                                    format!(
-                                        "for={};proto=https",
-                                        bootstrap_forwarded_for_value(peer.ip())
-                                    ),
-                                );
+                                upstream_req =
+                                    upstream_req.header(http::header::HOST, upstream_host);
+
+                                let forwarded_policy = forwarded_header_policies
+                                    .get(&upstream_name)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let forwarded_values = match build_forwarded_header_values(
+                                    &forwarded_policy,
+                                    ForwardedHeaderChains {
+                                        forwarded: &forwarded_from_headers,
+                                        x_forwarded_for: &x_forwarded_for_from_headers,
+                                        x_forwarded_proto: &x_forwarded_proto_from_headers,
+                                        x_forwarded_host: &x_forwarded_host_from_headers,
+                                    },
+                                    peer.ip(),
+                                    upstream_host,
+                                ) {
+                                    Ok(values) => values,
+                                    Err(err) => {
+                                        warn!("Bootstrap forwarded header policy failed: {}", err);
+                                        return Ok(Response::builder()
+                                            .status(StatusCode::BAD_REQUEST)
+                                            .header("alt-svc", &alt)
+                                            .body(boxed_full(Bytes::from_static(
+                                                b"invalid forwarded headers\n",
+                                            )))
+                                            .unwrap_or_else(|_| {
+                                                Response::new(boxed_full(Bytes::from_static(
+                                                    b"error\n",
+                                                )))
+                                            }));
+                                    }
+                                };
+                                if let Some(value) = forwarded_values.forwarded {
+                                    upstream_req = upstream_req.header("forwarded", value);
+                                }
+                                if let Some(value) = forwarded_values.x_forwarded_for {
+                                    upstream_req = upstream_req.header("x-forwarded-for", value);
+                                }
+                                if let Some(value) = forwarded_values.x_forwarded_proto {
+                                    upstream_req = upstream_req.header("x-forwarded-proto", value);
+                                }
+                                if let Some(value) = forwarded_values.x_forwarded_host {
+                                    upstream_req = upstream_req.header("x-forwarded-host", value);
+                                }
 
                                 if !is_websocket_upgrade
                                     && content_length
@@ -5031,6 +5153,8 @@ mod tests {
                 lb_type: lb_type.to_string(),
                 key: lb_key.map(str::to_string),
             },
+            host_policy: Default::default(),
+            forwarded_headers: Default::default(),
             route: RouteMatch {
                 host: None,
                 path_prefix: Some("/api".to_string()),

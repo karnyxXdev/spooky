@@ -33,6 +33,13 @@ upstream:
     route:
       path_prefix: "/api"
 
+    host_policy:
+      mode: pass-through   # pass-through | rewrite | upstream
+      # host: "api.example.com"  # required when mode: rewrite
+
+    forwarded_headers:
+      mode: append         # append | preserve | overwrite
+
     backends:
       - id: "backend1"
         address: "api-backend-1.internal.example:7001"   # verified HTTPS by default; use config.development.yaml for local cleartext

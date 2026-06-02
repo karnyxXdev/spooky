@@ -233,6 +233,8 @@ upstream:
 | `load_balancing` | object | No | round-robin | Per-upstream load balancing algorithm configuration |
 | `route` | object | Yes | - | Route matching criteria |
 | `backends` | array | Yes | - | List of backend servers |
+| `host_policy` | object | No | `pass-through` | Controls how the `Host`/`:authority` header is set on upstream requests |
+| `forwarded_headers` | object | No | `overwrite` | Controls `X-Forwarded-For` forwarding behavior |
 
 ### Route Matching
 
@@ -405,6 +407,88 @@ backends:
     health_check:
       path: "/healthz"
       interval: 5000
+```
+
+### Host Policy
+
+Controls how the `Host` / `:authority` header is set on requests forwarded to the upstream.
+
+| Property | Type | Required | Default | Description |
+|----------|------|----------|---------|-------------|
+| `mode` | string | No | `pass-through` | Header rewrite mode: `pass-through`, `rewrite`, or `upstream` |
+| `host` | string | No | - | Static host to use when `mode: rewrite` |
+
+#### Modes
+
+| Mode | Behavior |
+|------|----------|
+| `pass-through` | Forwards the original client `Host`/`:authority` unchanged to the upstream |
+| `rewrite` | Replaces the host with the value of `host` (required when using this mode) |
+| `upstream` | Uses the backend's own authority (hostname from the `address` field) |
+
+#### Examples
+
+```yaml
+upstream:
+  # Pass client host through as-is (default)
+  api_pool:
+    host_policy:
+      mode: pass-through
+    backends: [...]
+
+  # Rewrite to a static host
+  legacy_pool:
+    host_policy:
+      mode: rewrite
+      host: "legacy-origin.internal.example"
+    backends: [...]
+
+  # Use the backend's own hostname
+  direct_pool:
+    host_policy:
+      mode: upstream
+    backends: [...]
+```
+
+### Forwarded Headers Policy
+
+Controls how `X-Forwarded-For` and related forwarding headers are set on upstream requests.
+
+| Property | Type | Required | Default | Description |
+|----------|------|----------|---------|-------------|
+| `mode` | string | No | `overwrite` | Forwarding mode: `append`, `preserve`, or `overwrite` |
+
+#### Modes
+
+| Mode | Behavior |
+|------|----------|
+| `overwrite` | Replaces any inbound `X-Forwarded-For` with the client IP only (default) |
+| `append` | Appends the client IP to the existing `X-Forwarded-For` chain |
+| `preserve` | Passes the inbound `X-Forwarded-For` chain through unchanged without adding the client IP |
+
+Use `append` in multi-hop deployments where the full client IP chain must be preserved. Use `overwrite` (default) when spooky is the first edge and inbound forwarded headers should not be trusted.
+
+#### Examples
+
+```yaml
+upstream:
+  # First edge — overwrite inbound XFF with real client IP (default)
+  public_pool:
+    forwarded_headers:
+      mode: overwrite
+    backends: [...]
+
+  # Behind another trusted proxy — append to the existing chain
+  internal_pool:
+    forwarded_headers:
+      mode: append
+    backends: [...]
+
+  # Pass the inbound chain through unchanged
+  passthrough_pool:
+    forwarded_headers:
+      mode: preserve
+    backends: [...]
 ```
 
 ## Load Balancing Configuration

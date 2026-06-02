@@ -10,6 +10,8 @@ pub(super) struct ForwardRequestMeta {
     pub(super) client_addr: SocketAddr,
     pub(super) request_id: u64,
     pub(super) traceparent: Option<Arc<str>>,
+    pub(super) host_policy: UpstreamHostPolicy,
+    pub(super) forwarded_header_policy: ForwardedHeaderPolicy,
 }
 
 impl ForwardRequestMeta {
@@ -17,8 +19,10 @@ impl ForwardRequestMeta {
         &self,
         endpoint: &BackendEndpoint,
     ) -> Result<Request<BoxBody<Bytes, std::convert::Infallible>>, ProxyError> {
-        build_h2_request_for_endpoint(
+        build_h2_request_for_endpoint_with_host_policy(
             endpoint,
+            &self.host_policy,
+            &self.forwarded_header_policy,
             &self.method,
             &self.path,
             self.headers.as_slice(),

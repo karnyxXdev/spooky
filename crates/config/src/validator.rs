@@ -1,5 +1,7 @@
 use crate::backend_endpoint::{BackendEndpoint, BackendScheme};
-use crate::config::{CURRENT_CONFIG_VERSION, Config, SUPPORTED_CONFIG_VERSIONS};
+use crate::config::{
+    CURRENT_CONFIG_VERSION, Config, SUPPORTED_CONFIG_VERSIONS, UpstreamHostPolicyMode,
+};
 use log::{error, info, warn};
 use std::collections::HashMap;
 use std::fs::File;
@@ -195,6 +197,17 @@ fn normalized_route_method(method: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_uppercase())
+}
+
+fn valid_static_host_header(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed == value
+        && !trimmed.chars().any(|ch| ch.is_ascii_whitespace())
+        && !trimmed.contains('/')
+        && !trimmed.contains('?')
+        && !trimmed.contains('#')
+        && http::HeaderValue::from_str(trimmed).is_ok()
 }
 
 fn normalize_sni_server_name(raw: &str) -> Option<String> {
@@ -1063,6 +1076,27 @@ pub fn validate(config: &Config) -> bool {
                 return false;
             }
         }
+
+        match upstream.host_policy.mode {
+            UpstreamHostPolicyMode::PassThrough | UpstreamHostPolicyMode::Upstream => {
+                if upstream.host_policy.host.is_some() {
+                    warn!(
+                        "upstream {}.host_policy.host is ignored unless mode is rewrite",
+                        upstream_name
+                    );
+                }
+            }
+            UpstreamHostPolicyMode::Rewrite => match upstream.host_policy.host.as_deref() {
+                Some(host) if valid_static_host_header(host) => {}
+                _ => {
+                    error!(
+                        "upstream {}.host_policy.mode=rewrite requires a valid non-empty host_policy.host",
+                        upstream_name
+                    );
+                    return false;
+                }
+            },
+        }
     }
 
     // --- Validate upstreams ---
@@ -1257,6 +1291,8 @@ mod tests {
                     lb_type: "round-robin".to_string(),
                     key: None,
                 },
+                host_policy: Default::default(),
+                forwarded_headers: Default::default(),
                 route: RouteMatch {
                     host: None,
                     path_prefix: Some("/".to_string()),
@@ -1986,6 +2022,8 @@ upstream:
                 lb_type: "round-robin".to_string(),
                 key: None,
             },
+            host_policy: Default::default(),
+            forwarded_headers: Default::default(),
             route: RouteMatch {
                 host: Some("api.example.com".to_string()),
                 path_prefix: Some("/api".to_string()),
@@ -2023,6 +2061,8 @@ upstream:
                 lb_type: "round-robin".to_string(),
                 key: None,
             },
+            host_policy: Default::default(),
+            forwarded_headers: Default::default(),
             route: RouteMatch {
                 host: Some("api.example.com".to_string()),
                 path_prefix: Some("/api".to_string()),

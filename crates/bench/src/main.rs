@@ -736,6 +736,8 @@ fn build_lb_upstream(scale: usize, lb_type: &str) -> Upstream {
             lb_type: lb_type.to_string(),
             key: None,
         },
+        host_policy: Default::default(),
+        forwarded_headers: Default::default(),
         route: RouteMatch {
             host: None,
             path_prefix: Some("/".to_string()),

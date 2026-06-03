@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 mod privilege_drop;
 mod runtime_guard;
 
-use spooky_config::config::Config;
+use spooky_config::config::{Config, effective_listens};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -114,14 +114,14 @@ fn main() {
     );
     runtime_guard::install_panic_hook();
 
-    // Require root only when binding a privileged port (< 1024).
+    // Require root only when binding privileged ports (< 1024).
     let uid = unsafe { libc::getuid() };
-    if uid != 0 && config_yaml.listen.port < 1024 {
+    let binds_privileged_port = std::iter::once(&config_yaml.listen)
+        .chain(config_yaml.listeners.iter())
+        .any(|listen| listen.port < 1024);
+    if uid != 0 && binds_privileged_port {
         fatal_startup_error(
-            &format!(
-                "binding privileged port {} requires root or CAP_NET_BIND_SERVICE. Use a port >= 1024 for unprivileged startup.",
-                config_yaml.listen.port
-            ),
+            "binding a privileged port requires root or CAP_NET_BIND_SERVICE. Use ports >= 1024 for unprivileged startup.",
             true,
             1,
         );
@@ -176,68 +176,18 @@ async fn run(config_yaml: Config, uid: libc::uid_t) {
         std::process::exit(1);
     }
 
-    let sockets = if worker_count > 1 {
-        match QUICListener::bind_reuseport_sockets(&config_yaml, worker_count) {
-            Ok(sockets) => sockets,
-            Err(e) => {
-                error!("Failed to bind SO_REUSEPORT sockets: {}", e);
-                std::process::exit(1);
-            }
-        }
-    } else {
-        match QUICListener::bind_socket(&config_yaml, false) {
-            Ok(socket) => vec![socket],
-            Err(e) => {
-                error!("Failed to bind UDP socket: {}", e);
-                std::process::exit(1);
-            }
-        }
-    };
-
-    let privileged_bind = config_yaml.listen.port < 1024;
-    if privileged_bind && uid == 0 {
-        if config_yaml.security.privileges.enabled {
-            match privilege_drop::drop_privileges(
-                &config_yaml.security.privileges.user,
-                &config_yaml.security.privileges.group,
-            ) {
-                Ok(()) => {
-                    info!(
-                        "Dropped root privileges to user='{}' group='{}'",
-                        config_yaml.security.privileges.user, config_yaml.security.privileges.group
-                    );
-                }
-                Err(err) => {
-                    error!("Failed to drop privileges after privileged bind: {}", err);
-                    std::process::exit(1);
-                }
-            }
-        } else {
-            warn!(
-                "Running as root on privileged port without privilege drop (security.privileges.enabled=false)"
-            );
-        }
+    let listens = effective_listens(&config_yaml);
+    let binds_privileged_port = listens.iter().any(|listen| listen.port < 1024);
+    if uid != 0 && binds_privileged_port {
+        fatal_startup_error(
+            "binding a privileged port requires root or CAP_NET_BIND_SERVICE. Use ports >= 1024 for unprivileged startup.",
+            true,
+            1,
+        );
     }
-
-    info!("Spooky is starting");
-    info!(
-        "Ingress: HTTP/3 (QUIC) on UDP {}:{}, HTTP/1.1+HTTP/2 bootstrap (TLS) on TCP {}:{} with Alt-Svc upgrade",
-        config_yaml.listen.address,
-        config_yaml.listen.port,
-        config_yaml.listen.address,
-        config_yaml.listen.port,
-    );
-    info!(
-        "Data-plane workers={} packet_shards_per_worker={} reuseport={} pin_workers={}",
-        sockets.len(),
-        shard_count,
-        config_yaml.performance.reuseport,
-        config_yaml.performance.pin_workers
-    );
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_flag = shutdown.clone();
-
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
         shutdown_flag.store(true, Ordering::Relaxed);
@@ -246,48 +196,65 @@ async fn run(config_yaml: Config, uid: libc::uid_t) {
     let pin_workers = config_yaml.performance.pin_workers;
     let shard_queue_capacity = config_yaml.performance.packet_shard_queue_capacity.max(1);
     let shard_queue_max_bytes = config_yaml.performance.packet_shard_queue_max_bytes.max(1);
-    let mut worker_handles = Vec::with_capacity(sockets.len());
-    for (worker_idx, socket) in sockets.into_iter().enumerate() {
-        let worker_config = config_yaml.clone();
-        let worker_shutdown = Arc::clone(&shutdown);
-        let worker_shared = Arc::clone(&shared_state);
-        let thread_name = format!("spooky-data-plane-{}", worker_idx);
-        let handle = thread::Builder::new().name(thread_name.clone()).spawn(
-            move || -> Result<(), String> {
-                if shard_count <= 1 {
-                    return run_single_listener_worker(
-                        worker_idx,
-                        pin_workers,
-                        worker_config,
-                        socket,
-                        worker_shared,
-                        worker_shutdown,
-                    );
-                }
+    let mut worker_handles: Vec<thread::JoinHandle<Result<(), String>>> = Vec::new();
+    let mut worker_index_base = 0usize;
 
-                run_sharded_listener_worker(
-                    worker_idx,
-                    shard_count,
-                    shard_queue_capacity,
-                    shard_queue_max_bytes,
-                    pin_workers,
-                    worker_config,
-                    socket,
-                    worker_shared,
-                    worker_shutdown,
-                )
-            },
-        );
+    for (listener_idx, listen) in listens.iter().enumerate() {
+        let mut listener_config = config_yaml.clone();
+        listener_config.listen = listen.clone();
 
-        match handle {
-            Ok(handle) => worker_handles.push(handle),
+        if let Err(err) =
+            QUICListener::spawn_bootstrap_tls_listener(&listener_config, &shared_state)
+        {
+            error!(
+                "Failed to initialize bootstrap TLS listener {} ({}:{}): {}",
+                listener_idx, listen.address, listen.port, err
+            );
+            std::process::exit(1);
+        }
+
+        match spawn_listener_worker_group(
+            listener_config,
+            worker_count,
+            shard_count,
+            shard_queue_capacity,
+            shard_queue_max_bytes,
+            pin_workers,
+            Arc::clone(&shared_state),
+            Arc::clone(&shutdown),
+            worker_index_base,
+        ) {
+            Ok(handles) => worker_handles.extend(handles),
             Err(err) => {
-                error!("Failed to spawn worker thread {}: {}", worker_idx, err);
-                shutdown.store(true, Ordering::Relaxed);
-                break;
+                error!("{}", err);
+                std::process::exit(1);
             }
         }
+
+        worker_index_base = worker_index_base.saturating_add(worker_count.max(1));
     }
+
+    info!("Spooky is starting");
+    info!(
+        "Ingress listeners={} packet_shards_per_worker={} reuseport={} pin_workers={}",
+        listens.len(),
+        shard_count,
+        config_yaml.performance.reuseport,
+        config_yaml.performance.pin_workers
+    );
+    for (idx, listen) in listens.iter().enumerate() {
+        info!(
+            "Listener {}: HTTP/3 (QUIC) on UDP {}:{}, HTTP/1.1+HTTP/2 bootstrap (TLS) on TCP {}:{} with Alt-Svc upgrade",
+            idx, listen.address, listen.port, listen.address, listen.port,
+        );
+    }
+    info!(
+        "Data-plane workers={} packet_shards_per_worker={} reuseport={} pin_workers={}",
+        worker_handles.len(),
+        shard_count,
+        config_yaml.performance.reuseport,
+        config_yaml.performance.pin_workers
+    );
 
     let mut worker_failed = false;
     let mut active_worker_handles = worker_handles;
@@ -330,6 +297,79 @@ async fn run(config_yaml: Config, uid: libc::uid_t) {
     }
     spooky_utils::telemetry::shutdown_tracing();
     info!("Spooky shutdown complete");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_listener_worker_group(
+    listener_config: Config,
+    worker_count: usize,
+    shard_count: usize,
+    shard_queue_capacity: usize,
+    shard_queue_max_bytes: usize,
+    pin_workers: bool,
+    worker_shared: Arc<SharedRuntimeState>,
+    worker_shutdown: Arc<AtomicBool>,
+    worker_index_base: usize,
+) -> Result<Vec<thread::JoinHandle<Result<(), String>>>, String> {
+    let sockets = if worker_count > 1 {
+        match QUICListener::bind_reuseport_sockets(&listener_config, worker_count) {
+            Ok(sockets) => sockets,
+            Err(e) => return Err(format!("Failed to bind SO_REUSEPORT sockets: {}", e)),
+        }
+    } else {
+        match QUICListener::bind_socket(&listener_config, false) {
+            Ok(socket) => vec![socket],
+            Err(e) => return Err(format!("Failed to bind UDP socket: {}", e)),
+        }
+    };
+
+    let mut worker_handles = Vec::with_capacity(sockets.len());
+    for (socket_idx, socket) in sockets.into_iter().enumerate() {
+        let worker_idx = worker_index_base.saturating_add(socket_idx);
+        let worker_config = listener_config.clone();
+        let worker_shutdown = Arc::clone(&worker_shutdown);
+        let worker_shared = Arc::clone(&worker_shared);
+        let thread_name = format!("spooky-data-plane-{}", worker_idx);
+        let handle =
+            thread::Builder::new()
+                .name(thread_name)
+                .spawn(move || -> Result<(), String> {
+                    if shard_count <= 1 {
+                        return run_single_listener_worker(
+                            worker_idx,
+                            pin_workers,
+                            worker_config,
+                            socket,
+                            worker_shared,
+                            worker_shutdown,
+                        );
+                    }
+
+                    run_sharded_listener_worker(
+                        worker_idx,
+                        shard_count,
+                        shard_queue_capacity,
+                        shard_queue_max_bytes,
+                        pin_workers,
+                        worker_config,
+                        socket,
+                        worker_shared,
+                        worker_shutdown,
+                    )
+                });
+
+        match handle {
+            Ok(handle) => worker_handles.push(handle),
+            Err(err) => {
+                return Err(format!(
+                    "Failed to spawn worker thread {}: {}",
+                    worker_idx, err
+                ));
+            }
+        }
+    }
+
+    Ok(worker_handles)
 }
 
 #[allow(clippy::too_many_arguments)]

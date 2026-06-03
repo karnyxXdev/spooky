@@ -88,7 +88,11 @@ Configuration schema version.
 
 ### listen
 
-Server listening configuration. Defines the protocol, address, and port for incoming client connections.
+Server listening configuration. Defines the protocol, address, and port for incoming client connections. Used as the single listener when `listeners` is absent or empty.
+
+### listeners
+
+Optional multi-listener array. When set, overrides the top-level `listen` block. Each entry is an independent listener with its own address, port, and TLS identity. Spooky spawns a separate QUIC worker group and bootstrap TLS listener per entry.
 
 ### upstream
 
@@ -214,6 +218,40 @@ listen:
         key: "/etc/spooky/certs/www.key"
 ```
 
+### Multi-Listener Configuration
+
+Use `listeners` instead of `listen` when you need multiple independent listeners — for example, a public-facing port and a private/internal port with different TLS identities.
+
+`listeners` and `listen` share the same per-entry schema. When `listeners` is set, the top-level `listen` block is ignored.
+
+```yaml
+# Single listener — use the top-level listen block (default)
+listen:
+  protocol: http3
+  address: "0.0.0.0"
+  port: 9889
+  tls:
+    cert: "/etc/spooky/certs/fullchain.pem"
+    key: "/etc/spooky/certs/privkey.pem"
+
+# Multi-listener — independent public and internal listeners
+listeners:
+  - protocol: http3
+    address: "0.0.0.0"
+    port: 9889
+    tls:
+      cert: "/etc/spooky/certs/public-fullchain.pem"
+      key: "/etc/spooky/certs/public-privkey.pem"
+  - protocol: http3
+    address: "10.0.0.1"
+    port: 9890
+    tls:
+      cert: "/etc/spooky/certs/internal-fullchain.pem"
+      key: "/etc/spooky/certs/internal-privkey.pem"
+```
+
+Each listener entry shares the same upstream routing table — route matching, load balancing, and health checks are global across all listeners.
+
 ## Upstream Configuration
 
 Upstream pools define groups of backend servers with routing rules and load balancing strategies. Each upstream pool is identified by a unique name and contains routing criteria, load balancing configuration, and backend definitions.
@@ -236,6 +274,7 @@ upstream:
 | `route` | object | Yes | - | Route matching criteria |
 | `backends` | array | Yes | - | List of backend servers |
 | `host_policy` | object | No | `pass-through` | Controls how the `Host`/`:authority` header is set on upstream requests |
+| `tls` | object | No | inherits `upstream_tls` | Per-upstream TLS policy override (verify_certificates, strict_sni, ca_file, ca_dir) |
 | `forwarded_headers` | object | No | `overwrite` | Controls `X-Forwarded-For` forwarding behavior |
 
 ### Route Matching
@@ -490,6 +529,53 @@ upstream:
   passthrough_pool:
     forwarded_headers:
       mode: preserve
+    backends: [...]
+```
+
+### Per-Upstream TLS Policy
+
+Each upstream can optionally override the global `upstream_tls` settings with its own TLS profile. When `tls` is omitted, the global `upstream_tls` block applies.
+
+| Property | Type | Required | Default | Description |
+|----------|------|----------|---------|-------------|
+| `verify_certificates` | bool | No | `true` | Verify upstream TLS certificates |
+| `strict_sni` | bool | No | `true` | Send backend hostname as SNI |
+| `ca_file` | string | No | - | Path to a PEM CA bundle for this upstream |
+| `ca_dir` | string | No | - | Path to a directory of PEM CA bundles for this upstream |
+
+This is useful when backends have heterogeneous trust requirements — for example, one upstream uses a private internal CA while another uses a public CA.
+
+#### Examples
+
+```yaml
+upstream_tls:
+  verify_certificates: true   # global default
+  strict_sni: true
+
+upstream:
+  # Uses global upstream_tls — no override needed
+  public_pool:
+    route:
+      path_prefix: "/api"
+    backends: [...]
+
+  # Override: trust a private CA for this upstream only
+  internal_pool:
+    tls:
+      verify_certificates: true
+      strict_sni: true
+      ca_file: "/etc/spooky/certs/internal-ca.pem"
+    route:
+      path_prefix: "/internal"
+    backends: [...]
+
+  # Override: disable verification for a trusted dev upstream
+  dev_pool:
+    tls:
+      verify_certificates: false
+      strict_sni: false
+    route:
+      path_prefix: "/dev"
     backends: [...]
 ```
 

@@ -19,6 +19,22 @@ listen:
             require_client_cert: false  # when true, close connections that complete handshake without a client cert
             ca_file: null               # PEM CA bundle used to verify client certificates when enabled=true
 
+# listeners: optional multi-listener block; when set, overrides the top-level listen block.
+# Each entry is an independent listener with its own address, port, and TLS identity.
+# listeners:
+#   - protocol: http3
+#     address: "0.0.0.0"
+#     port: 9889
+#     tls:
+#       cert: certs/public-fullchain.pem
+#       key: certs/public-key-pkcs8.pem
+#   - protocol: http3
+#     address: "10.0.0.1"
+#     port: 9890
+#     tls:
+#       cert: certs/internal-fullchain.pem
+#       key: certs/internal-key-pkcs8.pem
+
 upstream_tls:
     verify_certificates: true  # safe-by-default for HTTPS upstreams
     strict_sni: true           # send backend host as SNI for HTTPS upstream connections
@@ -39,6 +55,13 @@ upstream:
 
     forwarded_headers:
       mode: append         # append | preserve | overwrite
+
+    # tls: optional per-upstream TLS override; inherits from upstream_tls when omitted
+    # tls:
+    #   verify_certificates: true
+    #   strict_sni: true
+    #   ca_file: certs/private-ca.pem  # optional custom CA bundle for this upstream only
+    #   ca_dir: null
 
     backends:
       - id: "backend1"

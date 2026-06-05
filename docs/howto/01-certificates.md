@@ -10,17 +10,16 @@ Spooky requires TLS certificates for both the QUIC/HTTP3 listener and the HTTP/1
 
 ## Option 1: Let's Encrypt with Certbot (Standalone)
 
-Use when Caddy is stopped or you want a fresh independent cert.
+Use when no other service is running on port 80, or when you want a fresh independent cert.
 
 ```bash
-# Stop whatever is on port 80 first
-sudo systemctl stop caddy
+# Stop whatever is on port 80 first (e.g. sudo systemctl stop caddy/nginx/apache)
 
 sudo apt install -y certbot
 
 sudo certbot certonly --standalone \
-  -d spooky.nishujangra.dev \
-  --email ndjangra1027@gmail.com \
+  -d example.com \
+  --email admin@example.com \
   --agree-tos \
   --non-interactive
 ```
@@ -31,13 +30,13 @@ Let's Encrypt issues PKCS#1 keys — convert to PKCS#8 which Spooky requires:
 sudo mkdir -p /etc/spooky/certs
 
 sudo openssl pkcs8 -topk8 -nocrypt \
-  -in /etc/letsencrypt/live/spooky.nishujangra.dev/privkey.pem \
+  -in /etc/letsencrypt/live/example.com/privkey.pem \
   -out /etc/spooky/certs/privkey.pem
 
-sudo cp /etc/letsencrypt/live/spooky.nishujangra.dev/fullchain.pem \
+sudo cp /etc/letsencrypt/live/example.com/fullchain.pem \
     /etc/spooky/certs/fullchain.pem
 
-sudo chown ubuntu:ubuntu /etc/spooky/certs/*
+sudo chown $USER:$USER /etc/spooky/certs/*
 sudo chmod 640 /etc/spooky/certs/*
 ```
 
@@ -49,7 +48,7 @@ Create `/etc/letsencrypt/renewal-hooks/deploy/spooky-reload.sh`:
 #!/bin/bash
 set -e
 
-DOMAIN="spooky.nishujangra.dev"
+DOMAIN="example.com"
 SRC="/etc/letsencrypt/live/${DOMAIN}"
 DST="/etc/spooky/certs"
 
@@ -59,7 +58,7 @@ openssl pkcs8 -topk8 -nocrypt \
   -in "${SRC}/privkey.pem" \
   -out "${DST}/privkey.pem"
 
-chown ubuntu:ubuntu "${DST}"/*.pem
+chown $SUDO_USER:$SUDO_USER "${DST}"/*.pem
 systemctl restart spooky
 ```
 
@@ -75,20 +74,20 @@ sudo certbot renew --dry-run   # test renewal
 `acme.sh` supports DNS-01 challenges — no need to stop any service on port 80.
 
 ```bash
-curl https://get.acme.sh | sh -s email=nishant@udyansh.org
+curl https://get.acme.sh | sh -s email=admin@example.com
 source ~/.bashrc
 
 # Issue cert via DNS challenge (requires DNS provider API key)
 # Example for Cloudflare:
 export CF_Token="your-cloudflare-api-token"
 ~/.acme.sh/acme.sh --issue --dns dns_cf \
-  -d spooky.nishujangra.dev \
+  -d example.com \
   --server letsencrypt
 
 # Install to spooky cert dir with PKCS#8 key conversion
 sudo mkdir -p /etc/spooky/certs
 
-~/.acme.sh/acme.sh --install-cert -d spooky.nishujangra.dev \
+~/.acme.sh/acme.sh --install-cert -d example.com \
   --cert-file      /etc/spooky/certs/fullchain.pem \
   --key-file       /tmp/privkey-pkcs1.pem \
   --reloadcmd      "openssl pkcs8 -topk8 -nocrypt -in /tmp/privkey-pkcs1.pem -out /etc/spooky/certs/privkey.pem && systemctl restart spooky"
@@ -106,10 +105,10 @@ listen:
     cert: /etc/spooky/certs/default-fullchain.pem   # fallback when SNI unmatched
     key:  /etc/spooky/certs/default-privkey.pem
     certificates:
-      - server_name: "spooky.nishujangra.dev"
+      - server_name: "example.com"
         cert: /etc/spooky/certs/spooky-fullchain.pem
         key:  /etc/spooky/certs/spooky-privkey.pem
-      - server_name: "api.spooky.nishujangra.dev"
+      - server_name: "api.example.com"
         cert: /etc/spooky/certs/api-fullchain.pem
         key:  /etc/spooky/certs/api-privkey.pem
 ```

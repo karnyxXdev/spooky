@@ -24,7 +24,7 @@ upstream:
             type: round-robin
 
         route:
-            host: "domain.abc"
+            host: "example.com"
             path_prefix: "/"
 
         host_policy:
@@ -43,7 +43,7 @@ upstream:
             type: round-robin
 
         route:
-            host: "domain.abc"
+            host: "example.com"
             path_prefix: "/api"
 
         host_policy:

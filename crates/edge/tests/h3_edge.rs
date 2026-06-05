@@ -528,7 +528,7 @@ fn invalid_backend_scheme_is_rejected_at_startup() {
         Ok(_) => panic!("invalid backend scheme should fail startup"),
         Err(err) => {
             assert!(
-                err.to_string().contains("invalid backend address"),
+                err.to_string().contains("backend_address_invalid"),
                 "unexpected startup error: {err}"
             );
         }

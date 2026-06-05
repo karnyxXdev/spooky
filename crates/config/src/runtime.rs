@@ -3,9 +3,9 @@ use std::{collections::HashMap, fmt, net::IpAddr};
 use crate::{
     backend_endpoint::BackendEndpoint,
     config::{
-        Backend, ClientAuth, Config, ForwardedHeaderPolicy, Listen, LoadBalancing,
-        Observability, Performance, ProtocolPolicy, Resilience, RouteMatch, Security,
-        TlsCertificate, Upstream, UpstreamHostPolicy, UpstreamHostPolicyMode, UpstreamTls,
+        Backend, ClientAuth, Config, ForwardedHeaderPolicy, Listen, LoadBalancing, Observability,
+        Performance, ProtocolPolicy, Resilience, RouteMatch, Security, TlsCertificate, Upstream,
+        UpstreamHostPolicy, UpstreamHostPolicyMode, UpstreamTls,
     },
 };
 
@@ -186,7 +186,10 @@ impl RuntimeListener {
     }
 
     pub fn bind_key(&self) -> (String, u16) {
-        (self.listen.address.trim().to_ascii_lowercase(), self.listen.port)
+        (
+            self.listen.address.trim().to_ascii_lowercase(),
+            self.listen.port,
+        )
     }
 }
 
@@ -249,9 +252,11 @@ impl RuntimeListenerTls {
                 .first()
                 .map(|entry| RuntimeTlsIdentity::from_certificate(entry, label))
                 .transpose()?
-                .ok_or_else(|| RuntimeConfigError::TlsMaterialInvalid(format!(
-                    "{label}.tls requires either cert/key or certificates entries"
-                )))?,
+                .ok_or_else(|| {
+                    RuntimeConfigError::TlsMaterialInvalid(format!(
+                        "{label}.tls requires either cert/key or certificates entries"
+                    ))
+                })?,
         };
 
         Ok(Self {
@@ -294,10 +299,7 @@ impl RuntimeTlsIdentity {
         })
     }
 
-    fn from_legacy_pair(
-        listen: &Listen,
-        label: &str,
-    ) -> Result<Option<Self>, RuntimeConfigError> {
+    fn from_legacy_pair(listen: &Listen, label: &str) -> Result<Option<Self>, RuntimeConfigError> {
         let cert = listen.tls.cert.trim();
         let key = listen.tls.key.trim();
         if cert.is_empty() || key.is_empty() {
@@ -339,9 +341,7 @@ impl RuntimeUpstream {
             route: upstream.route.clone(),
             policy: RuntimeUpstreamPolicy {
                 host: RuntimeHostPolicy(upstream.host_policy.clone()),
-                forwarded_headers: RuntimeForwardedHeaderPolicy(
-                    upstream.forwarded_headers.clone(),
-                ),
+                forwarded_headers: RuntimeForwardedHeaderPolicy(upstream.forwarded_headers.clone()),
                 protocol: RuntimeProtocolPolicy(config.resilience.protocol.clone()),
             },
             effective_tls: effective_tls.clone(),
@@ -424,9 +424,7 @@ pub fn runtime_listeners(config: &Config) -> Result<Vec<RuntimeListener>, Runtim
     Ok(listeners)
 }
 
-fn validate_listener_bindings(
-    listeners: &[RuntimeListener],
-) -> Result<(), RuntimeConfigError> {
+fn validate_listener_bindings(listeners: &[RuntimeListener]) -> Result<(), RuntimeConfigError> {
     let mut seen = HashMap::new();
     for listener in listeners {
         let bind_key = listener.bind_key();
@@ -481,7 +479,8 @@ fn normalize_upstreams(
             });
         }
 
-        let runtime_upstream = RuntimeUpstream::from_config(config, upstream_name.as_str(), upstream);
+        let runtime_upstream =
+            RuntimeUpstream::from_config(config, upstream_name.as_str(), upstream);
         validate_runtime_upstream_tls(upstream_name, &runtime_upstream.effective_tls)?;
 
         for backend in &runtime_upstream.backends {
@@ -555,12 +554,12 @@ fn validate_protocol_policy(policy: &ProtocolPolicy) -> Result<(), RuntimeConfig
         .any(|prefix| prefix.is_empty() || !prefix.starts_with('/'))
     {
         return Err(RuntimeConfigError::ConfigInvalid(
-            "resilience.protocol.denied_path_prefixes must contain '/'-prefixed paths"
-                .to_string(),
+            "resilience.protocol.denied_path_prefixes must contain '/'-prefixed paths".to_string(),
         ));
     }
     if !policy.allow_connect
-        && (!policy.connect_allowed_ports.is_empty() || !policy.connect_allowed_authorities.is_empty())
+        && (!policy.connect_allowed_ports.is_empty()
+            || !policy.connect_allowed_authorities.is_empty())
     {
         return Err(RuntimeConfigError::UnsupportedPolicyCombination(
             "resilience.protocol.connect_allowed_ports/connect_allowed_authorities require allow_connect=true"
@@ -826,20 +825,33 @@ mod tests {
                 protocol: "http3".to_string(),
                 port: 8443,
                 address: "127.0.0.1".to_string(),
-                tls: Tls::default(),
+                tls: Tls {
+                    cert: "/tmp/tls/explicit-1.pem".to_string(),
+                    key: "/tmp/tls/explicit-1.key".to_string(),
+                    certificates: Vec::new(),
+                    client_auth: ClientAuth::default(),
+                },
             },
             Listen {
                 protocol: "http3".to_string(),
                 port: 9443,
                 address: "127.0.0.2".to_string(),
-                tls: Tls::default(),
+                tls: Tls {
+                    cert: "/tmp/tls/explicit-2.pem".to_string(),
+                    key: "/tmp/tls/explicit-2.key".to_string(),
+                    certificates: Vec::new(),
+                    client_auth: ClientAuth::default(),
+                },
             },
         ];
 
         let listeners = runtime_listeners(&config).expect("explicit listeners");
 
         assert_eq!(listeners.len(), 2);
-        assert_eq!(listeners[0].source, RuntimeListenerSource::ExplicitListeners);
+        assert_eq!(
+            listeners[0].source,
+            RuntimeListenerSource::ExplicitListeners
+        );
         assert_eq!(listeners[0].listen.port, 8443);
         assert_eq!(listeners[1].listen.port, 9443);
     }
@@ -877,11 +889,7 @@ mod tests {
             ca_file: Some("/tmp/roots/global.pem".to_string()),
             ca_dir: None,
         };
-        config
-            .upstream
-            .get_mut("api")
-            .expect("upstream")
-            .tls = Some(UpstreamTls {
+        config.upstream.get_mut("api").expect("upstream").tls = Some(UpstreamTls {
             verify_certificates: false,
             strict_sni: false,
             ca_file: Some("/tmp/roots/upstream.pem".to_string()),
@@ -899,7 +907,10 @@ mod tests {
             Some("/tmp/roots/upstream.pem")
         );
         assert_eq!(upstream.backends.len(), 1);
-        assert_eq!(upstream.backends[0].backend.address, "https://api.internal:8443");
+        assert_eq!(
+            upstream.backends[0].backend.address,
+            "https://api.internal:8443"
+        );
         assert_eq!(upstream.policy.host.0.mode, UpstreamHostPolicyMode::Rewrite);
         assert_eq!(
             upstream.policy.forwarded_headers.0.mode,
@@ -915,13 +926,23 @@ mod tests {
                 protocol: "http3".to_string(),
                 port: 8443,
                 address: "127.0.0.1".to_string(),
-                tls: Tls::default(),
+                tls: Tls {
+                    cert: "/tmp/tls/dup-1.pem".to_string(),
+                    key: "/tmp/tls/dup-1.key".to_string(),
+                    certificates: Vec::new(),
+                    client_auth: ClientAuth::default(),
+                },
             },
             Listen {
                 protocol: "http3".to_string(),
                 port: 8443,
                 address: "127.0.0.1".to_string(),
-                tls: Tls::default(),
+                tls: Tls {
+                    cert: "/tmp/tls/dup-2.pem".to_string(),
+                    key: "/tmp/tls/dup-2.key".to_string(),
+                    certificates: Vec::new(),
+                    client_auth: ClientAuth::default(),
+                },
             },
         ];
 
@@ -968,6 +989,12 @@ mod tests {
     #[test]
     fn runtime_config_rejects_ignored_host_rewrite_value() {
         let mut config = sample_config();
+        config
+            .upstream
+            .get_mut("api")
+            .expect("upstream")
+            .host_policy
+            .mode = UpstreamHostPolicyMode::Upstream;
         config
             .upstream
             .get_mut("api")

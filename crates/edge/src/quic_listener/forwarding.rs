@@ -1,4 +1,5 @@
 use super::*;
+use spooky_config::config::{ForwardedHeaderPolicy, UpstreamHostPolicy};
 use std::error::Error as StdError;
 
 #[derive(Clone)]

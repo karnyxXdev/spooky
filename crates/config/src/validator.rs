@@ -2168,7 +2168,10 @@ upstream:
         let (legacy_cert, legacy_key) = write_test_certs(dir.path());
         let (listener_cert, listener_key) = write_test_certs(dir.path());
 
-        let mut cfg = base_config(&legacy_cert.to_string_lossy(), &legacy_key.to_string_lossy());
+        let mut cfg = base_config(
+            &legacy_cert.to_string_lossy(),
+            &legacy_key.to_string_lossy(),
+        );
         cfg.listen.tls.cert.clear();
         cfg.listen.tls.key.clear();
         cfg.listeners = vec![Listen {

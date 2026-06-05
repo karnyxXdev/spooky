@@ -132,7 +132,12 @@ fn main() {
         }
     };
 
-    if uid != 0 && runtime_config.listeners.iter().any(|listener| listener.listen.port < 1024) {
+    if uid != 0
+        && runtime_config
+            .listeners
+            .iter()
+            .any(|listener| listener.listen.port < 1024)
+    {
         fatal_startup_error(
             "binding a privileged port requires root or CAP_NET_BIND_SERVICE. Use ports >= 1024 for unprivileged startup.",
             true,
@@ -177,9 +182,11 @@ async fn run(runtime_config: RuntimeConfig, uid: libc::uid_t) {
     let worker_count = runtime_config.performance.worker_threads.max(1);
     let shard_count = runtime_config.performance.packet_shards_per_worker.max(1);
     let effective_worker_count = worker_count.saturating_mul(shard_count);
-    if let Err(err) =
-        QUICListener::spawn_control_plane_tasks(&runtime_config, &shared_state, effective_worker_count)
-    {
+    if let Err(err) = QUICListener::spawn_control_plane_tasks(
+        &runtime_config,
+        &shared_state,
+        effective_worker_count,
+    ) {
         error!("Failed to initialize control-plane tasks: {}", err);
         std::process::exit(1);
     }
@@ -204,13 +211,20 @@ async fn run(runtime_config: RuntimeConfig, uid: libc::uid_t) {
     });
 
     let pin_workers = runtime_config.performance.pin_workers;
-    let shard_queue_capacity = runtime_config.performance.packet_shard_queue_capacity.max(1);
-    let shard_queue_max_bytes = runtime_config.performance.packet_shard_queue_max_bytes.max(1);
+    let shard_queue_capacity = runtime_config
+        .performance
+        .packet_shard_queue_capacity
+        .max(1);
+    let shard_queue_max_bytes = runtime_config
+        .performance
+        .packet_shard_queue_max_bytes
+        .max(1);
     let mut worker_handles: Vec<thread::JoinHandle<Result<(), String>>> = Vec::new();
     let mut worker_index_base = 0usize;
 
     for listener_config in runtime_config.listener_runtime_configs() {
-        if let Err(err) = QUICListener::spawn_bootstrap_tls_listener(&listener_config, &shared_state)
+        if let Err(err) =
+            QUICListener::spawn_bootstrap_tls_listener(&listener_config, &shared_state)
         {
             error!(
                 "Failed to initialize bootstrap TLS listener {} ({}:{}): {}",

@@ -56,9 +56,7 @@ use tracing::{Instrument, info_span};
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
     config::UpstreamTls,
-    runtime::{
-        ListenerRuntimeConfig, RuntimeConfig, RuntimeListenerTls, RuntimeUpstreamPolicy,
-    },
+    runtime::{ListenerRuntimeConfig, RuntimeConfig, RuntimeListenerTls, RuntimeUpstreamPolicy},
 };
 
 use crate::{
@@ -415,13 +413,15 @@ struct ResolvedBackend {
 
 impl QUICListener {
     pub fn new(config: spooky_config::config::Config) -> Result<Self, ProxyError> {
-        let runtime_config =
-            RuntimeConfig::from_config(&config).map_err(|err| ProxyError::Transport(err.to_string()))?;
+        let runtime_config = RuntimeConfig::from_config(&config)
+            .map_err(|err| ProxyError::Transport(err.to_string()))?;
         let listener_config = runtime_config
             .listener_runtime_configs()
             .into_iter()
             .next()
-            .ok_or_else(|| ProxyError::Transport("no effective listeners configured".to_string()))?;
+            .ok_or_else(|| {
+                ProxyError::Transport("no effective listeners configured".to_string())
+            })?;
         let shared_state = Arc::new(Self::build_shared_state(&runtime_config)?);
         Self::spawn_control_plane_tasks(&runtime_config, &shared_state, 1)?;
         let socket = Self::bind_socket(&listener_config, false)?;
@@ -483,7 +483,7 @@ impl QUICListener {
         let mut seen_backend_origins: HashMap<String, (String, String)> = HashMap::new();
         let mut backend_tls_configs: HashMap<String, TlsClientConfig> = HashMap::new();
         let mut upstream_tls_configs: HashMap<String, TlsClientConfig> = HashMap::new();
-        for (upstream_name, upstream) in &runtime_config.upstreams {
+        for (upstream_name, upstream) in &config.upstreams {
             let upstream_tls_client = Self::upstream_tls_client_config(&upstream.effective_tls);
             upstream_tls_configs.insert(upstream_name.clone(), upstream_tls_client.clone());
 
@@ -499,12 +499,10 @@ impl QUICListener {
                 };
 
                 let origin = endpoint.origin();
-                if let Some((existing_upstream, existing_backend)) = seen_backend_origins
-                    .insert(
-                        origin.clone(),
-                        (upstream_name.clone(), backend.backend.id.clone()),
-                    )
-                {
+                if let Some((existing_upstream, existing_backend)) = seen_backend_origins.insert(
+                    origin.clone(),
+                    (upstream_name.clone(), backend.backend.id.clone()),
+                ) {
                     return Err(ProxyError::Transport(format!(
                         "duplicate backend address '{}' detected while building H2 pool: upstream '{}' backend '{}' conflicts with upstream '{}' backend '{}'",
                         origin,
@@ -515,10 +513,8 @@ impl QUICListener {
                     )));
                 }
                 backend_addresses.push(backend.backend.address.clone());
-                backend_tls_configs.insert(
-                    backend.backend.address.clone(),
-                    upstream_tls_client.clone(),
-                );
+                backend_tls_configs
+                    .insert(backend.backend.address.clone(), upstream_tls_client.clone());
             }
         }
 
@@ -542,17 +538,16 @@ impl QUICListener {
         for (name, runtime_upstream) in &config.upstreams {
             let upstream_pool = UpstreamPool::from_upstream(&runtime_upstream.as_config_upstream())
                 .map_err(|err| {
-                ProxyError::Transport(format!(
-                    "failed to create upstream pool '{}': {}",
-                    name, err
-                ))
+                    ProxyError::Transport(format!(
+                        "failed to create upstream pool '{}': {}",
+                        name, err
+                    ))
                 })?;
             upstream_pools.insert(name.clone(), Arc::new(RwLock::new(upstream_pool)));
             upstream_inflight.insert(name.clone(), Arc::new(Semaphore::new(per_upstream_limit)));
-            let tls = upstream_tls_configs
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| Self::upstream_tls_client_config(&runtime_upstream.effective_tls));
+            let tls = upstream_tls_configs.get(name).cloned().unwrap_or_else(|| {
+                Self::upstream_tls_client_config(&runtime_upstream.effective_tls)
+            });
             let client = H2Client::new(
                 config.performance.h2_pool_max_idle_per_backend.max(1),
                 Duration::from_millis(config.performance.h2_pool_idle_timeout_ms.max(1)),
@@ -928,8 +923,7 @@ impl QUICListener {
         if listener_tls.client_auth.enabled {
             let ca_file = listener_tls.client_auth.ca_file.as_ref().ok_or_else(|| {
                 ProxyError::Tls(
-                    "listen.tls.client_auth.ca_file is required when mTLS is enabled"
-                        .to_string(),
+                    "listen.tls.client_auth.ca_file is required when mTLS is enabled".to_string(),
                 )
             })?;
             quic_config
@@ -2225,8 +2219,11 @@ impl QUICListener {
                                     client_addr: connection.peer_address,
                                     request_id,
                                     traceparent: traceparent.as_deref().map(Arc::<str>::from),
-                                    host_policy: host_policy.clone(),
-                                    forwarded_header_policy: forwarded_header_policy.clone(),
+                                    host_policy: upstream_policy.host.0.clone(),
+                                    forwarded_header_policy: upstream_policy
+                                        .forwarded_headers
+                                        .0
+                                        .clone(),
                                 })
                             });
                             let trace_span_for_upstream = trace_span.clone();
@@ -4070,8 +4067,7 @@ impl QUICListener {
         let builder = if enforce_client_auth && listener_tls.client_auth.enabled {
             let ca_file = listener_tls.client_auth.ca_file.as_ref().ok_or_else(|| {
                 ProxyError::Tls(
-                    "listen.tls.client_auth.ca_file is required when mTLS is enabled"
-                        .to_string(),
+                    "listen.tls.client_auth.ca_file is required when mTLS is enabled".to_string(),
                 )
             })?;
             let ca_bytes = std::fs::read(ca_file).map_err(|err| {
@@ -5084,10 +5080,13 @@ mod tests {
     };
 
     use rcgen::{Certificate, CertificateParams, SanType};
-    use spooky_config::config::{
-        Backend, ClientAuth, Config as SpookyConfigConfig, Listen, LoadBalancing, Log,
-        Observability, Performance, Resilience, RouteMatch, Security, Tls, TlsCertificate,
-        Upstream, UpstreamTls,
+    use spooky_config::{
+        config::{
+            Backend, ClientAuth, Config as SpookyConfigConfig, Listen, LoadBalancing, Log,
+            Observability, Performance, Resilience, RouteMatch, Security, Tls, TlsCertificate,
+            Upstream, UpstreamTls,
+        },
+        runtime::{ListenerRuntimeConfig, RuntimeConfig},
     };
     use tempfile::tempdir;
 
@@ -5206,6 +5205,13 @@ mod tests {
         }
     }
 
+    fn tls_test_listener_config(config: &SpookyConfigConfig) -> ListenerRuntimeConfig {
+        RuntimeConfig::from_config(config)
+            .expect("runtime config")
+            .primary_listener_runtime_config()
+            .expect("listener runtime config")
+    }
+
     #[test]
     fn runtime_listener_tls_uses_first_sni_entry_when_legacy_pair_is_missing() {
         let dir = tempdir().expect("tempdir");
@@ -5229,7 +5235,8 @@ mod tests {
         );
 
         let runtime_tls =
-            super::QUICListener::runtime_listener_tls(&config).expect("runtime listener tls");
+            super::QUICListener::runtime_listener_tls(&tls_test_listener_config(&config))
+                .expect("runtime listener tls");
         assert_eq!(runtime_tls.default_identity.cert_path, api_cert);
         assert_eq!(runtime_tls.default_identity.key_path, api_key);
     }
@@ -5248,8 +5255,11 @@ mod tests {
             }],
         );
 
-        let acceptor =
-            super::QUICListener::build_server_tls_acceptor(&config, false, vec![b"h2".to_vec()]);
+        let acceptor = super::QUICListener::build_server_tls_acceptor(
+            &tls_test_listener_config(&config),
+            false,
+            vec![b"h2".to_vec()],
+        );
         assert!(acceptor.is_ok());
     }
 
@@ -5267,10 +5277,13 @@ mod tests {
             }],
         );
 
-        let err =
-            super::QUICListener::build_server_tls_acceptor(&config, false, vec![b"h2".to_vec()])
-                .err()
-                .expect("mismatched SNI cert mapping should fail");
+        let err = super::QUICListener::build_server_tls_acceptor(
+            &tls_test_listener_config(&config),
+            false,
+            vec![b"h2".to_vec()],
+        )
+        .err()
+        .expect("mismatched SNI cert mapping should fail");
         assert!(
             err.to_string()
                 .contains("failed to add SNI certificate mapping"),

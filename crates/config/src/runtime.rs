@@ -1,9 +1,12 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, net::IpAddr};
 
-use crate::config::{
-    Backend, ClientAuth, Config, ForwardedHeaderPolicy, Listen, LoadBalancing, Observability,
-    Performance, ProtocolPolicy, Resilience, RouteMatch, Security, TlsCertificate, Upstream,
-    UpstreamHostPolicy, UpstreamTls,
+use crate::{
+    backend_endpoint::BackendEndpoint,
+    config::{
+        Backend, ClientAuth, Config, ForwardedHeaderPolicy, Listen, LoadBalancing,
+        Observability, Performance, ProtocolPolicy, Resilience, RouteMatch, Security,
+        TlsCertificate, Upstream, UpstreamHostPolicy, UpstreamHostPolicyMode, UpstreamTls,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -22,16 +25,7 @@ impl RuntimeConfig {
         Ok(Self {
             version: config.version,
             listeners: runtime_listeners(config)?,
-            upstreams: config
-                .upstream
-                .iter()
-                .map(|(name, upstream)| {
-                    (
-                        name.clone(),
-                        RuntimeUpstream::from_config(config, name.as_str(), upstream),
-                    )
-                })
-                .collect(),
+            upstreams: normalize_upstreams(config)?,
             performance: config.performance.clone(),
             observability: config.observability.clone(),
             resilience: config.resilience.clone(),
@@ -87,9 +81,31 @@ impl RuntimeListenerTls {
         let mut sni_identities = HashMap::new();
         let legacy_identity = RuntimeTlsIdentity::from_legacy_pair(listen, label)?;
 
+        if !listen.tls.client_auth.enabled && listen.tls.client_auth.require_client_cert {
+            return Err(format!(
+                "{label}.tls.client_auth.require_client_cert requires client_auth.enabled=true"
+            ));
+        }
+        if listen.tls.client_auth.enabled {
+            let Some(ca_file) = listen.tls.client_auth.ca_file.as_deref().map(str::trim) else {
+                return Err(format!(
+                    "{label}.tls.client_auth.ca_file is required when client_auth.enabled=true"
+                ));
+            };
+            if ca_file.is_empty() {
+                return Err(format!(
+                    "{label}.tls.client_auth.ca_file must be non-empty when client_auth.enabled=true"
+                ));
+            }
+        }
+
         for entry in &listen.tls.certificates {
             let identity = RuntimeTlsIdentity::from_certificate(entry, label)?;
-            let server_name = entry.server_name.trim().to_ascii_lowercase();
+            let server_name = normalize_sni_server_name(&entry.server_name).ok_or_else(|| {
+                format!(
+                    "{label}.tls.certificates entries must include a valid DNS server_name"
+                )
+            })?;
             if let Some(existing) = sni_identities.insert(server_name.clone(), identity) {
                 return Err(format!(
                     "{label}.tls.certificates contains duplicate server_name '{server_name}' for '{}' and '{}'",
@@ -278,6 +294,282 @@ fn validate_listener_bindings(listeners: &[RuntimeListener]) -> Result<(), Strin
     Ok(())
 }
 
+fn normalize_upstreams(config: &Config) -> Result<HashMap<String, RuntimeUpstream>, String> {
+    if config.upstream.is_empty() {
+        return Err("no upstreams configured".to_string());
+    }
+
+    validate_protocol_policy(&config.resilience.protocol)?;
+
+    let mut seen_route_matchers: HashMap<RouteMatcherKey, String> = HashMap::new();
+    let mut seen_backend_origins: HashMap<String, (String, String)> = HashMap::new();
+    let mut normalized = HashMap::new();
+
+    for (upstream_name, upstream) in &config.upstream {
+        validate_upstream_policy(config, upstream_name, upstream)?;
+
+        let route_key = (
+            upstream.route.host.as_deref().map(normalize_route_host),
+            upstream.route.path_prefix.clone(),
+            normalized_route_method(upstream.route.method.as_deref()),
+        );
+        if let Some(existing) = seen_route_matchers.insert(route_key.clone(), upstream_name.clone())
+        {
+            return Err(format!(
+                "ambiguous route matcher: upstream '{upstream_name}' conflicts with upstream '{existing}' for host={:?} path_prefix={:?} method={:?}",
+                route_key.0, route_key.1, route_key.2
+            ));
+        }
+
+        let runtime_upstream = RuntimeUpstream::from_config(config, upstream_name.as_str(), upstream);
+        validate_runtime_upstream_tls(upstream_name, &runtime_upstream.effective_tls)?;
+
+        for backend in &runtime_upstream.backends {
+            if backend.backend.id.trim().is_empty() {
+                return Err(format!("upstream '{upstream_name}' contains an empty backend id"));
+            }
+            if backend.backend.address.trim().is_empty() {
+                return Err(format!(
+                    "backend '{}' in upstream '{}' has an empty address",
+                    backend.backend.id, upstream_name
+                ));
+            }
+
+            let endpoint = BackendEndpoint::parse(&backend.backend.address).map_err(|err| {
+                format!(
+                    "invalid backend address '{}' in upstream '{}' (backend '{}'): {}",
+                    backend.backend.address, upstream_name, backend.backend.id, err
+                )
+            })?;
+
+            let origin = endpoint.origin();
+            if let Some((existing_upstream, existing_backend)) = seen_backend_origins.insert(
+                origin.clone(),
+                (upstream_name.clone(), backend.backend.id.clone()),
+            ) {
+                return Err(format!(
+                    "duplicate backend address '{}' detected: upstream '{}' backend '{}' conflicts with upstream '{}' backend '{}'",
+                    origin, upstream_name, backend.backend.id, existing_upstream, existing_backend
+                ));
+            }
+        }
+
+        normalized.insert(upstream_name.clone(), runtime_upstream);
+    }
+
+    Ok(normalized)
+}
+
+fn validate_protocol_policy(policy: &ProtocolPolicy) -> Result<(), String> {
+    if policy.max_headers_count == 0 {
+        return Err("resilience.protocol.max_headers_count must be greater than 0".to_string());
+    }
+    if policy.max_headers_bytes == 0 {
+        return Err("resilience.protocol.max_headers_bytes must be greater than 0".to_string());
+    }
+    if policy
+        .allowed_methods
+        .iter()
+        .any(|method| method.trim().is_empty())
+    {
+        return Err(
+            "resilience.protocol.allowed_methods must not contain empty values".to_string(),
+        );
+    }
+    if policy
+        .denied_path_prefixes
+        .iter()
+        .any(|prefix| prefix.is_empty() || !prefix.starts_with('/'))
+    {
+        return Err(
+            "resilience.protocol.denied_path_prefixes must contain '/'-prefixed paths"
+                .to_string(),
+        );
+    }
+    if !policy.allow_connect
+        && (!policy.connect_allowed_ports.is_empty() || !policy.connect_allowed_authorities.is_empty())
+    {
+        return Err(
+            "resilience.protocol.connect_allowed_ports/connect_allowed_authorities require allow_connect=true"
+                .to_string(),
+        );
+    }
+    if policy.connect_allowed_ports.contains(&0) {
+        return Err(
+            "resilience.protocol.connect_allowed_ports must contain ports in range 1-65535"
+                .to_string(),
+        );
+    }
+    if policy
+        .connect_allowed_authorities
+        .iter()
+        .any(|authority| !is_valid_connect_authority(authority))
+    {
+        return Err(
+            "resilience.protocol.connect_allowed_authorities must contain authority-form host:port targets"
+                .to_string(),
+        );
+    }
+    if policy.allow_0rtt && policy.early_data_safe_methods.is_empty() {
+        return Err(
+            "resilience.protocol.early_data_safe_methods must be non-empty when allow_0rtt=true"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_upstream_policy(
+    config: &Config,
+    upstream_name: &str,
+    upstream: &Upstream,
+) -> Result<(), String> {
+    match upstream.host_policy.mode {
+        UpstreamHostPolicyMode::PassThrough | UpstreamHostPolicyMode::Upstream => {
+            if upstream.host_policy.host.is_some() {
+                return Err(format!(
+                    "upstream '{upstream_name}' sets host_policy.host but mode is not rewrite"
+                ));
+            }
+        }
+        UpstreamHostPolicyMode::Rewrite => match upstream.host_policy.host.as_deref() {
+            Some(host) if valid_static_host_header(host) => {}
+            _ => {
+                return Err(format!(
+                    "upstream '{upstream_name}' requires a valid non-empty host_policy.host when mode=rewrite"
+                ));
+            }
+        },
+    }
+
+    if let Some(path) = upstream.route.path_prefix.as_deref()
+        && (path.is_empty() || !path.starts_with('/'))
+    {
+        return Err(format!(
+            "upstream '{upstream_name}' has an invalid route.path_prefix '{}'",
+            path
+        ));
+    }
+
+    if normalized_route_method(upstream.route.method.as_deref()).as_deref() == Some("CONNECT")
+        && !config.resilience.protocol.allow_connect
+    {
+        return Err(format!(
+            "upstream '{upstream_name}' routes CONNECT but resilience.protocol.allow_connect=false"
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_runtime_upstream_tls(upstream_name: &str, tls: &UpstreamTls) -> Result<(), String> {
+    if tls
+        .ca_file
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(format!(
+            "upstream '{upstream_name}' has an empty effective upstream_tls.ca_file"
+        ));
+    }
+    if tls
+        .ca_dir
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(format!(
+            "upstream '{upstream_name}' has an empty effective upstream_tls.ca_dir"
+        ));
+    }
+    Ok(())
+}
+
+type RouteMatcherKey = (Option<String>, Option<String>, Option<String>);
+
+fn normalize_route_host(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let host = if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            &rest[..end]
+        } else {
+            trimmed
+        }
+    } else if let Some((candidate_host, candidate_port)) = trimmed.rsplit_once(':') {
+        if !candidate_host.contains(':') && candidate_port.chars().all(|c| c.is_ascii_digit()) {
+            candidate_host
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn normalized_route_method(method: Option<&str>) -> Option<String> {
+    method
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_uppercase())
+}
+
+fn valid_static_host_header(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed == value
+        && !trimmed.chars().any(|ch| ch.is_ascii_whitespace())
+        && !trimmed.contains('/')
+        && !trimmed.contains('?')
+        && !trimmed.contains('#')
+        && http::HeaderValue::from_str(trimmed).is_ok()
+}
+
+fn normalize_sni_server_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.contains(':')
+        || trimmed.contains('*')
+        || trimmed.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    let without_trailing_dot = trimmed.trim_end_matches('.');
+    if without_trailing_dot.is_empty() {
+        return None;
+    }
+    let ascii = idna::domain_to_ascii(without_trailing_dot).ok()?;
+    if ascii.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    Some(ascii.to_ascii_lowercase())
+}
+
+fn is_valid_connect_authority(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        let suffix = &rest[end + 1..];
+        if !suffix.starts_with(':') || suffix.len() <= 1 {
+            return false;
+        }
+        return suffix[1..].parse::<u16>().ok().is_some_and(|port| port > 0);
+    }
+
+    let Some((host, port)) = trimmed.rsplit_once(':') else {
+        return false;
+    };
+    if host.is_empty() || host.contains(':') {
+        return false;
+    }
+    port.parse::<u16>().ok().is_some_and(|value| value > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,7 +608,7 @@ mod tests {
             Upstream {
                 load_balancing: LoadBalancing::default(),
                 host_policy: UpstreamHostPolicy {
-                    mode: UpstreamHostPolicyMode::Upstream,
+                    mode: UpstreamHostPolicyMode::Rewrite,
                     host: Some("api.internal".to_string()),
                 },
                 forwarded_headers: ForwardedHeaderPolicy {
@@ -432,7 +724,7 @@ mod tests {
         );
         assert_eq!(upstream.backends.len(), 1);
         assert_eq!(upstream.backends[0].backend.address, "https://api.internal:8443");
-        assert_eq!(upstream.policy.host.0.mode, UpstreamHostPolicyMode::Upstream);
+        assert_eq!(upstream.policy.host.0.mode, UpstreamHostPolicyMode::Rewrite);
         assert_eq!(
             upstream.policy.forwarded_headers.0.mode,
             ForwardedHeaderPolicyMode::Append
@@ -489,5 +781,46 @@ mod tests {
 
         let err = runtime_listeners(&config).expect_err("duplicate sni names must fail");
         assert!(err.contains("duplicate server_name"));
+    }
+
+    #[test]
+    fn runtime_config_rejects_ignored_host_rewrite_value() {
+        let mut config = sample_config();
+        config
+            .upstream
+            .get_mut("api")
+            .expect("upstream")
+            .host_policy
+            .host = Some("ignored.example.com".to_string());
+
+        let err = RuntimeConfig::from_config(&config).expect_err("conflicting host policy");
+        assert!(err.contains("mode is not rewrite"));
+    }
+
+    #[test]
+    fn runtime_config_rejects_duplicate_route_matchers() {
+        let mut config = sample_config();
+        config.upstream.insert(
+            "api-copy".to_string(),
+            config.upstream.get("api").expect("api").clone(),
+        );
+
+        let err = RuntimeConfig::from_config(&config).expect_err("duplicate routes");
+        assert!(err.contains("ambiguous route matcher"));
+    }
+
+    #[test]
+    fn runtime_config_rejects_connect_route_when_protocol_disallows_connect() {
+        let mut config = sample_config();
+        config
+            .upstream
+            .get_mut("api")
+            .expect("upstream")
+            .route
+            .method = Some("CONNECT".to_string());
+        config.resilience.protocol.allow_connect = false;
+
+        let err = RuntimeConfig::from_config(&config).expect_err("connect route must fail");
+        assert!(err.contains("allow_connect=false"));
     }
 }

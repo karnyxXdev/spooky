@@ -55,8 +55,10 @@ use tracing::{Instrument, info_span};
 
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
-    config::{Config as SpookyConfig, UpstreamTls},
-    runtime::{RuntimeConfig, RuntimeListenerTls, RuntimeUpstreamPolicy},
+    config::UpstreamTls,
+    runtime::{
+        ListenerRuntimeConfig, RuntimeConfig, RuntimeListenerTls, RuntimeUpstreamPolicy,
+    },
 };
 
 use crate::{
@@ -412,11 +414,18 @@ struct ResolvedBackend {
 }
 
 impl QUICListener {
-    pub fn new(config: SpookyConfig) -> Result<Self, ProxyError> {
-        let shared_state = Arc::new(Self::build_shared_state(&config)?);
-        Self::spawn_control_plane_tasks(&config, &shared_state, 1)?;
-        let socket = Self::bind_socket(&config, false)?;
-        Self::new_with_socket_and_shared_state(config, socket, shared_state)
+    pub fn new(config: spooky_config::config::Config) -> Result<Self, ProxyError> {
+        let runtime_config =
+            RuntimeConfig::from_config(&config).map_err(|err| ProxyError::Transport(err.to_string()))?;
+        let listener_config = runtime_config
+            .listener_runtime_configs()
+            .into_iter()
+            .next()
+            .ok_or_else(|| ProxyError::Transport("no effective listeners configured".to_string()))?;
+        let shared_state = Arc::new(Self::build_shared_state(&runtime_config)?);
+        Self::spawn_control_plane_tasks(&runtime_config, &shared_state, 1)?;
+        let socket = Self::bind_socket(&listener_config, false)?;
+        Self::new_with_socket_and_shared_state(listener_config, socket, shared_state)
     }
 
     fn upstream_tls_client_config(tls: &UpstreamTls) -> TlsClientConfig {
@@ -428,9 +437,7 @@ impl QUICListener {
         }
     }
 
-    pub fn build_shared_state(config: &SpookyConfig) -> Result<SharedRuntimeState, ProxyError> {
-        let runtime_config =
-            RuntimeConfig::from_config(config).map_err(|err| ProxyError::Transport(err.to_string()))?;
+    pub fn build_shared_state(config: &RuntimeConfig) -> Result<SharedRuntimeState, ProxyError> {
         let worker_threads = config.performance.worker_threads.max(1);
         let shard_count = config.performance.packet_shards_per_worker.max(1);
         let active_worker_threads = if worker_threads > 1 && !config.performance.reuseport {
@@ -532,19 +539,14 @@ impl QUICListener {
         let mut upstream_inflight = HashMap::new();
         let mut upstream_health_clients = HashMap::new();
 
-        for (name, runtime_upstream) in &runtime_config.upstreams {
-            let upstream = config.upstream.get(name).ok_or_else(|| {
-                ProxyError::Transport(format!(
-                    "normalized upstream '{}' missing from raw config",
-                    name
-                ))
-            })?;
-            let upstream_pool = UpstreamPool::from_upstream(upstream).map_err(|err| {
+        for (name, runtime_upstream) in &config.upstreams {
+            let upstream_pool = UpstreamPool::from_upstream(&runtime_upstream.as_config_upstream())
+                .map_err(|err| {
                 ProxyError::Transport(format!(
                     "failed to create upstream pool '{}': {}",
                     name, err
                 ))
-            })?;
+                })?;
             upstream_pools.insert(name.clone(), Arc::new(RwLock::new(upstream_pool)));
             upstream_inflight.insert(name.clone(), Arc::new(Semaphore::new(per_upstream_limit)));
             let tls = upstream_tls_configs
@@ -599,27 +601,28 @@ impl QUICListener {
             global_inflight_limit,
         ));
         let watchdog = Arc::new(WatchdogCoordinator::new(&config.resilience.watchdog));
-        let mut route_labels = config.upstream.keys().cloned().collect::<Vec<_>>();
+        let mut route_labels = config.upstreams.keys().cloned().collect::<Vec<_>>();
         route_labels.push("unrouted".to_string());
+        let routing_index = Arc::new(RouteIndex::from_upstreams(&config.upstreams_as_config()));
 
         Ok(SharedRuntimeState {
             h2_pool,
             backend_endpoints: Arc::new(
                 config
-                    .upstream
+                    .upstreams
                     .values()
                     .flat_map(|upstream| upstream.backends.iter())
                     .filter_map(|backend| {
-                        BackendEndpoint::parse(&backend.address)
+                        BackendEndpoint::parse(&backend.backend.address)
                             .ok()
-                            .map(|endpoint| (backend.address.clone(), endpoint))
+                            .map(|endpoint| (backend.backend.address.clone(), endpoint))
                     })
                     .collect(),
             ),
             backend_dns_resolver,
             upstream_health_clients: Arc::new(upstream_health_clients),
             upstream_policies: Arc::new(
-                runtime_config
+                config
                     .upstreams
                     .iter()
                     .map(|(name, upstream)| (name.clone(), upstream.policy.clone()))
@@ -628,6 +631,7 @@ impl QUICListener {
             upstream_pools,
             upstream_inflight,
             global_inflight: Arc::new(Semaphore::new(global_inflight_limit)),
+            routing_index,
             metrics: Arc::new(Metrics::new(worker_slots, route_labels)),
             resilience,
             watchdog,
@@ -635,7 +639,7 @@ impl QUICListener {
     }
 
     pub fn spawn_control_plane_tasks(
-        config: &SpookyConfig,
+        config: &RuntimeConfig,
         shared_state: &SharedRuntimeState,
         worker_count: usize,
     ) -> Result<(), ProxyError> {
@@ -659,7 +663,7 @@ impl QUICListener {
     }
 
     pub fn bind_reuseport_sockets(
-        config: &SpookyConfig,
+        config: &ListenerRuntimeConfig,
         workers: usize,
     ) -> Result<Vec<UdpSocket>, ProxyError> {
         let workers = workers.max(1);
@@ -670,7 +674,10 @@ impl QUICListener {
         Ok(sockets)
     }
 
-    pub fn bind_socket(config: &SpookyConfig, reuse_port: bool) -> Result<UdpSocket, ProxyError> {
+    pub fn bind_socket(
+        config: &ListenerRuntimeConfig,
+        reuse_port: bool,
+    ) -> Result<UdpSocket, ProxyError> {
         let bind_addr = Self::resolve_bind_addr(config)?;
         let socket = Self::create_udp_socket(
             bind_addr,
@@ -688,7 +695,7 @@ impl QUICListener {
     }
 
     pub fn new_with_socket_and_shared_state(
-        config: SpookyConfig,
+        config: ListenerRuntimeConfig,
         socket: UdpSocket,
         shared_state: Arc<SharedRuntimeState>,
     ) -> Result<Self, ProxyError> {
@@ -702,7 +709,6 @@ impl QUICListener {
             Arc::new(quiche::h3::Config::new().map_err(|err| {
                 ProxyError::Transport(format!("failed to create h3 config: {err}"))
             })?);
-        let routing_index = RouteIndex::from_upstreams(&config.upstream);
         let backend_timeout = Duration::from_millis(config.performance.backend_timeout_ms);
         let backend_body_idle_timeout =
             Duration::from_millis(config.performance.backend_body_idle_timeout_ms);
@@ -740,7 +746,7 @@ impl QUICListener {
             upstream_pools: shared_state.upstream_pools.clone(),
             upstream_inflight: shared_state.upstream_inflight.clone(),
             global_inflight: Arc::clone(&shared_state.global_inflight),
-            routing_index,
+            routing_index: Arc::clone(&shared_state.routing_index),
             metrics: Arc::clone(&shared_state.metrics),
             resilience: Arc::clone(&shared_state.resilience),
             watchdog: Arc::clone(&shared_state.watchdog),
@@ -769,8 +775,11 @@ impl QUICListener {
         })
     }
 
-    fn resolve_bind_addr(config: &SpookyConfig) -> Result<SocketAddr, ProxyError> {
-        let socket_address = format!("{}:{}", config.listen.address, config.listen.port);
+    fn resolve_bind_addr(config: &ListenerRuntimeConfig) -> Result<SocketAddr, ProxyError> {
+        let socket_address = format!(
+            "{}:{}",
+            config.listen.listen.address, config.listen.listen.port
+        );
         socket_address
             .to_socket_addrs()
             .map_err(|err| {
@@ -861,11 +870,13 @@ impl QUICListener {
         Ok(socket.into())
     }
 
-    fn runtime_listener_tls(config: &SpookyConfig) -> Result<RuntimeListenerTls, ProxyError> {
-        RuntimeListenerTls::normalize(&config.listen, "listen").map_err(ProxyError::Tls)
+    fn runtime_listener_tls(
+        config: &ListenerRuntimeConfig,
+    ) -> Result<RuntimeListenerTls, ProxyError> {
+        Ok(config.listen.tls.clone())
     }
 
-    fn build_quic_config(config: &SpookyConfig) -> Result<Config, ProxyError> {
+    fn build_quic_config(config: &ListenerRuntimeConfig) -> Result<Config, ProxyError> {
         let mut quic_config = Config::new(quiche::PROTOCOL_VERSION)
             .map_err(|err| ProxyError::Transport(format!("failed to create QUIC config: {err}")))?;
 
@@ -1534,7 +1545,7 @@ impl QUICListener {
                 self.config.observability.tracing.enabled,
                 self.config.observability.routing.enabled,
                 self.config.observability.routing.include_reason,
-                self.config.listen.port,
+                self.config.listen.listen.port,
             )
         {
             error!("HTTP/3 handling failed: {:?}", e);
@@ -1620,7 +1631,7 @@ impl QUICListener {
                     self.max_response_body_bytes,
                     self.unknown_length_response_prebuffer_bytes,
                     self.client_body_idle_timeout,
-                    self.config.listen.port,
+                    self.config.listen.listen.port,
                 ) {
                     error!("advance_streams_non_blocking in timeout path: {:?}", e);
                 }
@@ -3843,7 +3854,7 @@ impl QUICListener {
     }
 
     fn spawn_metrics_endpoint(
-        config: &SpookyConfig,
+        config: &RuntimeConfig,
         metrics: Arc<Metrics>,
     ) -> Result<(), ProxyError> {
         let endpoint = &config.observability.metrics;
@@ -4047,7 +4058,7 @@ impl QUICListener {
     }
 
     fn build_server_tls_acceptor(
-        config: &SpookyConfig,
+        config: &ListenerRuntimeConfig,
         enforce_client_auth: bool,
         alpn_protocols: Vec<Vec<u8>>,
     ) -> Result<TlsAcceptor, ProxyError> {
@@ -4155,12 +4166,14 @@ impl QUICListener {
         Ok(TlsAcceptor::from(Arc::new(tls_config)))
     }
 
-    fn build_bootstrap_tls_acceptor(config: &SpookyConfig) -> Result<TlsAcceptor, ProxyError> {
+    fn build_bootstrap_tls_acceptor(
+        config: &ListenerRuntimeConfig,
+    ) -> Result<TlsAcceptor, ProxyError> {
         Self::build_server_tls_acceptor(config, true, vec![b"h2".to_vec(), b"http/1.1".to_vec()])
     }
 
     pub fn spawn_bootstrap_tls_listener(
-        config: &SpookyConfig,
+        config: &ListenerRuntimeConfig,
         shared_state: &SharedRuntimeState,
     ) -> Result<(), ProxyError> {
         let acceptor = Self::build_bootstrap_tls_acceptor(config).map_err(|err| {
@@ -4170,8 +4183,11 @@ impl QUICListener {
             ))
         })?;
 
-        let bind = format!("{}:{}", config.listen.address, config.listen.port);
-        let alt_svc_value = format!("h3=\":{}\"; ma=86400", config.listen.port);
+        let bind = format!(
+            "{}:{}",
+            config.listen.listen.address, config.listen.listen.port
+        );
+        let alt_svc_value = format!("h3=\":{}\"; ma=86400", config.listen.listen.port);
         let backend_timeout = Duration::from_millis(config.performance.backend_timeout_ms);
         let max_request_body_bytes = config.performance.max_request_body_bytes;
         let max_response_body_bytes = config.performance.max_response_body_bytes;
@@ -4185,8 +4201,6 @@ impl QUICListener {
         let metrics = Arc::clone(&shared_state.metrics);
         let resilience = Arc::clone(&shared_state.resilience);
         let upstream_pools = shared_state.upstream_pools.clone();
-        let routing_index = RouteIndex::from_upstreams(&config.upstream);
-
         let handle = match runtime_handle() {
             Some(h) => h,
             None => {
@@ -4219,7 +4233,7 @@ impl QUICListener {
             })?
         };
 
-        let routing_index = Arc::new(routing_index);
+        let routing_index = Arc::clone(&shared_state.routing_index);
 
         spawn_supervised_async_task(&handle, "bootstrap-tls-listener", None, async move {
             info!(

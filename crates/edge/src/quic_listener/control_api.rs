@@ -69,7 +69,7 @@ impl QUICListener {
     }
 
     pub(super) fn spawn_control_api_endpoint(
-        config: &SpookyConfig,
+        config: &RuntimeConfig,
         shared_state: &SharedRuntimeState,
         worker_count: usize,
     ) -> Result<(), ProxyError> {
@@ -82,8 +82,12 @@ impl QUICListener {
         let bind = format!("{}:{}", endpoint.address, endpoint.port);
         let max_connections = endpoint.max_connections.max(1);
         let connection_timeout = Duration::from_millis(endpoint.connection_timeout_ms.max(1));
+        let listener_config =
+            config.primary_listener_runtime_config().ok_or_else(|| {
+                ProxyError::Transport("no effective listeners configured".to_string())
+            })?;
         let acceptor =
-            match Self::build_server_tls_acceptor(config, false, vec![b"http/1.1".to_vec()]) {
+            match Self::build_server_tls_acceptor(&listener_config, false, vec![b"http/1.1".to_vec()]) {
                 Ok(acceptor) => acceptor,
                 Err(err) => {
                     let msg = format!("failed to initialize control API TLS config: {err}");
@@ -409,7 +413,7 @@ impl QUICListener {
     }
 
     pub(super) fn spawn_watchdog(
-        config: &SpookyConfig,
+        config: &RuntimeConfig,
         metrics: Arc<Metrics>,
         resilience: Arc<RuntimeResilience>,
         watchdog: Arc<WatchdogCoordinator>,

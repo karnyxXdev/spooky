@@ -2,8 +2,7 @@ use bytes::Bytes;
 use core::net::SocketAddr;
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
-    config::Config,
-    runtime::RuntimeUpstreamPolicy,
+    runtime::{ListenerRuntimeConfig, RuntimeUpstreamPolicy},
 };
 use spooky_errors::ProxyError;
 use spooky_lb::UpstreamPool;
@@ -37,6 +36,7 @@ pub struct SharedRuntimeState {
     pub(crate) upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
     pub(crate) upstream_inflight: HashMap<String, Arc<Semaphore>>,
     pub(crate) global_inflight: Arc<Semaphore>,
+    pub(crate) routing_index: Arc<route_index::RouteIndex>,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) resilience: Arc<RuntimeResilience>,
     pub(crate) watchdog: Arc<WatchdogCoordinator>,
@@ -80,7 +80,7 @@ impl SharedRuntimeState {
 pub struct QUICListener {
     pub socket: UdpSocket,
     pub local_addr: SocketAddr,
-    pub config: Config,
+    pub config: ListenerRuntimeConfig,
     pub quic_config: quiche::Config,
     pub h3_config: Arc<quiche::h3::Config>,
     pub h2_pool: Arc<H2Pool>,
@@ -90,7 +90,7 @@ pub struct QUICListener {
     pub upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
     pub upstream_inflight: HashMap<String, Arc<Semaphore>>,
     pub global_inflight: Arc<Semaphore>,
-    pub(crate) routing_index: route_index::RouteIndex,
+    pub(crate) routing_index: Arc<route_index::RouteIndex>,
     pub metrics: Arc<Metrics>,
     pub resilience: Arc<RuntimeResilience>,
     pub watchdog: Arc<WatchdogCoordinator>,

@@ -32,6 +32,29 @@ impl RuntimeConfig {
             security: config.security.clone(),
         })
     }
+
+    pub fn listener_runtime_configs(&self) -> Vec<ListenerRuntimeConfig> {
+        self.listeners
+            .iter()
+            .cloned()
+            .map(|listen| ListenerRuntimeConfig {
+                listen,
+                performance: self.performance.clone(),
+                observability: self.observability.clone(),
+            })
+            .collect()
+    }
+
+    pub fn primary_listener_runtime_config(&self) -> Option<ListenerRuntimeConfig> {
+        self.listener_runtime_configs().into_iter().next()
+    }
+
+    pub fn upstreams_as_config(&self) -> HashMap<String, Upstream> {
+        self.upstreams
+            .iter()
+            .map(|(name, upstream)| (name.clone(), upstream.as_config_upstream()))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +160,13 @@ pub struct RuntimeListener {
     pub source: RuntimeListenerSource,
     pub listen: Listen,
     pub tls: RuntimeListenerTls,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListenerRuntimeConfig {
+    pub listen: RuntimeListener,
+    pub performance: Performance,
+    pub observability: Observability,
 }
 
 impl RuntimeListener {
@@ -323,6 +353,21 @@ impl RuntimeUpstream {
                     backend,
                     effective_tls: effective_tls.clone(),
                 })
+                .collect(),
+        }
+    }
+
+    pub fn as_config_upstream(&self) -> Upstream {
+        Upstream {
+            load_balancing: self.load_balancing.clone(),
+            host_policy: self.policy.host.0.clone(),
+            forwarded_headers: self.policy.forwarded_headers.0.clone(),
+            tls: Some(self.effective_tls.clone()),
+            route: self.route.clone(),
+            backends: self
+                .backends
+                .iter()
+                .map(|backend| backend.backend.clone())
                 .collect(),
         }
     }

@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 mod privilege_drop;
 mod runtime_guard;
 
-use spooky_config::{config::Config, runtime::RuntimeConfig};
+use spooky_config::runtime::{ListenerRuntimeConfig, RuntimeConfig};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -140,7 +140,7 @@ fn main() {
         );
     }
 
-    let control_plane_threads = config_yaml.performance.control_plane_threads.max(1);
+    let control_plane_threads = runtime_config.performance.control_plane_threads.max(1);
     configure_async_runtime(control_plane_threads);
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -162,11 +162,11 @@ fn main() {
         }
     };
 
-    runtime.block_on(run(config_yaml, runtime_config, uid));
+    runtime.block_on(run(runtime_config, uid));
 }
 
-async fn run(config_yaml: Config, runtime_config: RuntimeConfig, uid: libc::uid_t) {
-    let shared_state = match QUICListener::build_shared_state(&config_yaml) {
+async fn run(runtime_config: RuntimeConfig, uid: libc::uid_t) {
+    let shared_state = match QUICListener::build_shared_state(&runtime_config) {
         Ok(shared_state) => Arc::new(shared_state),
         Err(e) => {
             error!("Failed to initialize shared runtime state: {}", e);
@@ -174,11 +174,11 @@ async fn run(config_yaml: Config, runtime_config: RuntimeConfig, uid: libc::uid_
         }
     };
 
-    let worker_count = config_yaml.performance.worker_threads.max(1);
-    let shard_count = config_yaml.performance.packet_shards_per_worker.max(1);
+    let worker_count = runtime_config.performance.worker_threads.max(1);
+    let shard_count = runtime_config.performance.packet_shards_per_worker.max(1);
     let effective_worker_count = worker_count.saturating_mul(shard_count);
     if let Err(err) =
-        QUICListener::spawn_control_plane_tasks(&config_yaml, &shared_state, effective_worker_count)
+        QUICListener::spawn_control_plane_tasks(&runtime_config, &shared_state, effective_worker_count)
     {
         error!("Failed to initialize control-plane tasks: {}", err);
         std::process::exit(1);
@@ -203,22 +203,21 @@ async fn run(config_yaml: Config, runtime_config: RuntimeConfig, uid: libc::uid_
         shutdown_flag.store(true, Ordering::Relaxed);
     });
 
-    let pin_workers = config_yaml.performance.pin_workers;
-    let shard_queue_capacity = config_yaml.performance.packet_shard_queue_capacity.max(1);
-    let shard_queue_max_bytes = config_yaml.performance.packet_shard_queue_max_bytes.max(1);
+    let pin_workers = runtime_config.performance.pin_workers;
+    let shard_queue_capacity = runtime_config.performance.packet_shard_queue_capacity.max(1);
+    let shard_queue_max_bytes = runtime_config.performance.packet_shard_queue_max_bytes.max(1);
     let mut worker_handles: Vec<thread::JoinHandle<Result<(), String>>> = Vec::new();
     let mut worker_index_base = 0usize;
 
-    for listener in &runtime_config.listeners {
-        let mut listener_config = config_yaml.clone();
-        listener_config.listen = listener.listen.clone();
-
-        if let Err(err) =
-            QUICListener::spawn_bootstrap_tls_listener(&listener_config, &shared_state)
+    for listener_config in runtime_config.listener_runtime_configs() {
+        if let Err(err) = QUICListener::spawn_bootstrap_tls_listener(&listener_config, &shared_state)
         {
             error!(
                 "Failed to initialize bootstrap TLS listener {} ({}:{}): {}",
-                listener.index, listener.listen.address, listener.listen.port, err
+                listener_config.listen.index,
+                listener_config.listen.listen.address,
+                listener_config.listen.listen.port,
+                err
             );
             std::process::exit(1);
         }
@@ -249,8 +248,8 @@ async fn run(config_yaml: Config, runtime_config: RuntimeConfig, uid: libc::uid_
         "Ingress listeners={} packet_shards_per_worker={} reuseport={} pin_workers={}",
         runtime_config.listeners.len(),
         shard_count,
-        config_yaml.performance.reuseport,
-        config_yaml.performance.pin_workers
+        runtime_config.performance.reuseport,
+        runtime_config.performance.pin_workers
     );
     for listener in &runtime_config.listeners {
         info!(
@@ -266,8 +265,8 @@ async fn run(config_yaml: Config, runtime_config: RuntimeConfig, uid: libc::uid_
         "Data-plane workers={} packet_shards_per_worker={} reuseport={} pin_workers={}",
         worker_handles.len(),
         shard_count,
-        config_yaml.performance.reuseport,
-        config_yaml.performance.pin_workers
+        runtime_config.performance.reuseport,
+        runtime_config.performance.pin_workers
     );
 
     let mut worker_failed = false;
@@ -315,7 +314,7 @@ async fn run(config_yaml: Config, runtime_config: RuntimeConfig, uid: libc::uid_
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_listener_worker_group(
-    listener_config: Config,
+    listener_config: ListenerRuntimeConfig,
     worker_count: usize,
     shard_count: usize,
     shard_queue_capacity: usize,
@@ -393,7 +392,7 @@ fn run_sharded_listener_worker(
     shard_queue_capacity: usize,
     shard_queue_max_bytes: usize,
     pin_workers: bool,
-    worker_config: spooky_config::config::Config,
+    worker_config: ListenerRuntimeConfig,
     socket: std::net::UdpSocket,
     worker_shared: Arc<SharedRuntimeState>,
     worker_shutdown: Arc<AtomicBool>,
@@ -585,7 +584,7 @@ fn run_sharded_listener_worker(
 fn run_single_listener_worker(
     worker_idx: usize,
     pin_workers: bool,
-    worker_config: spooky_config::config::Config,
+    worker_config: ListenerRuntimeConfig,
     socket: std::net::UdpSocket,
     worker_shared: Arc<SharedRuntimeState>,
     worker_shutdown: Arc<AtomicBool>,

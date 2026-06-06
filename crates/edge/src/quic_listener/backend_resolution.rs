@@ -60,6 +60,7 @@ impl QUICListener {
             }
         };
 
+        let task_metrics = Arc::clone(&metrics);
         spawn_supervised_async_task(&handle, "backend-dns-refresh", Some(metrics), async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -82,7 +83,7 @@ impl QUICListener {
                             generation,
                             refreshed_at,
                         } => {
-                            metrics.record_backend_dns_refresh_success(
+                            task_metrics.record_backend_dns_refresh_success(
                                 &backend_addr,
                                 refreshed_at,
                                 current_addrs.len(),
@@ -111,7 +112,7 @@ impl QUICListener {
                             generation,
                             refreshed_at,
                         } => {
-                            metrics.record_backend_dns_refresh_success(
+                            task_metrics.record_backend_dns_refresh_success(
                                 &backend_addr,
                                 refreshed_at,
                                 current_addrs.len(),
@@ -127,7 +128,7 @@ impl QUICListener {
                             authority_host,
                             retained_addrs,
                         } => {
-                            metrics.inc_backend_dns_refresh_failure();
+                            task_metrics.inc_backend_dns_refresh_failure();
                             warn!(
                                 "backend DNS refresh returned no addresses for '{}' (backend '{}'); retaining {:?}",
                                 authority_host, backend_addr, retained_addrs
@@ -139,7 +140,7 @@ impl QUICListener {
                             retained_addrs,
                             error,
                         } => {
-                            metrics.inc_backend_dns_refresh_failure();
+                            task_metrics.inc_backend_dns_refresh_failure();
                             warn!(
                                 "backend DNS refresh failed for '{}' (backend '{}'): {}; retaining {:?}",
                                 authority_host, backend_addr, error, retained_addrs

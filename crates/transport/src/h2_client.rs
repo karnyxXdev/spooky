@@ -98,7 +98,7 @@ impl SharedDnsResolver {
         I: IntoIterator<Item = SocketAddr>,
     {
         let normalized = normalize_dns_cache_host(host);
-        let addrs: Vec<SocketAddr> = addrs.into_iter().collect();
+        let addrs = canonicalize_socket_addrs(addrs);
         let previous_addrs = if let Ok(mut guard) = self.cache.write() {
             if addrs.is_empty() {
                 guard.remove(&normalized).unwrap_or_default()
@@ -230,6 +230,16 @@ impl H2Client {
 
 fn normalize_dns_cache_host(host: &str) -> String {
     host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn canonicalize_socket_addrs<I>(addrs: I) -> Vec<SocketAddr>
+where
+    I: IntoIterator<Item = SocketAddr>,
+{
+    let mut addrs: Vec<_> = addrs.into_iter().collect();
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
 }
 
 fn build_tls_config(tls: &TlsClientConfig) -> Result<ClientConfig, String> {

@@ -78,6 +78,7 @@ use crate::{
     watchdog::{WatchdogCoordinator, WatchdogRuntimeConfig, now_millis},
 };
 
+mod backend_resolution;
 mod connection;
 mod control_api;
 mod forwarding;
@@ -671,6 +672,12 @@ impl QUICListener {
         Self::spawn_health_checks(
             shared_state.upstream_pools.clone(),
             Arc::clone(&shared_state.upstream_health_clients),
+            Arc::clone(&shared_state.metrics),
+        );
+        Self::spawn_backend_dns_refresh(
+            config,
+            Arc::clone(&shared_state.backend_resolution_store),
+            shared_state.backend_dns_resolver.clone(),
             Arc::clone(&shared_state.metrics),
         );
         Self::spawn_metrics_endpoint(config, Arc::clone(&shared_state.metrics))?;

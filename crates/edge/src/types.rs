@@ -174,6 +174,28 @@ impl RuntimeBackendResolution {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeBackendResolutionUpdate {
+    pub backend_addr: String,
+    pub authority_host: String,
+    pub authority_port: u16,
+    pub address_kind: RuntimeBackendAddressKind,
+    pub previous_addrs: Vec<SocketAddr>,
+    pub current_addrs: Vec<SocketAddr>,
+    pub last_refresh_success_at: Option<SystemTime>,
+    pub refresh_generation: u64,
+}
+
+impl RuntimeBackendResolutionUpdate {
+    pub fn changed(&self) -> bool {
+        self.previous_addrs != self.current_addrs
+    }
+
+    pub fn cleared(&self) -> bool {
+        self.current_addrs.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeBackendResolutionStore {
     entries: Arc<RwLock<HashMap<String, RuntimeBackendResolution>>>,
@@ -219,6 +241,41 @@ impl RuntimeBackendResolutionStore {
             })
             .unwrap_or_default()
     }
+
+    pub fn update_hostname_resolution(
+        &self,
+        backend_addr: &str,
+        resolved_addrs: Vec<SocketAddr>,
+        refreshed_at: SystemTime,
+    ) -> Option<RuntimeBackendResolutionUpdate> {
+        let resolved_addrs = canonicalize_socket_addrs(resolved_addrs);
+        let mut guard = self.entries.write().ok()?;
+        let entry = guard.get_mut(backend_addr)?;
+        if !entry.is_hostname() {
+            return None;
+        }
+
+        let previous_addrs = std::mem::replace(&mut entry.resolved_addrs, resolved_addrs.clone());
+        entry.last_refresh_success_at = Some(refreshed_at);
+        entry.refresh_generation = entry.refresh_generation.saturating_add(1);
+
+        Some(RuntimeBackendResolutionUpdate {
+            backend_addr: entry.backend_addr.clone(),
+            authority_host: entry.authority_host.clone(),
+            authority_port: entry.authority_port,
+            address_kind: entry.address_kind,
+            previous_addrs,
+            current_addrs: resolved_addrs,
+            last_refresh_success_at: entry.last_refresh_success_at,
+            refresh_generation: entry.refresh_generation,
+        })
+    }
+}
+
+fn canonicalize_socket_addrs(mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
 }
 
 #[cfg(test)]
@@ -227,6 +284,7 @@ mod backend_resolution_tests {
         RuntimeBackendAddressKind, RuntimeBackendResolution, RuntimeBackendResolutionStore,
     };
     use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::SystemTime;
 
     #[test]
     fn hostname_entries_exclude_ip_literal_backends() {
@@ -267,6 +325,37 @@ mod backend_resolution_tests {
         assert_eq!(entry.authority_host, "127.0.0.1");
         assert_eq!(entry.authority_port, 8080);
         assert_eq!(entry.resolved_addrs.len(), 1);
+    }
+
+    #[test]
+    fn hostname_resolution_update_canonicalizes_and_tracks_generation() {
+        let store = RuntimeBackendResolutionStore::new([RuntimeBackendResolution::hostname(
+            "api.internal:443".to_string(),
+            "api.internal".to_string(),
+            443,
+        )]);
+
+        let update = store
+            .update_hostname_resolution(
+                "api.internal:443",
+                vec![
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 443),
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443),
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 443),
+                ],
+                SystemTime::UNIX_EPOCH,
+            )
+            .expect("update");
+
+        assert!(update.changed());
+        assert_eq!(update.refresh_generation, 1);
+        assert_eq!(
+            update.current_addrs,
+            vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 443)
+            ]
+        );
     }
 }
 

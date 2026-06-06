@@ -13,6 +13,10 @@ struct BackendHandle {
     inflight: Arc<Semaphore>,
 }
 
+// Connection pools are keyed by configured backend identity, not by resolved IP.
+// When DNS refresh updates a hostname's address set, new connects pick up the
+// refreshed resolver results, while already-pooled H2 connections may continue
+// using older addresses until Hyper retires them via the normal idle timeout.
 pub struct H2Pool {
     backends: HashMap<String, BackendHandle>,
 }

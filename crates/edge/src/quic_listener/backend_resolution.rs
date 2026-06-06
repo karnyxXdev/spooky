@@ -79,14 +79,21 @@ impl QUICListener {
                             current_addrs,
                             generation,
                         } => {
-                            info!(
-                                "backend DNS refresh updated '{}' (backend '{}'): {:?} -> {:?} generation={}",
-                                authority_host,
-                                backend_addr,
-                                previous_addrs,
-                                current_addrs,
-                                generation
-                            );
+                            if previous_addrs.is_empty() {
+                                info!(
+                                    "backend DNS refresh populated '{}' (backend '{}') with {:?} generation={}",
+                                    authority_host, backend_addr, current_addrs, generation
+                                );
+                            } else {
+                                info!(
+                                    "backend DNS refresh updated '{}' (backend '{}'): {:?} -> {:?} generation={} stale_pooled_connections=possible_until_idle_timeout",
+                                    authority_host,
+                                    backend_addr,
+                                    previous_addrs,
+                                    current_addrs,
+                                    generation
+                                );
+                            }
                         }
                         BackendDnsRefreshOutcome::Unchanged {
                             backend_addr,

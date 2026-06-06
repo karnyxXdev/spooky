@@ -13,12 +13,14 @@ enum BackendDnsRefreshOutcome {
         previous_addrs: Vec<SocketAddr>,
         current_addrs: Vec<SocketAddr>,
         generation: u64,
+        refreshed_at: SystemTime,
     },
     Unchanged {
         backend_addr: String,
         authority_host: String,
         current_addrs: Vec<SocketAddr>,
         generation: u64,
+        refreshed_at: SystemTime,
     },
     EmptyAnswerRetained {
         backend_addr: String,
@@ -78,7 +80,14 @@ impl QUICListener {
                             previous_addrs,
                             current_addrs,
                             generation,
+                            refreshed_at,
                         } => {
+                            metrics.record_backend_dns_refresh_success(
+                                &backend_addr,
+                                refreshed_at,
+                                current_addrs.len(),
+                                true,
+                            );
                             if previous_addrs.is_empty() {
                                 info!(
                                     "backend DNS refresh populated '{}' (backend '{}') with {:?} generation={}",
@@ -100,7 +109,14 @@ impl QUICListener {
                             authority_host,
                             current_addrs,
                             generation,
+                            refreshed_at,
                         } => {
+                            metrics.record_backend_dns_refresh_success(
+                                &backend_addr,
+                                refreshed_at,
+                                current_addrs.len(),
+                                false,
+                            );
                             debug!(
                                 "backend DNS refresh unchanged for '{}' (backend '{}') addrs={:?} generation={}",
                                 authority_host, backend_addr, current_addrs, generation
@@ -111,6 +127,7 @@ impl QUICListener {
                             authority_host,
                             retained_addrs,
                         } => {
+                            metrics.inc_backend_dns_refresh_failure();
                             warn!(
                                 "backend DNS refresh returned no addresses for '{}' (backend '{}'); retaining {:?}",
                                 authority_host, backend_addr, retained_addrs
@@ -122,6 +139,7 @@ impl QUICListener {
                             retained_addrs,
                             error,
                         } => {
+                            metrics.inc_backend_dns_refresh_failure();
                             warn!(
                                 "backend DNS refresh failed for '{}' (backend '{}'): {}; retaining {:?}",
                                 authority_host, backend_addr, error, retained_addrs
@@ -180,6 +198,7 @@ async fn refresh_backend_hostname(
             previous_addrs: update.previous_addrs,
             current_addrs: update.current_addrs,
             generation: update.refresh_generation,
+            refreshed_at,
         }
     } else {
         BackendDnsRefreshOutcome::Unchanged {
@@ -187,6 +206,7 @@ async fn refresh_backend_hostname(
             authority_host: update.authority_host,
             current_addrs: update.current_addrs,
             generation: update.refresh_generation,
+            refreshed_at,
         }
     }
 }

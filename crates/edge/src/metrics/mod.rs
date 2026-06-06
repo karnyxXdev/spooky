@@ -2,8 +2,11 @@ use std::{
     cell::Cell,
     collections::HashMap,
     env,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
+    sync::{
+        RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub use spooky_lb::HealthFailureReason;
@@ -74,6 +77,9 @@ pub struct Metrics {
     pub health_failure_timeout: AtomicU64,
     pub health_failure_transport: AtomicU64,
     pub health_failure_tls: AtomicU64,
+    pub backend_dns_refresh_success: AtomicU64,
+    pub backend_dns_refresh_failure: AtomicU64,
+    pub backend_dns_refresh_address_changes: AtomicU64,
     route_latency_sample_every: u64,
     route_latency_sample_counter: AtomicU64,
     route_labels: Vec<String>,
@@ -82,6 +88,13 @@ pub struct Metrics {
     unrouted_route_id: usize,
     worker_labels: Vec<String>,
     worker_stats: Vec<WorkerStatsAtomic>,
+    backend_dns_state: RwLock<HashMap<String, BackendDnsState>>,
+}
+
+#[derive(Default, Clone)]
+pub(crate) struct BackendDnsState {
+    pub(crate) last_success_unix_seconds: u64,
+    pub(crate) resolved_address_count: u64,
 }
 
 const LATENCY_BUCKETS_MS: [u64; 14] = [
@@ -334,6 +347,9 @@ impl Metrics {
             health_failure_timeout: AtomicU64::new(0),
             health_failure_transport: AtomicU64::new(0),
             health_failure_tls: AtomicU64::new(0),
+            backend_dns_refresh_success: AtomicU64::new(0),
+            backend_dns_refresh_failure: AtomicU64::new(0),
+            backend_dns_refresh_address_changes: AtomicU64::new(0),
             route_latency_sample_every,
             route_latency_sample_counter: AtomicU64::new(0),
             route_labels: route_labels_dedup,
@@ -342,6 +358,7 @@ impl Metrics {
             unrouted_route_id,
             worker_labels,
             worker_stats,
+            backend_dns_state: RwLock::new(HashMap::new()),
         }
     }
 
@@ -533,6 +550,55 @@ impl Metrics {
     pub fn inc_ingress_version_neg_failed(&self) {
         self.ingress_version_neg_failed_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_backend_dns_refresh_success(
+        &self,
+        backend: &str,
+        refreshed_at: SystemTime,
+        resolved_address_count: usize,
+        changed: bool,
+    ) {
+        self.backend_dns_refresh_success
+            .fetch_add(1, Ordering::Relaxed);
+        if changed {
+            self.backend_dns_refresh_address_changes
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        let last_success_unix_seconds = refreshed_at
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        if let Ok(mut guard) = self.backend_dns_state.write() {
+            guard.insert(
+                backend.to_string(),
+                BackendDnsState {
+                    last_success_unix_seconds,
+                    resolved_address_count: resolved_address_count as u64,
+                },
+            );
+        }
+    }
+
+    pub fn inc_backend_dns_refresh_failure(&self) {
+        self.backend_dns_refresh_failure
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot_backend_dns_state(&self) -> Vec<(String, BackendDnsState)> {
+        self.backend_dns_state
+            .read()
+            .map(|guard| {
+                let mut entries = guard
+                    .iter()
+                    .map(|(backend, state)| (backend.clone(), state.clone()))
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                entries
+            })
+            .unwrap_or_default()
     }
 
     fn current_worker_stats(&self) -> Option<&WorkerStatsAtomic> {

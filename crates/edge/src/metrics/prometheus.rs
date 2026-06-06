@@ -475,6 +475,50 @@ impl Metrics {
             self.health_failure_tls.load(Ordering::Relaxed)
         ));
         out.push_str(
+            "# HELP spooky_backend_dns_refresh_success_total Total successful backend DNS refreshes.\n",
+        );
+        out.push_str("# TYPE spooky_backend_dns_refresh_success_total counter\n");
+        out.push_str(&format!(
+            "spooky_backend_dns_refresh_success_total {}\n",
+            self.backend_dns_refresh_success.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP spooky_backend_dns_refresh_failure_total Total failed backend DNS refreshes.\n",
+        );
+        out.push_str("# TYPE spooky_backend_dns_refresh_failure_total counter\n");
+        out.push_str(&format!(
+            "spooky_backend_dns_refresh_failure_total {}\n",
+            self.backend_dns_refresh_failure.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP spooky_backend_dns_address_set_changes_total Total successful backend DNS refreshes that changed the resolved address set.\n",
+        );
+        out.push_str("# TYPE spooky_backend_dns_address_set_changes_total counter\n");
+        out.push_str(&format!(
+            "spooky_backend_dns_address_set_changes_total {}\n",
+            self.backend_dns_refresh_address_changes
+                .load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP spooky_backend_dns_last_refresh_success_seconds Unix timestamp of the last successful backend DNS refresh.\n",
+        );
+        out.push_str("# TYPE spooky_backend_dns_last_refresh_success_seconds gauge\n");
+        out.push_str(
+            "# HELP spooky_backend_dns_resolved_addresses Current number of resolved addresses retained for a backend identity.\n",
+        );
+        out.push_str("# TYPE spooky_backend_dns_resolved_addresses gauge\n");
+        for (backend, state) in self.snapshot_backend_dns_state() {
+            let backend = escape_prometheus_label(&backend);
+            out.push_str(&format!(
+                "spooky_backend_dns_last_refresh_success_seconds{{backend=\"{}\"}} {}\n",
+                backend, state.last_success_unix_seconds
+            ));
+            out.push_str(&format!(
+                "spooky_backend_dns_resolved_addresses{{backend=\"{}\"}} {}\n",
+                backend, state.resolved_address_count
+            ));
+        }
+        out.push_str(
             "# HELP spooky_route_latency_sample_every Route latency histogram sampling interval (1 = every request).\n",
         );
         out.push_str("# TYPE spooky_route_latency_sample_every gauge\n");

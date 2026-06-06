@@ -14,7 +14,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::UdpSocket,
     sync::{Arc, RwLock},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tracing::Span;
@@ -30,6 +30,7 @@ use crate::watchdog::WatchdogCoordinator;
 pub struct SharedRuntimeState {
     pub(crate) h2_pool: Arc<H2Pool>,
     pub(crate) backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+    pub(crate) backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
     pub(crate) backend_dns_resolver: SharedDnsResolver,
     pub(crate) upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
     pub(crate) upstream_health_clients: Arc<HashMap<String, Arc<H2Client>>>,
@@ -85,6 +86,7 @@ pub struct QUICListener {
     pub h3_config: Arc<quiche::h3::Config>,
     pub h2_pool: Arc<H2Pool>,
     pub backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+    pub backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
     pub backend_dns_resolver: SharedDnsResolver,
     pub upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
     pub upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
@@ -118,6 +120,154 @@ pub struct QUICListener {
     pub(crate) peer_routes: HashMap<SocketAddr, Arc<[u8]>>, // KEY: peer address, VALUE: primary SCID
     pub(crate) cid_radix: CidRadix,
     pub(crate) conn_rate_limiter: crate::quic_listener::TokenBucket,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeBackendAddressKind {
+    Hostname,
+    IpLiteral,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeBackendResolution {
+    pub backend_addr: String,
+    pub authority_host: String,
+    pub authority_port: u16,
+    pub address_kind: RuntimeBackendAddressKind,
+    pub resolved_addrs: Vec<SocketAddr>,
+    pub last_refresh_success_at: Option<SystemTime>,
+    pub refresh_generation: u64,
+}
+
+impl RuntimeBackendResolution {
+    pub fn hostname(backend_addr: String, authority_host: String, authority_port: u16) -> Self {
+        Self {
+            backend_addr,
+            authority_host,
+            authority_port,
+            address_kind: RuntimeBackendAddressKind::Hostname,
+            resolved_addrs: Vec::new(),
+            last_refresh_success_at: None,
+            refresh_generation: 0,
+        }
+    }
+
+    pub fn ip_literal(
+        backend_addr: String,
+        authority_host: String,
+        authority_port: u16,
+        resolved_addrs: Vec<SocketAddr>,
+    ) -> Self {
+        Self {
+            backend_addr,
+            authority_host,
+            authority_port,
+            address_kind: RuntimeBackendAddressKind::IpLiteral,
+            resolved_addrs,
+            last_refresh_success_at: None,
+            refresh_generation: 0,
+        }
+    }
+
+    pub fn is_hostname(&self) -> bool {
+        self.address_kind == RuntimeBackendAddressKind::Hostname
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeBackendResolutionStore {
+    entries: Arc<RwLock<HashMap<String, RuntimeBackendResolution>>>,
+}
+
+impl RuntimeBackendResolutionStore {
+    pub fn new<I>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = RuntimeBackendResolution>,
+    {
+        let entries = entries
+            .into_iter()
+            .map(|entry| (entry.backend_addr.clone(), entry))
+            .collect();
+        Self {
+            entries: Arc::new(RwLock::new(entries)),
+        }
+    }
+
+    pub fn get(&self, backend_addr: &str) -> Option<RuntimeBackendResolution> {
+        self.entries
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(backend_addr).cloned())
+    }
+
+    pub fn snapshot(&self) -> HashMap<String, RuntimeBackendResolution> {
+        self.entries
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn hostname_entries(&self) -> Vec<RuntimeBackendResolution> {
+        self.entries
+            .read()
+            .map(|guard| {
+                guard
+                    .values()
+                    .filter(|entry| entry.is_hostname())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod backend_resolution_tests {
+    use super::{
+        RuntimeBackendAddressKind, RuntimeBackendResolution, RuntimeBackendResolutionStore,
+    };
+    use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn hostname_entries_exclude_ip_literal_backends() {
+        let store = RuntimeBackendResolutionStore::new([
+            RuntimeBackendResolution::hostname(
+                "api.internal:443".to_string(),
+                "api.internal".to_string(),
+                443,
+            ),
+            RuntimeBackendResolution::ip_literal(
+                "10.0.0.10:8443".to_string(),
+                "10.0.0.10".to_string(),
+                8443,
+                vec![SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+                    8443,
+                )],
+            ),
+        ]);
+
+        let entries = store.hostname_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].backend_addr, "api.internal:443");
+        assert_eq!(entries[0].address_kind, RuntimeBackendAddressKind::Hostname);
+    }
+
+    #[test]
+    fn store_snapshot_preserves_seeded_resolution_state() {
+        let store = RuntimeBackendResolutionStore::new([RuntimeBackendResolution::ip_literal(
+            "127.0.0.1:8080".to_string(),
+            "127.0.0.1".to_string(),
+            8080,
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080)],
+        )]);
+
+        let snapshot = store.snapshot();
+        let entry = snapshot.get("127.0.0.1:8080").expect("entry");
+        assert_eq!(entry.authority_host, "127.0.0.1");
+        assert_eq!(entry.authority_port, 8080);
+        assert_eq!(entry.resolved_addrs.len(), 1);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

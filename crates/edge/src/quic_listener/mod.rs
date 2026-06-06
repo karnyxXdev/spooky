@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
     future::Future,
-    net::{ToSocketAddrs, UdpSocket},
+    net::{IpAddr, SocketAddr as StdSocketAddr, ToSocketAddrs, UdpSocket},
     pin::Pin,
     sync::{
         Arc, OnceLock, RwLock,
@@ -74,7 +74,7 @@ use crate::{
     outcome_from_status,
     resilience::{RouteQueueRejection, RuntimeResilience},
     route_index::{RouteDecisionReason, RouteIndex, normalize_host_for_routing},
-    types::QuicConnectionErrorSnapshot,
+    types::{QuicConnectionErrorSnapshot, RuntimeBackendResolution, RuntimeBackendResolutionStore},
     watchdog::{WatchdogCoordinator, WatchdogRuntimeConfig, now_millis},
 };
 
@@ -480,6 +480,7 @@ impl QUICListener {
         );
 
         let mut backend_addresses = Vec::new();
+        let mut backend_resolutions = Vec::new();
         let mut seen_backend_origins: HashMap<String, (String, String)> = HashMap::new();
         let mut backend_tls_configs: HashMap<String, TlsClientConfig> = HashMap::new();
         let mut upstream_tls_configs: HashMap<String, TlsClientConfig> = HashMap::new();
@@ -513,12 +514,37 @@ impl QUICListener {
                     )));
                 }
                 backend_addresses.push(backend.backend.address.clone());
+                let authority_host = endpoint.authority_host().to_string();
+                let authority_port = endpoint.authority_port();
+                let resolution = if endpoint.authority_is_ip_literal() {
+                    let ip_addr = authority_host.parse::<IpAddr>().map_err(|err| {
+                        ProxyError::Transport(format!(
+                            "failed to parse IP literal backend '{}' in upstream '{}' (backend '{}'): {}",
+                            backend.backend.address, upstream_name, backend.backend.id, err
+                        ))
+                    })?;
+                    RuntimeBackendResolution::ip_literal(
+                        backend.backend.address.clone(),
+                        authority_host,
+                        authority_port,
+                        vec![StdSocketAddr::new(ip_addr, authority_port)],
+                    )
+                } else {
+                    RuntimeBackendResolution::hostname(
+                        backend.backend.address.clone(),
+                        authority_host,
+                        authority_port,
+                    )
+                };
+                backend_resolutions.push(resolution);
                 backend_tls_configs
                     .insert(backend.backend.address.clone(), upstream_tls_client.clone());
             }
         }
 
         let backend_dns_resolver = SharedDnsResolver::new();
+        let backend_resolution_store =
+            Arc::new(RuntimeBackendResolutionStore::new(backend_resolutions));
         let h2_pool = Arc::new(
             H2Pool::new(
                 backend_addresses,
@@ -614,6 +640,7 @@ impl QUICListener {
                     })
                     .collect(),
             ),
+            backend_resolution_store,
             backend_dns_resolver,
             upstream_health_clients: Arc::new(upstream_health_clients),
             upstream_policies: Arc::new(
@@ -736,6 +763,7 @@ impl QUICListener {
             h3_config,
             h2_pool: Arc::clone(&shared_state.h2_pool),
             backend_endpoints: Arc::clone(&shared_state.backend_endpoints),
+            backend_resolution_store: Arc::clone(&shared_state.backend_resolution_store),
             backend_dns_resolver: shared_state.backend_dns_resolver.clone(),
             upstream_policies: Arc::clone(&shared_state.upstream_policies),
             upstream_pools: shared_state.upstream_pools.clone(),

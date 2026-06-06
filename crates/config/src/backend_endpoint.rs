@@ -68,6 +68,22 @@ impl BackendEndpoint {
         &self.authority
     }
 
+    pub fn authority_host(&self) -> &str {
+        split_authority(&self.authority)
+            .map(|(host, _)| host)
+            .unwrap_or_default()
+    }
+
+    pub fn authority_port(&self) -> u16 {
+        split_authority(&self.authority)
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .unwrap_or_default()
+    }
+
+    pub fn authority_is_ip_literal(&self) -> bool {
+        self.authority_host().parse::<IpAddr>().is_ok()
+    }
+
     pub fn origin(&self) -> String {
         format!("{}://{}", self.scheme.as_str(), self.authority)
     }
@@ -98,6 +114,18 @@ fn normalize_authority(authority: &str, scheme: BackendScheme) -> String {
         return format!("{}:{}", authority, default_port);
     }
     authority.to_string()
+}
+
+fn split_authority(authority: &str) -> Option<(&str, &str)> {
+    if authority.starts_with('[') {
+        let bracket_end = authority.find(']')?;
+        let host = authority.get(1..bracket_end)?;
+        let suffix = authority.get(bracket_end + 1..)?;
+        let port = suffix.strip_prefix(':')?;
+        Some((host, port))
+    } else {
+        authority.rsplit_once(':')
+    }
 }
 
 fn validate_dns_hostname(host: &str) -> Result<(), String> {
@@ -282,5 +310,21 @@ mod tests {
             endpoint.uri_for_path("health"),
             "https://backend.local:443/health"
         );
+    }
+
+    #[test]
+    fn authority_helpers_extract_hostname_and_port() {
+        let endpoint = BackendEndpoint::parse("https://example.com").expect("endpoint");
+        assert_eq!(endpoint.authority_host(), "example.com");
+        assert_eq!(endpoint.authority_port(), 443);
+        assert!(!endpoint.authority_is_ip_literal());
+    }
+
+    #[test]
+    fn authority_helpers_extract_ipv6_literal_host_and_port() {
+        let endpoint = BackendEndpoint::parse("https://[::1]:8443").expect("endpoint");
+        assert_eq!(endpoint.authority_host(), "::1");
+        assert_eq!(endpoint.authority_port(), 8443);
+        assert!(endpoint.authority_is_ip_literal());
     }
 }

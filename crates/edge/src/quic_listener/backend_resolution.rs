@@ -181,9 +181,18 @@ async fn refresh_backend_hostname(
     }
 
     let refreshed_at = SystemTime::now();
-    let update = backend_resolution_store
-        .update_hostname_resolution(&backend.backend_addr, resolved.clone(), refreshed_at)
-        .expect("hostname backend must exist in resolution store");
+    let Some(update) = backend_resolution_store.update_hostname_resolution(
+        &backend.backend_addr,
+        resolved.clone(),
+        refreshed_at,
+    ) else {
+        return BackendDnsRefreshOutcome::LookupFailed {
+            backend_addr: backend.backend_addr.clone(),
+            authority_host: backend.authority_host.clone(),
+            retained_addrs: backend.resolved_addrs.clone(),
+            error: "hostname backend disappeared from resolution store".to_string(),
+        };
+    };
 
     let _ = backend_dns_resolver.replace_host_addrs(
         &backend.authority_host,

@@ -55,6 +55,23 @@ type ResolverResponse = std::vec::IntoIter<SocketAddr>;
 type ResolverFuture =
     Pin<Box<dyn Future<Output = Result<ResolverResponse, io::Error>> + Send + 'static>>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsCacheUpdate {
+    pub host: String,
+    pub previous_addrs: Vec<SocketAddr>,
+    pub current_addrs: Vec<SocketAddr>,
+}
+
+impl DnsCacheUpdate {
+    pub fn changed(&self) -> bool {
+        self.previous_addrs != self.current_addrs
+    }
+
+    pub fn cleared(&self) -> bool {
+        self.current_addrs.is_empty()
+    }
+}
+
 #[derive(Clone)]
 pub struct SharedDnsResolver {
     cache: Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>,
@@ -73,21 +90,36 @@ impl SharedDnsResolver {
     where
         I: IntoIterator<Item = SocketAddr>,
     {
+        let _ = self.replace_host_addrs(host, addrs);
+    }
+
+    pub fn replace_host_addrs<I>(&self, host: &str, addrs: I) -> DnsCacheUpdate
+    where
+        I: IntoIterator<Item = SocketAddr>,
+    {
         let normalized = normalize_dns_cache_host(host);
         let addrs: Vec<SocketAddr> = addrs.into_iter().collect();
-        if addrs.is_empty() {
-            self.remove_host(host);
-            return;
-        }
-        if let Ok(mut guard) = self.cache.write() {
-            guard.insert(normalized, addrs);
+        let previous_addrs = if let Ok(mut guard) = self.cache.write() {
+            if addrs.is_empty() {
+                guard.remove(&normalized).unwrap_or_default()
+            } else {
+                guard
+                    .insert(normalized.clone(), addrs.clone())
+                    .unwrap_or_default()
+            }
+        } else {
+            Vec::new()
+        };
+
+        DnsCacheUpdate {
+            host: normalized,
+            previous_addrs,
+            current_addrs: addrs,
         }
     }
 
-    pub fn remove_host(&self, host: &str) {
-        if let Ok(mut guard) = self.cache.write() {
-            guard.remove(&normalize_dns_cache_host(host));
-        }
+    pub fn remove_host(&self, host: &str) -> DnsCacheUpdate {
+        self.replace_host_addrs(host, Vec::<SocketAddr>::new())
     }
 
     pub fn cached_addrs(&self, host: &str) -> Option<Vec<SocketAddr>> {
@@ -95,6 +127,13 @@ impl SharedDnsResolver {
             .read()
             .ok()
             .and_then(|guard| guard.get(&normalize_dns_cache_host(host)).cloned())
+    }
+
+    pub fn snapshot(&self) -> HashMap<String, Vec<SocketAddr>> {
+        self.cache
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -362,7 +401,7 @@ impl ServerCertVerifier for InsecureServerCertVerifier {
 
 #[cfg(test)]
 mod tests {
-    use super::{H2Client, SharedDnsResolver, TlsClientConfig};
+    use super::{DnsCacheUpdate, H2Client, SharedDnsResolver, TlsClientConfig};
     use hyper_util::client::legacy::connect::dns::Name;
     use std::{net::SocketAddr, str::FromStr, time::Duration};
     use tower_service::Service;
@@ -444,5 +483,62 @@ mod tests {
                 SocketAddr::from(([127, 0, 0, 11], 0))
             ]
         );
+    }
+
+    #[test]
+    fn replace_host_addrs_reports_previous_and_current_values() {
+        let resolver = SharedDnsResolver::new();
+        let first = resolver.replace_host_addrs(
+            "api.example.com",
+            [SocketAddr::from(([127, 0, 0, 10], 443))],
+        );
+        assert_eq!(
+            first,
+            DnsCacheUpdate {
+                host: "api.example.com".to_string(),
+                previous_addrs: Vec::new(),
+                current_addrs: vec![SocketAddr::from(([127, 0, 0, 10], 443))],
+            }
+        );
+        assert!(first.changed());
+
+        let second = resolver.replace_host_addrs(
+            "API.EXAMPLE.COM.",
+            [
+                SocketAddr::from(([127, 0, 0, 11], 443)),
+                SocketAddr::from(([127, 0, 0, 12], 443)),
+            ],
+        );
+        assert_eq!(second.host, "api.example.com");
+        assert_eq!(
+            second.previous_addrs,
+            vec![SocketAddr::from(([127, 0, 0, 10], 443))]
+        );
+        assert_eq!(
+            second.current_addrs,
+            vec![
+                SocketAddr::from(([127, 0, 0, 11], 443)),
+                SocketAddr::from(([127, 0, 0, 12], 443))
+            ]
+        );
+        assert!(second.changed());
+    }
+
+    #[test]
+    fn remove_host_clears_case_insensitive_cache_entry() {
+        let resolver = SharedDnsResolver::new();
+        resolver.set_host_addrs(
+            "api.example.com",
+            [SocketAddr::from(([127, 0, 0, 10], 443))],
+        );
+
+        let cleared = resolver.remove_host("API.EXAMPLE.COM");
+        assert!(cleared.changed());
+        assert!(cleared.cleared());
+        assert_eq!(
+            cleared.previous_addrs,
+            vec![SocketAddr::from(([127, 0, 0, 10], 443))]
+        );
+        assert!(resolver.cached_addrs("api.example.com").is_none());
     }
 }

@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
     convert::Infallible,
+    fs::File,
+    io::BufReader,
     net::SocketAddr,
     pin::Pin,
     sync::{
@@ -14,10 +16,12 @@ use std::{
 
 use bytes::Bytes;
 use http::header::{CONTENT_LENGTH, HeaderValue};
+use http::{HeaderMap, StatusCode};
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::{
     Request, Response, Uri,
     body::{Body, Frame, Incoming},
+    client::conn::http2,
     service::service_fn,
 };
 use hyper_util::{
@@ -28,7 +32,11 @@ use quiche::h3::NameValue;
 use rand::RngCore;
 use rcgen::{Certificate, CertificateParams, SanType};
 use tempfile::{TempDir, tempdir};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::{
+    TlsConnector,
+    rustls::{ClientConfig, RootCertStore, pki_types::ServerName},
+};
 
 use spooky_config::config::{
     Backend, ClientAuth, Config, HealthCheck, Listen, LoadBalancing, Log, LogFormat, Security, Tls,
@@ -710,6 +718,174 @@ fn run_h3_client_two_chunk_post(
     }
 }
 
+fn run_h3_client_collect_trailers(
+    addr: SocketAddr,
+    path: &str,
+) -> Result<(String, Vec<u8>, Vec<(String, String)>), String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    let local_addr = socket.local_addr().map_err(|e| e.to_string())?;
+
+    let mut config =
+        quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| format!("config: {e:?}"))?;
+    config.verify_peer(false);
+    config
+        .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+        .map_err(|e| format!("alpn: {e:?}"))?;
+    config.set_max_idle_timeout(QUIC_IDLE_TIMEOUT_MS);
+    config.set_max_recv_udp_payload_size(MAX_UDP_PAYLOAD_BYTES);
+    config.set_max_send_udp_payload_size(MAX_UDP_PAYLOAD_BYTES);
+    config.set_initial_max_data(QUIC_INITIAL_MAX_DATA);
+    config.set_initial_max_stream_data_bidi_local(QUIC_INITIAL_STREAM_DATA);
+    config.set_initial_max_stream_data_bidi_remote(QUIC_INITIAL_STREAM_DATA);
+    config.set_initial_max_stream_data_uni(QUIC_INITIAL_STREAM_DATA);
+    config.set_initial_max_streams_bidi(QUIC_INITIAL_MAX_STREAMS_BIDI);
+    config.set_initial_max_streams_uni(QUIC_INITIAL_MAX_STREAMS_UNI);
+    config.set_disable_active_migration(true);
+
+    let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
+    rand::thread_rng().fill_bytes(&mut scid_bytes);
+    let scid = quiche::ConnectionId::from_ref(&scid_bytes);
+
+    let mut conn = quiche::connect(Some("localhost"), &scid, local_addr, addr, &mut config)
+        .map_err(|e| format!("connect: {e:?}"))?;
+    let h3_config = quiche::h3::Config::new().map_err(|e| format!("h3: {e:?}"))?;
+    let mut h3_conn: Option<quiche::h3::Connection> = None;
+
+    let mut out = [0u8; MAX_UDP_PAYLOAD_BYTES];
+    let mut buf = [0u8; MAX_DATAGRAM_SIZE_BYTES];
+    let mut request_sent = false;
+    let mut request_stream_id = None;
+    let mut status = String::new();
+    let mut response_body = Vec::new();
+    let mut trailers: Vec<(String, String)> = Vec::new();
+    let start = Instant::now();
+    let timeout = Duration::from_secs(REQUEST_TIMEOUT_SECS);
+
+    loop {
+        while let Ok((write, send_info)) = conn.send(&mut out) {
+            socket
+                .send_to(&out[..write], send_info.to)
+                .map_err(|e| format!("send_to: {e:?}"))?;
+        }
+
+        let read_timeout = conn
+            .timeout()
+            .unwrap_or(Duration::from_millis(50))
+            .min(Duration::from_millis(50));
+        let read_timeout = if read_timeout.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            read_timeout
+        };
+        socket
+            .set_read_timeout(Some(read_timeout))
+            .map_err(|e| format!("timeout: {e:?}"))?;
+
+        match socket.recv_from(&mut buf) {
+            Ok((len, from)) => {
+                let recv_info = quiche::RecvInfo {
+                    from,
+                    to: local_addr,
+                };
+                conn.recv(&mut buf[..len], recv_info)
+                    .map_err(|e| format!("recv: {e:?}"))?;
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                conn.on_timeout();
+            }
+            Err(e) => return Err(format!("recv: {e:?}")),
+        }
+
+        if conn.is_established() && h3_conn.is_none() {
+            h3_conn = Some(
+                quiche::h3::Connection::with_transport(&mut conn, &h3_config)
+                    .map_err(|e| format!("h3 conn: {e:?}"))?,
+            );
+        }
+
+        if let Some(h3c) = h3_conn.as_mut() {
+            if conn.is_established() && !request_sent {
+                let req = vec![
+                    quiche::h3::Header::new(b":method", b"GET"),
+                    quiche::h3::Header::new(b":scheme", b"https"),
+                    quiche::h3::Header::new(b":authority", b"localhost"),
+                    quiche::h3::Header::new(b":path", path.as_bytes()),
+                    quiche::h3::Header::new(b"user-agent", b"spooky-regression-test"),
+                ];
+                let stream_id = h3c
+                    .send_request(&mut conn, &req, true)
+                    .map_err(|e| format!("send_request: {e:?}"))?;
+                request_stream_id = Some(stream_id);
+                request_sent = true;
+            }
+
+            loop {
+                match h3c.poll(&mut conn) {
+                    Ok((sid, quiche::h3::Event::Headers { list, .. })) => {
+                        if Some(sid) != request_stream_id {
+                            continue;
+                        }
+                        if status.is_empty() {
+                            for header in &list {
+                                if header.name() == b":status" {
+                                    status = String::from_utf8_lossy(header.value()).to_string();
+                                }
+                            }
+                        } else {
+                            for header in &list {
+                                trailers.push((
+                                    String::from_utf8_lossy(header.name()).to_string(),
+                                    String::from_utf8_lossy(header.value()).to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    Ok((sid, quiche::h3::Event::Data)) => {
+                        if Some(sid) != request_stream_id {
+                            continue;
+                        }
+                        loop {
+                            match h3c.recv_body(&mut conn, sid, &mut buf) {
+                                Ok(read) => response_body.extend_from_slice(&buf[..read]),
+                                Err(quiche::h3::Error::Done) => break,
+                                Err(e) => return Err(format!("recv_body: {e:?}")),
+                            }
+                        }
+                    }
+                    Ok((sid, quiche::h3::Event::Finished)) => {
+                        if Some(sid) != request_stream_id {
+                            continue;
+                        }
+                        return Ok((status, response_body, trailers));
+                    }
+                    Ok((sid, quiche::h3::Event::Reset(_))) => {
+                        if Some(sid) != request_stream_id {
+                            continue;
+                        }
+                        return Err("stream reset".to_string());
+                    }
+                    Ok((_sid, quiche::h3::Event::PriorityUpdate)) => {}
+                    Ok((_sid, quiche::h3::Event::GoAway)) => {}
+                    Err(quiche::h3::Error::Done) => break,
+                    Err(e) => return Err(format!("poll: {e:?}")),
+                }
+            }
+        }
+
+        if start.elapsed() > timeout {
+            return Err(format!(
+                "timeout waiting for response with trailers (status='{}', body_len={}, trailers={})",
+                status,
+                response_body.len(),
+                trailers.len()
+            ));
+        }
+    }
+}
+
 type TestBody = BoxBody<Bytes, Infallible>;
 
 struct DelayedChunkBody {
@@ -737,6 +913,191 @@ impl Body for DelayedChunkBody {
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+struct TrailerThenEndBody {
+    data: Option<Bytes>,
+    trailers: Option<HeaderMap>,
+}
+
+impl TrailerThenEndBody {
+    fn new(data: Bytes, trailers: HeaderMap) -> Self {
+        Self {
+            data: Some(data),
+            trailers: Some(trailers),
+        }
+    }
+}
+
+impl Body for TrailerThenEndBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if let Some(data) = self.data.take() {
+            return Poll::Ready(Some(Ok(Frame::data(data))));
+        }
+        if let Some(trailers) = self.trailers.take() {
+            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+        }
+        Poll::Ready(None)
+    }
+}
+
+async fn start_h2_backend_with_trailers() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            let io = TokioIo::new(stream);
+            let service = service_fn(|_req: Request<Incoming>| async move {
+                let mut trailers = HeaderMap::new();
+                trailers.insert(
+                    http::HeaderName::from_static("grpc-status"),
+                    HeaderValue::from_static("0"),
+                );
+                trailers.insert(
+                    http::HeaderName::from_static("grpc-message"),
+                    HeaderValue::from_static("ok"),
+                );
+
+                let body =
+                    TrailerThenEndBody::new(Bytes::from_static(b"hello\n"), trailers).boxed();
+                Ok::<_, hyper::Error>(
+                    Response::builder()
+                        .header("content-type", "application/grpc")
+                        .body(body)
+                        .expect("response"),
+                )
+            });
+
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
+        }
+    });
+
+    addr
+}
+
+fn read_test_root_store(cert_path: &str) -> Result<RootCertStore, String> {
+    let file = File::open(cert_path).map_err(|err| format!("open cert file: {err}"))?;
+    let mut reader = BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("parse certs: {err}"))?;
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|err| format!("add root cert: {err}"))?;
+    }
+    Ok(roots)
+}
+
+async fn connect_bootstrap_h2(
+    addr: SocketAddr,
+    cert_path: &str,
+) -> Result<
+    (
+        hyper::client::conn::http2::SendRequest<Empty<Bytes>>,
+        tokio::task::JoinHandle<()>,
+    ),
+    String,
+> {
+    let roots = read_test_root_store(cert_path)?;
+    let mut tls_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+    let connector = TlsConnector::from(Arc::new(tls_config));
+
+    let server_name = ServerName::try_from("localhost")
+        .map_err(|err| format!("server name: {err}"))?
+        .to_owned();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                let tls_stream = connector
+                    .connect(server_name.clone(), stream)
+                    .await
+                    .map_err(|err| format!("tls connect: {err}"))?;
+                let (sender, conn) =
+                    http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream))
+                        .await
+                        .map_err(|err| format!("h2 handshake: {err}"))?;
+                let conn_task = tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                return Ok((sender, conn_task));
+            }
+            Err(err) if Instant::now() < deadline => {
+                let _ = err;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(err) => return Err(format!("tcp connect: {err}")),
+        }
+    }
+}
+
+async fn run_bootstrap_h2_client_collect_trailers(
+    addr: SocketAddr,
+    cert_path: &str,
+    path: &str,
+) -> Result<(StatusCode, Vec<u8>, Vec<(String, String)>), String> {
+    let (mut sender, _conn_task) = connect_bootstrap_h2(addr, cert_path).await?;
+    sender
+        .ready()
+        .await
+        .map_err(|err| format!("sender ready: {err}"))?;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(
+            Uri::builder()
+                .path_and_query(path)
+                .build()
+                .map_err(|err| format!("uri build: {err}"))?,
+        )
+        .header("host", "localhost")
+        .body(Empty::<Bytes>::new())
+        .map_err(|err| format!("request build: {err}"))?;
+
+    let mut response = sender
+        .send_request(req)
+        .await
+        .map_err(|err| format!("send request: {err}"))?;
+    let status = response.status();
+    let mut body = Vec::new();
+    let mut trailers = Vec::new();
+
+    while let Some(frame) = response.body_mut().frame().await {
+        let frame = frame.map_err(|err| format!("read frame: {err}"))?;
+        match frame.into_data() {
+            Ok(data) => body.extend_from_slice(&data),
+            Err(frame) => {
+                if let Ok(trailer_map) = frame.into_trailers() {
+                    for (name, value) in &trailer_map {
+                        trailers.push((
+                            name.as_str().to_string(),
+                            value
+                                .to_str()
+                                .map_err(|err| format!("trailer utf8: {err}"))?
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((status, body, trailers))
 }
 
 #[derive(Debug, Clone)]
@@ -1221,6 +1582,74 @@ fn http3_to_http2_roundtrip() {
     let body = run_h3_client(listen_addr).expect("client request failed");
 
     assert!(!body.is_empty(), "expected non-empty response from backend");
+}
+
+#[test]
+fn http3_to_http2_preserves_response_trailers() {
+    let dir = tempdir().expect("failed to create temp dir");
+    let (cert, key) = write_test_certs(&dir);
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let backend_addr = rt.block_on(start_h2_backend_with_trailers());
+    let config = make_config(0, backend_addr.to_string(), cert, key);
+    let listener = QUICListener::new(config).expect("failed to create listener");
+    let listen_addr = listener.socket.local_addr().unwrap();
+    let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
+
+    let (status, body, trailers) =
+        run_h3_client_collect_trailers(listen_addr, "/").expect("client trailer request failed");
+
+    assert_eq!(status, "200");
+    assert_eq!(body, b"hello\n");
+    assert!(
+        trailers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("grpc-status") && value == "0"),
+        "expected grpc-status trailer, got {trailers:?}"
+    );
+    assert!(
+        trailers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("grpc-message") && value == "ok"),
+        "expected grpc-message trailer, got {trailers:?}"
+    );
+}
+
+#[test]
+fn bootstrap_h2_preserves_response_trailers() {
+    let dir = tempdir().expect("failed to create temp dir");
+    let (cert, key) = write_test_certs(&dir);
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let backend_addr = rt.block_on(start_h2_backend_with_trailers());
+    let config = make_config(0, backend_addr.to_string(), cert.clone(), key);
+    let listener = QUICListener::new(config).expect("failed to create listener");
+    let listen_addr = listener.socket.local_addr().unwrap();
+    let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
+
+    let bootstrap_addr = SocketAddr::new(listen_addr.ip(), listen_addr.port());
+    let (status, body, trailers) = rt
+        .block_on(run_bootstrap_h2_client_collect_trailers(
+            bootstrap_addr,
+            &cert,
+            "/",
+        ))
+        .expect("bootstrap trailer request failed");
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"hello\n");
+    assert!(
+        trailers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("grpc-status") && value == "0"),
+        "expected grpc-status trailer, got {trailers:?}"
+    );
+    assert!(
+        trailers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("grpc-message") && value == "ok"),
+        "expected grpc-message trailer, got {trailers:?}"
+    );
 }
 
 /// While draining, new QUIC Initial packets must be silently dropped so no new

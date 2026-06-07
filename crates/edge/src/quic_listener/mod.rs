@@ -2821,7 +2821,7 @@ impl QUICListener {
     ///      store `response_chunk_rx`, transition to SendingResponse.
     /// 4. Flush `response_chunk_rx` chunks into H3 (`try_recv` loop).
     ///    - `Data`  → `h3.send_body(..., false)`
-    ///    - `Trailers` → `h3.send_additional_headers(..., false)`
+    ///    - `Trailers` → `h3.send_additional_headers(..., true, false)`
     ///    - `End`   → `h3.send_body(..., true)`, mark Completed
     ///    - `Error` → send 502, mark Failed
     /// 5. Remove streams in terminal phase (Completed / Failed).

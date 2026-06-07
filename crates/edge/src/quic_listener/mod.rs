@@ -4469,157 +4469,10 @@ impl QUICListener {
 
                                 // Build upstream request
                                 let request_path = if path.is_empty() { "/" } else { &path };
-                                let upstream_uri = match http::Uri::try_from(
-                                    endpoint.uri_for_path(request_path),
-                                ) {
-                                    Ok(u) => u,
-                                    Err(_) => {
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::BAD_GATEWAY)
-                                            .header("alt-svc", &alt)
-                                            .body(boxed_full(Bytes::from_static(b"bad uri\n")))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(boxed_full(Bytes::from_static(
-                                                    b"error\n",
-                                                )))
-                                            }));
-                                    }
-                                };
-
                                 let upstream_policy = upstream_policies
                                     .get(&upstream_name)
                                     .cloned()
                                     .unwrap_or_default();
-                                let request_host = req
-                                    .headers()
-                                    .get(http::header::HOST)
-                                    .and_then(|value| value.to_str().ok());
-                                let upstream_host = match resolve_upstream_host_value(
-                                    &endpoint,
-                                    &upstream_policy.host.0,
-                                    authority.as_deref(),
-                                    request_host,
-                                ) {
-                                    Ok(host) => host,
-                                    Err(_) => {
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::BAD_REQUEST)
-                                            .header("alt-svc", &alt)
-                                            .body(boxed_full(Bytes::from_static(
-                                                b"invalid host policy\n",
-                                            )))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(boxed_full(Bytes::from_static(
-                                                    b"error\n",
-                                                )))
-                                            }));
-                                    }
-                                };
-
-                                let mut upstream_req =
-                                    Request::builder().method(method.as_str()).uri(upstream_uri);
-
-                                let bootstrap_connection_tokens =
-                                    connection_header_tokens(req.headers());
-                                let mut forwarded_from_headers: Vec<Vec<u8>> = Vec::new();
-                                let mut x_forwarded_for_from_headers: Vec<Vec<u8>> = Vec::new();
-                                let mut x_forwarded_proto_from_headers: Vec<Vec<u8>> = Vec::new();
-                                let mut x_forwarded_host_from_headers: Vec<Vec<u8>> = Vec::new();
-                                for (name, value) in req.headers() {
-                                    if name == http::header::HOST {
-                                        continue;
-                                    }
-                                    if name.as_str().eq_ignore_ascii_case("forwarded") {
-                                        forwarded_from_headers.push(value.as_bytes().to_vec());
-                                        continue;
-                                    }
-                                    if name.as_str().eq_ignore_ascii_case("x-forwarded-for") {
-                                        x_forwarded_for_from_headers
-                                            .push(value.as_bytes().to_vec());
-                                        continue;
-                                    }
-                                    if name.as_str().eq_ignore_ascii_case("x-forwarded-proto") {
-                                        x_forwarded_proto_from_headers
-                                            .push(value.as_bytes().to_vec());
-                                        continue;
-                                    }
-                                    if name.as_str().eq_ignore_ascii_case("x-forwarded-host") {
-                                        x_forwarded_host_from_headers
-                                            .push(value.as_bytes().to_vec());
-                                        continue;
-                                    }
-                                    if !is_websocket_upgrade
-                                        && should_strip_bootstrap_request_header(
-                                            name,
-                                            &bootstrap_connection_tokens,
-                                        )
-                                    {
-                                        continue;
-                                    }
-                                    if is_websocket_upgrade
-                                        && (name == http::header::PROXY_AUTHORIZATION
-                                            || name == http::header::PROXY_AUTHENTICATE
-                                            || name
-                                                .as_str()
-                                                .eq_ignore_ascii_case("proxy-connection")
-                                            || name.as_str().eq_ignore_ascii_case("forwarded")
-                                            || name
-                                                .as_str()
-                                                .eq_ignore_ascii_case("x-forwarded-for")
-                                            || name
-                                                .as_str()
-                                                .eq_ignore_ascii_case("x-forwarded-proto")
-                                            || name
-                                                .as_str()
-                                                .eq_ignore_ascii_case("x-forwarded-host"))
-                                    {
-                                        continue;
-                                    }
-                                    upstream_req = upstream_req.header(name, value);
-                                }
-                                upstream_req =
-                                    upstream_req.header(http::header::HOST, upstream_host);
-
-                                let forwarded_values = match build_forwarded_header_values(
-                                    &upstream_policy.forwarded_headers.0,
-                                    ForwardedHeaderChains {
-                                        forwarded: &forwarded_from_headers,
-                                        x_forwarded_for: &x_forwarded_for_from_headers,
-                                        x_forwarded_proto: &x_forwarded_proto_from_headers,
-                                        x_forwarded_host: &x_forwarded_host_from_headers,
-                                    },
-                                    peer.ip(),
-                                    upstream_host,
-                                ) {
-                                    Ok(values) => values,
-                                    Err(err) => {
-                                        warn!("Bootstrap forwarded header policy failed: {}", err);
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::BAD_REQUEST)
-                                            .header("alt-svc", &alt)
-                                            .body(boxed_full(Bytes::from_static(
-                                                b"invalid forwarded headers\n",
-                                            )))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(boxed_full(Bytes::from_static(
-                                                    b"error\n",
-                                                )))
-                                            }));
-                                    }
-                                };
-                                if let Some(value) = forwarded_values.forwarded {
-                                    upstream_req = upstream_req.header("forwarded", value);
-                                }
-                                if let Some(value) = forwarded_values.x_forwarded_for {
-                                    upstream_req = upstream_req.header("x-forwarded-for", value);
-                                }
-                                if let Some(value) = forwarded_values.x_forwarded_proto {
-                                    upstream_req = upstream_req.header("x-forwarded-proto", value);
-                                }
-                                if let Some(value) = forwarded_values.x_forwarded_host {
-                                    upstream_req = upstream_req.header("x-forwarded-host", value);
-                                }
-
                                 if !is_websocket_upgrade
                                     && content_length
                                         .is_some_and(|value| value > max_request_body_bytes)
@@ -4637,28 +4490,218 @@ impl QUICListener {
                                         }));
                                 }
 
-                                let upstream_req = match if is_websocket_upgrade {
-                                    upstream_req.body(boxed_full(Bytes::new()))
+                                let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+                                let traceparent = req
+                                    .headers()
+                                    .get("traceparent")
+                                    .and_then(|value| value.to_str().ok());
+                                let upstream_req = if is_websocket_upgrade {
+                                    let upstream_uri = match http::Uri::try_from(
+                                        endpoint.uri_for_path(request_path),
+                                    ) {
+                                        Ok(uri) => uri,
+                                        Err(_) => {
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::BAD_GATEWAY)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(b"bad uri\n")))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
+                                    };
+                                    let request_host = req
+                                        .headers()
+                                        .get(http::header::HOST)
+                                        .and_then(|value| value.to_str().ok());
+                                    let upstream_host = match resolve_upstream_host_value(
+                                        &endpoint,
+                                        &upstream_policy.host.0,
+                                        authority.as_deref(),
+                                        request_host,
+                                    ) {
+                                        Ok(host) => host,
+                                        Err(_) => {
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::BAD_REQUEST)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"invalid host policy\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
+                                    };
+
+                                    let mut upstream_req = Request::builder()
+                                        .method(method.as_str())
+                                        .uri(upstream_uri);
+                                    let mut forwarded_from_headers: Vec<Vec<u8>> = Vec::new();
+                                    let mut x_forwarded_for_from_headers: Vec<Vec<u8>> = Vec::new();
+                                    let mut x_forwarded_proto_from_headers: Vec<Vec<u8>> =
+                                        Vec::new();
+                                    let mut x_forwarded_host_from_headers: Vec<Vec<u8>> =
+                                        Vec::new();
+                                    for (name, value) in req.headers() {
+                                        if name == http::header::HOST {
+                                            continue;
+                                        }
+                                        if name.as_str().eq_ignore_ascii_case("forwarded") {
+                                            forwarded_from_headers.push(value.as_bytes().to_vec());
+                                            continue;
+                                        }
+                                        if name.as_str().eq_ignore_ascii_case("x-forwarded-for") {
+                                            x_forwarded_for_from_headers
+                                                .push(value.as_bytes().to_vec());
+                                            continue;
+                                        }
+                                        if name.as_str().eq_ignore_ascii_case("x-forwarded-proto") {
+                                            x_forwarded_proto_from_headers
+                                                .push(value.as_bytes().to_vec());
+                                            continue;
+                                        }
+                                        if name.as_str().eq_ignore_ascii_case("x-forwarded-host") {
+                                            x_forwarded_host_from_headers
+                                                .push(value.as_bytes().to_vec());
+                                            continue;
+                                        }
+                                        if name == http::header::PROXY_AUTHORIZATION
+                                            || name == http::header::PROXY_AUTHENTICATE
+                                            || name
+                                                .as_str()
+                                                .eq_ignore_ascii_case("proxy-connection")
+                                            || name == http::header::CONTENT_LENGTH
+                                            || name == http::header::TE
+                                            || name == http::header::TRAILER
+                                            || name == http::header::TRANSFER_ENCODING
+                                            || name.as_str().eq_ignore_ascii_case("keep-alive")
+                                            || name.as_str().eq_ignore_ascii_case("forwarded")
+                                            || name.as_str().eq_ignore_ascii_case("x-forwarded-for")
+                                            || name
+                                                .as_str()
+                                                .eq_ignore_ascii_case("x-forwarded-proto")
+                                            || name
+                                                .as_str()
+                                                .eq_ignore_ascii_case("x-forwarded-host")
+                                        {
+                                            continue;
+                                        }
+                                        upstream_req = upstream_req.header(name, value);
+                                    }
+                                    upstream_req =
+                                        upstream_req.header(http::header::HOST, upstream_host);
+
+                                    let forwarded_values = match build_forwarded_header_values(
+                                        &upstream_policy.forwarded_headers.0,
+                                        ForwardedHeaderChains {
+                                            forwarded: &forwarded_from_headers,
+                                            x_forwarded_for: &x_forwarded_for_from_headers,
+                                            x_forwarded_proto: &x_forwarded_proto_from_headers,
+                                            x_forwarded_host: &x_forwarded_host_from_headers,
+                                        },
+                                        peer.ip(),
+                                        upstream_host,
+                                    ) {
+                                        Ok(values) => values,
+                                        Err(err) => {
+                                            warn!(
+                                                "Bootstrap forwarded header policy failed: {}",
+                                                err
+                                            );
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::BAD_REQUEST)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"invalid forwarded headers\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
+                                    };
+                                    if let Some(value) = forwarded_values.forwarded {
+                                        upstream_req = upstream_req.header("forwarded", value);
+                                    }
+                                    if let Some(value) = forwarded_values.x_forwarded_for {
+                                        upstream_req =
+                                            upstream_req.header("x-forwarded-for", value);
+                                    }
+                                    if let Some(value) = forwarded_values.x_forwarded_proto {
+                                        upstream_req =
+                                            upstream_req.header("x-forwarded-proto", value);
+                                    }
+                                    if let Some(value) = forwarded_values.x_forwarded_host {
+                                        upstream_req =
+                                            upstream_req.header("x-forwarded-host", value);
+                                    }
+
+                                    match upstream_req.body(boxed_full(Bytes::new())) {
+                                        Ok(request) => request,
+                                        Err(_) => {
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::BAD_GATEWAY)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"request build error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
+                                    }
                                 } else {
-                                    upstream_req.body(
+                                    let bridge_headers: Vec<quiche::h3::Header> = req
+                                        .headers()
+                                        .iter()
+                                        .map(|(name, value)| {
+                                            quiche::h3::Header::new(
+                                                name.as_str().as_bytes(),
+                                                value.as_bytes(),
+                                            )
+                                        })
+                                        .collect();
+                                    match build_h2_request_for_endpoint_with_host_policy(
+                                        &endpoint,
+                                        &upstream_policy.host.0,
+                                        &upstream_policy.forwarded_headers.0,
+                                        &method,
+                                        &path,
+                                        &bridge_headers,
                                         BootstrapStreamingBody::new(req.into_body())
                                             .map_err(|never| match never {})
                                             .boxed(),
-                                    )
-                                } {
-                                    Ok(r) => r,
-                                    Err(_) => {
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::BAD_GATEWAY)
-                                            .header("alt-svc", &alt)
-                                            .body(boxed_full(Bytes::from_static(
-                                                b"request build error\n",
-                                            )))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(boxed_full(Bytes::from_static(
-                                                    b"error\n",
+                                        None,
+                                        ForwardedContext {
+                                            client_addr: peer,
+                                            request_authority: authority.as_deref(),
+                                            request_id,
+                                            traceparent,
+                                        },
+                                    ) {
+                                        Ok(request) => request,
+                                        Err(err) => {
+                                            warn!("Bootstrap request build failed: {}", err);
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::BAD_REQUEST)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"invalid request\n",
                                                 )))
-                                            }));
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
                                     }
                                 };
                                 let mut upstream_resp = if is_websocket_upgrade {

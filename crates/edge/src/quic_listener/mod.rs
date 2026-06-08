@@ -3299,8 +3299,6 @@ impl QUICListener {
                                                             .is_err()
                                                         {
                                                             return;
-                                                        } else {
-                                                            return;
                                                         }
                                                     }
                                                 }
@@ -3336,13 +3334,15 @@ impl QUICListener {
                                                     }
                                                 }
                                             }
-                                            if let Some(headers) = buffered_trailers {
-                                                let _ = chunk_tx
+                                            if let Some(headers) = buffered_trailers
+                                                && chunk_tx
                                                     .send(ResponseChunk::Trailers { headers })
-                                                    .await;
-                                            } else {
-                                                let _ = chunk_tx.send(ResponseChunk::End).await;
+                                                    .await
+                                                    .is_err()
+                                            {
+                                                return;
                                             }
+                                            let _ = chunk_tx.send(ResponseChunk::End).await;
                                             return;
                                         }
                                     }
@@ -3547,14 +3547,10 @@ impl QUICListener {
                                 quic,
                                 stream_id,
                                 &h3_headers,
-                                true,
+                                false,
                                 false,
                             ) {
-                                Ok(_) => {
-                                    req.phase = StreamPhase::Completed;
-                                    terminal = true;
-                                    break;
-                                }
+                                Ok(_) => {}
                                 Err(quiche::h3::Error::StreamBlocked) => {
                                     req.pending_chunk = Some(ResponseChunk::Trailers { headers });
                                     break;

@@ -1955,12 +1955,18 @@ fn bootstrap_h2_preserves_response_trailers() {
 
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let backend_addr = rt.block_on(start_h2_backend_with_trailers());
-    let config = make_config(0, backend_addr.to_string(), cert.clone(), key);
+    let listen_port = find_free_tcp_port();
+    let config = make_config(
+        u32::from(listen_port),
+        backend_addr.to_string(),
+        cert.clone(),
+        key,
+    );
     let listener = make_listener_with_bootstrap(config);
     let listen_addr = listener.socket.local_addr().unwrap();
     let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
 
-    let bootstrap_addr = SocketAddr::new(listen_addr.ip(), listen_addr.port());
+    let bootstrap_addr = SocketAddr::new(listen_addr.ip(), listen_port);
     let (status, body, trailers) = rt
         .block_on(run_bootstrap_h2_client_collect_trailers(
             bootstrap_addr,
@@ -2023,14 +2029,20 @@ fn bootstrap_h2_head_suppresses_response_body() {
 
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let backend_addr = rt.block_on(start_h2_backend_with_regression_routes());
-    let config = make_config(0, backend_addr.to_string(), cert.clone(), key);
+    let listen_port = find_free_tcp_port();
+    let config = make_config(
+        u32::from(listen_port),
+        backend_addr.to_string(),
+        cert.clone(),
+        key,
+    );
     let listener = make_listener_with_bootstrap(config);
     let listen_addr = listener.socket.local_addr().unwrap();
     let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
 
     let (status, body, _trailers) = rt
         .block_on(run_bootstrap_h2_client_request(
-            SocketAddr::new(listen_addr.ip(), listen_addr.port()),
+            SocketAddr::new(listen_addr.ip(), listen_port),
             &cert,
             "HEAD",
             "/stream",

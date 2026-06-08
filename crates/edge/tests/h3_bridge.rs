@@ -1123,32 +1123,38 @@ async fn start_h2_backend_with_trailers() -> SocketAddr {
     let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        if let Ok((stream, _)) = listener.accept().await {
-            let io = TokioIo::new(stream);
-            let service = service_fn(|_req: Request<Incoming>| async move {
-                let mut trailers = HeaderMap::new();
-                trailers.insert(
-                    http::HeaderName::from_static("grpc-status"),
-                    HeaderValue::from_static("0"),
-                );
-                trailers.insert(
-                    http::HeaderName::from_static("grpc-message"),
-                    HeaderValue::from_static("ok"),
-                );
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let service = service_fn(|_req: Request<Incoming>| async move {
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert(
+                        http::HeaderName::from_static("grpc-status"),
+                        HeaderValue::from_static("0"),
+                    );
+                    trailers.insert(
+                        http::HeaderName::from_static("grpc-message"),
+                        HeaderValue::from_static("ok"),
+                    );
 
-                let body =
-                    TrailerThenEndBody::new(Bytes::from_static(b"hello\n"), trailers).boxed();
-                Ok::<_, hyper::Error>(
-                    Response::builder()
-                        .header("content-type", "application/grpc")
-                        .body(body)
-                        .expect("response"),
-                )
+                    let body =
+                        TrailerThenEndBody::new(Bytes::from_static(b"hello\n"), trailers).boxed();
+                    Ok::<_, hyper::Error>(
+                        Response::builder()
+                            .header("content-type", "application/grpc")
+                            .body(body)
+                            .expect("response"),
+                    )
+                });
+
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, service)
+                    .await;
             });
-
-            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                .serve_connection(io, service)
-                .await;
         }
     });
 
@@ -1210,6 +1216,9 @@ async fn start_h2_backend_with_grpc_routes() -> SocketAddr {
                                 .await;
                             Response::new(Full::new(Bytes::from_static(b"late\n")).boxed())
                         }
+                        "/health" => {
+                            Response::new(Full::new(Bytes::from_static(b"ok\n")).boxed())
+                        }
                         _ => Response::builder()
                             .status(StatusCode::NOT_FOUND)
                             .body(Full::new(Bytes::from_static(b"missing\n")).boxed())
@@ -1264,7 +1273,7 @@ async fn connect_bootstrap_h2(
         .map_err(|err| format!("server name: {err}"))?
         .to_owned();
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match TcpStream::connect(addr).await {
             Ok(stream) => {
@@ -2069,6 +2078,7 @@ fn http3_to_http2_preserves_grpc_error_trailers() {
             quiche::h3::Header::new(b":authority", b"localhost"),
             quiche::h3::Header::new(b":path", b"/grpc-error"),
             quiche::h3::Header::new(b"content-type", b"application/grpc"),
+            quiche::h3::Header::new(b"content-length", b"0"),
         ],
         true,
         Duration::from_secs(REQUEST_TIMEOUT_SECS),
@@ -2116,6 +2126,7 @@ fn grpc_timeout_returns_recoverable_proxy_error() {
             quiche::h3::Header::new(b":authority", b"localhost"),
             quiche::h3::Header::new(b":path", b"/grpc-timeout"),
             quiche::h3::Header::new(b"content-type", b"application/grpc"),
+            quiche::h3::Header::new(b"content-length", b"0"),
         ],
         true,
         Duration::from_secs(REQUEST_TIMEOUT_SECS + 4),

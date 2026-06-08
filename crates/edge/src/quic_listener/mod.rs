@@ -3191,6 +3191,7 @@ impl QUICListener {
                                 let mut body: hyper::body::Incoming = body;
                                 let mut response_bytes_received: usize = 0;
                                 let mut buffered_chunks: Vec<Bytes> = Vec::new();
+                                let mut buffered_trailers: Option<Vec<(Vec<u8>, Vec<u8>)>> = None;
                                 let mut saw_body_progress = false;
                                 loop {
                                     let frame_fut = BodyExt::frame(&mut body);
@@ -3286,15 +3287,21 @@ impl QUICListener {
                                                 if let Ok(trailers) = frame.into_trailers() {
                                                     let trailer_headers =
                                                         collect_h3_trailers(&trailers);
-                                                    if !trailer_headers.is_empty()
-                                                        && chunk_tx
+                                                    if !trailer_headers.is_empty() {
+                                                        if defer_headers_until_body_validated {
+                                                            buffered_trailers =
+                                                                Some(trailer_headers);
+                                                        } else if chunk_tx
                                                             .send(ResponseChunk::Trailers {
                                                                 headers: trailer_headers,
                                                             })
                                                             .await
                                                             .is_err()
-                                                    {
-                                                        return;
+                                                        {
+                                                            return;
+                                                        } else {
+                                                            return;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -3329,7 +3336,13 @@ impl QUICListener {
                                                     }
                                                 }
                                             }
-                                            let _ = chunk_tx.send(ResponseChunk::End).await;
+                                            if let Some(headers) = buffered_trailers {
+                                                let _ = chunk_tx
+                                                    .send(ResponseChunk::Trailers { headers })
+                                                    .await;
+                                            } else {
+                                                let _ = chunk_tx.send(ResponseChunk::End).await;
+                                            }
                                             return;
                                         }
                                     }
@@ -3537,7 +3550,11 @@ impl QUICListener {
                                 true,
                                 false,
                             ) {
-                                Ok(_) => {}
+                                Ok(_) => {
+                                    req.phase = StreamPhase::Completed;
+                                    terminal = true;
+                                    break;
+                                }
                                 Err(quiche::h3::Error::StreamBlocked) => {
                                     req.pending_chunk = Some(ResponseChunk::Trailers { headers });
                                     break;

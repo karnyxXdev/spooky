@@ -42,6 +42,7 @@ use spooky_config::config::{
     Backend, ClientAuth, Config, HealthCheck, Listen, LoadBalancing, Log, LogFormat, Security, Tls,
     UpstreamTls,
 };
+use spooky_config::runtime::RuntimeConfig;
 use spooky_edge::QUICListener;
 use spooky_edge::constants::{
     BACKEND_TIMEOUT_SECS, MAX_DATAGRAM_SIZE_BYTES, MAX_REQUEST_BODY_BYTES,
@@ -173,6 +174,25 @@ impl Drop for ListenerTaskGuard {
         self.stop.store(true, Ordering::Relaxed);
         self.handle.abort();
     }
+}
+
+fn make_listener_with_bootstrap(config: Config) -> QUICListener {
+    let runtime_config = RuntimeConfig::from_config(&config).expect("runtime config");
+    let listener_config = runtime_config
+        .listener_runtime_configs()
+        .into_iter()
+        .next()
+        .expect("listener runtime config");
+    let shared_state = Arc::new(
+        QUICListener::build_shared_state(&runtime_config).expect("shared runtime state"),
+    );
+    QUICListener::spawn_control_plane_tasks(&runtime_config, &shared_state, 1)
+        .expect("control plane tasks");
+    QUICListener::spawn_bootstrap_tls_listener(&listener_config, &shared_state)
+        .expect("bootstrap tls listener");
+    let socket = QUICListener::bind_socket(&listener_config, false).expect("bind socket");
+    QUICListener::new_with_socket_and_shared_state(listener_config, socket, shared_state)
+        .expect("listener with shared state")
 }
 
 async fn start_h2_backend() -> SocketAddr {
@@ -1936,7 +1956,7 @@ fn bootstrap_h2_preserves_response_trailers() {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let backend_addr = rt.block_on(start_h2_backend_with_trailers());
     let config = make_config(0, backend_addr.to_string(), cert.clone(), key);
-    let listener = QUICListener::new(config).expect("failed to create listener");
+    let listener = make_listener_with_bootstrap(config);
     let listen_addr = listener.socket.local_addr().unwrap();
     let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
 
@@ -2004,7 +2024,7 @@ fn bootstrap_h2_head_suppresses_response_body() {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let backend_addr = rt.block_on(start_h2_backend_with_regression_routes());
     let config = make_config(0, backend_addr.to_string(), cert.clone(), key);
-    let listener = QUICListener::new(config).expect("failed to create listener");
+    let listener = make_listener_with_bootstrap(config);
     let listen_addr = listener.socket.local_addr().unwrap();
     let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
 

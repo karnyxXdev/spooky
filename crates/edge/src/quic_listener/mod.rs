@@ -4908,10 +4908,10 @@ impl QUICListener {
                                 // Build downstream response with Alt-Svc injected
                                 if !suppress_downstream_body
                                     && let Some(content_length) = upstream_resp
-                                    .headers()
-                                    .get(http::header::CONTENT_LENGTH)
-                                    .and_then(|v| v.to_str().ok())
-                                    .and_then(|s| s.parse::<usize>().ok())
+                                        .headers()
+                                        .get(http::header::CONTENT_LENGTH)
+                                        .and_then(|v| v.to_str().ok())
+                                        .and_then(|s| s.parse::<usize>().ok())
                                     && content_length > max_response_body_bytes
                                 {
                                     return Ok(Response::builder()

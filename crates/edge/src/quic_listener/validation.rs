@@ -98,10 +98,7 @@ pub(super) fn validate_request_headers(
                 )?);
             }
             b"connection" => {
-                let value = strict_header_value(
-                    header.value(),
-                    b"invalid connection header\n",
-                )?;
+                let value = strict_header_value(header.value(), b"invalid connection header\n")?;
                 if value
                     .split(',')
                     .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
@@ -377,14 +374,13 @@ fn validate_request_parts(
     if resilience.enforce_authority_host_match
         && let (Some(authority_value), Some(host_value)) =
             (parsed_authority.as_ref(), parsed_host.as_ref())
+        && !authorities_match(authority_value, host_value)
     {
-        if !authorities_match(authority_value, host_value) {
-            return Err((
-                http::StatusCode::BAD_REQUEST,
-                errors.authority_mismatch,
-                false,
-            ));
-        }
+        return Err((
+            http::StatusCode::BAD_REQUEST,
+            errors.authority_mismatch,
+            false,
+        ));
     }
 
     if !resilience.method_allowed(&method) {

@@ -245,7 +245,8 @@ impl RouteTrie {
                 break;
             };
             node = next;
-            best = best_matching_route_with_reason(&node.routes, path, method, upstream_methods, best);
+            best =
+                best_matching_route_with_reason(&node.routes, path, method, upstream_methods, best);
         }
 
         best
@@ -286,17 +287,14 @@ fn best_matching_route_with_reason(
         }
         best = match best {
             None => Some((route, None)),
-            Some((current_route, current_reason)) => {
-                match compare_route(current_route, route) {
-                    RoutePreference::KeepCurrent => Some((
-                        current_route,
-                        current_reason.or_else(|| {
-                            route_preference_reason(compare_route(route, current_route))
-                        }),
-                    )),
-                    preference => Some((route, route_preference_reason(preference))),
-                }
-            }
+            Some((current_route, current_reason)) => match compare_route(current_route, route) {
+                RoutePreference::KeepCurrent => Some((
+                    current_route,
+                    current_reason
+                        .or_else(|| route_preference_reason(compare_route(route, current_route))),
+                )),
+                preference => Some((route, route_preference_reason(preference))),
+            },
         };
     }
     best
@@ -643,29 +641,31 @@ fn prefer_host_lookup_result(
         (None, None) => None,
         (Some(route), None) => Some(route),
         (None, Some(candidate)) => Some(candidate),
-        (Some(current), Some(candidate)) => match compare_route_candidate(current.candidate, candidate.candidate)
-        {
-            RoutePreference::KeepCurrent => {
-                let decision_reason = current.decision_reason.or(candidate.decision_reason).or_else(
-                    || {
-                        route_preference_reason(compare_route_candidate(
-                            candidate.candidate,
-                            current.candidate,
-                        ))
-                    },
-                );
-                Some(HostLookupResult {
-                    candidate: current.candidate,
-                    decision_reason,
-                })
+        (Some(current), Some(candidate)) => {
+            match compare_route_candidate(current.candidate, candidate.candidate) {
+                RoutePreference::KeepCurrent => {
+                    let decision_reason = current
+                        .decision_reason
+                        .or(candidate.decision_reason)
+                        .or_else(|| {
+                            route_preference_reason(compare_route_candidate(
+                                candidate.candidate,
+                                current.candidate,
+                            ))
+                        });
+                    Some(HostLookupResult {
+                        candidate: current.candidate,
+                        decision_reason,
+                    })
+                }
+                preference => Some(HostLookupResult {
+                    candidate: candidate.candidate,
+                    decision_reason: candidate
+                        .decision_reason
+                        .or_else(|| route_preference_reason(preference)),
+                }),
             }
-            preference => Some(HostLookupResult {
-                candidate: candidate.candidate,
-                decision_reason: candidate
-                    .decision_reason
-                    .or_else(|| route_preference_reason(preference)),
-            }),
-        },
+        }
     }
 }
 

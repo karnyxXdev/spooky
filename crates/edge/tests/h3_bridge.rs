@@ -183,9 +183,8 @@ fn make_listener_with_bootstrap(config: Config) -> QUICListener {
         .into_iter()
         .next()
         .expect("listener runtime config");
-    let shared_state = Arc::new(
-        QUICListener::build_shared_state(&runtime_config).expect("shared runtime state"),
-    );
+    let shared_state =
+        Arc::new(QUICListener::build_shared_state(&runtime_config).expect("shared runtime state"));
     QUICListener::spawn_control_plane_tasks(&runtime_config, &shared_state, 1)
         .expect("control plane tasks");
     QUICListener::spawn_bootstrap_tls_listener(&listener_config, &shared_state)
@@ -1232,13 +1231,10 @@ async fn start_h2_backend_with_grpc_routes() -> SocketAddr {
                                 .expect("grpc error response")
                         }
                         "/grpc-timeout" => {
-                            tokio::time::sleep(Duration::from_secs(BACKEND_TIMEOUT_SECS + 1))
-                                .await;
+                            tokio::time::sleep(Duration::from_secs(BACKEND_TIMEOUT_SECS + 1)).await;
                             Response::new(Full::new(Bytes::from_static(b"late\n")).boxed())
                         }
-                        "/health" => {
-                            Response::new(Full::new(Bytes::from_static(b"ok\n")).boxed())
-                        }
+                        "/health" => Response::new(Full::new(Bytes::from_static(b"ok\n")).boxed()),
                         _ => Response::builder()
                             .status(StatusCode::NOT_FOUND)
                             .body(Full::new(Bytes::from_static(b"missing\n")).boxed())
@@ -2018,7 +2014,10 @@ fn http3_head_suppresses_response_body() {
     .expect("HEAD request failed");
 
     assert_eq!(response.status, "200");
-    assert!(response.body.is_empty(), "HEAD response must not include a body");
+    assert!(
+        response.body.is_empty(),
+        "HEAD response must not include a body"
+    );
     assert!(!response.reset, "HEAD response should complete cleanly");
 }
 
@@ -2051,7 +2050,10 @@ fn bootstrap_h2_head_suppresses_response_body() {
         .expect("bootstrap HEAD request failed");
 
     assert_eq!(status, StatusCode::OK);
-    assert!(body.is_empty(), "bootstrap HEAD response must not include a body");
+    assert!(
+        body.is_empty(),
+        "bootstrap HEAD response must not include a body"
+    );
 }
 
 #[test]
@@ -2087,7 +2089,10 @@ fn http3_rejects_upgrade_style_requests() {
         "expected explicit Upgrade rejection body, got {:?}",
         String::from_utf8_lossy(&response.body)
     );
-    assert!(!response.reset, "upgrade rejection should be an HTTP response");
+    assert!(
+        !response.reset,
+        "upgrade rejection should be an HTTP response"
+    );
 }
 
 #[test]
@@ -2118,7 +2123,10 @@ fn http3_to_http2_preserves_grpc_error_trailers() {
     .expect("grpc error request failed");
 
     assert_eq!(response.status, "200");
-    assert!(response.body.is_empty(), "grpc error should be trailer-only");
+    assert!(
+        response.body.is_empty(),
+        "grpc error should be trailer-only"
+    );
     assert!(
         response
             .trailers
@@ -2128,10 +2136,9 @@ fn http3_to_http2_preserves_grpc_error_trailers() {
         response.trailers
     );
     assert!(
-        response
-            .trailers
-            .iter()
-            .any(|(name, value)| name.eq_ignore_ascii_case("grpc-message") && value == "unavailable"),
+        response.trailers.iter().any(
+            |(name, value)| name.eq_ignore_ascii_case("grpc-message") && value == "unavailable"
+        ),
         "expected grpc-message trailer, got {:?}",
         response.trailers
     );
@@ -2170,7 +2177,10 @@ fn grpc_timeout_returns_recoverable_proxy_error() {
         String::from_utf8_lossy(&response.body).contains("upstream timeout"),
         "timeout body should explain the proxy failure"
     );
-    assert!(!response.reset, "grpc timeout should surface as an HTTP response");
+    assert!(
+        !response.reset,
+        "grpc timeout should surface as an HTTP response"
+    );
 }
 
 #[test]

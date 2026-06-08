@@ -69,6 +69,12 @@ listen:
 
 Spooky also automatically starts a **bootstrap TLS listener** on the same address/port for HTTP/1.1 and HTTP/2 clients. This is how browsers connect before they learn about HTTP/3 via the `Alt-Svc` header. You do not configure it separately — it shares the same cert/key.
 
+Protocol boundary:
+- native ingress is HTTP/3 only
+- HTTP/3 `Upgrade` / `Connection: upgrade` requests are rejected explicitly
+- bootstrap HTTP/1.1 may proxy WebSocket upgrades
+- native H3 does not currently support WebSocket-style upgrade semantics
+
 **Binding port 443:**
 ```bash
 # Option A: run as root (drops privileges after binding — see security section)
@@ -285,6 +291,27 @@ forwarded_headers:
 
 forwarded_headers:
   mode: preserve     # pass inbound chain unchanged (no client IP added)
+```
+
+#### Request validation and protocol semantics
+
+- `:authority` and `Host` must match when both are present.
+- `CONNECT` requires `host:port` authority and is denied unless explicitly allowed by policy.
+- `HEAD` responses are headers-only downstream, even if the upstream emitted a body.
+- HTTP/3 rejects `Upgrade`-style requests; use the bootstrap HTTP/1.1 path for WebSocket upgrades.
+
+Example protocol policy:
+
+```yaml
+resilience:
+  protocol:
+    allow_0rtt: false
+    early_data_safe_methods: ["GET", "HEAD"]
+    enforce_authority_host_match: true
+    allow_connect: true
+    connect_allowed_ports: [443]
+    connect_allowed_authorities:
+      - "proxy.internal.example:443"
 ```
 
 #### Per-upstream TLS override

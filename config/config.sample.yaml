@@ -189,6 +189,9 @@ resilience:
         max_headers_count: 128
         max_headers_bytes: 16384
         enforce_authority_host_match: true
+        allow_connect: false
+        connect_allowed_ports: []
+        connect_allowed_authorities: []
         allowed_methods: []
         denied_path_prefixes: []
     circuit_breaker:

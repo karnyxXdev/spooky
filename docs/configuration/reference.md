@@ -970,8 +970,18 @@ Request validation and early-data policy.
 | `max_headers_count` | integer | No | `128` | Maximum number of request headers |
 | `max_headers_bytes` | integer | No | `16384` | Maximum total size of request headers (bytes) |
 | `enforce_authority_host_match` | bool | No | `true` | Reject requests where `:authority` differs from `Host` |
+| `allow_connect` | bool | No | `false` | Enable CONNECT proxy tunneling |
+| `connect_allowed_ports` | list | No | `[]` | Optional CONNECT target port allowlist |
+| `connect_allowed_authorities` | list | No | `[]` | Optional exact CONNECT `host:port` allowlist |
 | `allowed_methods` | list | No | `[]` | Allowed HTTP methods; empty means all methods allowed |
 | `denied_path_prefixes` | list | No | `[]` | Path prefixes that are always rejected with 403 |
+
+Request-shape rules enforced by the runtime:
+
+- HTTP/3 requests are rejected when `:authority` and `Host` differ and `enforce_authority_host_match` is enabled.
+- `CONNECT` requires `:authority`/`Host` in `host:port` form and must also satisfy the CONNECT allowlists when enabled.
+- Native HTTP/3 ingress rejects `Upgrade` / `Connection: upgrade` style requests. WebSocket-style upgrades are only supported on the bootstrap HTTP/1.1 compatibility path, not on native H3.
+- `HEAD` responses terminate after headers even if the upstream attempted to send a body.
 
 ### watchdog
 

@@ -51,6 +51,10 @@ use spooky_edge::constants::{
     REQUEST_TIMEOUT_SECS, UDP_READ_TIMEOUT_MS,
 };
 
+type TrailerPairs = Vec<(String, String)>;
+type H3TrailerResponse = (String, Vec<u8>, TrailerPairs);
+type BootstrapResponse = (StatusCode, Vec<u8>, TrailerPairs);
+
 fn write_test_certs(dir: &TempDir) -> (String, String) {
     let mut params = CertificateParams::new(vec!["localhost".into()]);
     params
@@ -740,7 +744,7 @@ fn run_h3_client_two_chunk_post(
 fn run_h3_client_collect_trailers(
     addr: SocketAddr,
     path: &str,
-) -> Result<(String, Vec<u8>, Vec<(String, String)>), String> {
+) -> Result<H3TrailerResponse, String> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     let local_addr = socket.local_addr().map_err(|e| e.to_string())?;
 
@@ -776,7 +780,7 @@ fn run_h3_client_collect_trailers(
     let mut request_stream_id = None;
     let mut status = String::new();
     let mut response_body = Vec::new();
-    let mut trailers: Vec<(String, String)> = Vec::new();
+    let mut trailers: TrailerPairs = Vec::new();
     let start = Instant::now();
     let timeout = Duration::from_secs(REQUEST_TIMEOUT_SECS);
 
@@ -1319,7 +1323,7 @@ async fn run_bootstrap_h2_client_collect_trailers(
     addr: SocketAddr,
     cert_path: &str,
     path: &str,
-) -> Result<(StatusCode, Vec<u8>, Vec<(String, String)>), String> {
+) -> Result<BootstrapResponse, String> {
     let (mut sender, _conn_task) = connect_bootstrap_h2(addr, cert_path).await?;
     sender
         .ready()
@@ -1375,7 +1379,7 @@ async fn run_bootstrap_h2_client_request(
     method: &str,
     path: &str,
     extra_headers: &[(&str, &str)],
-) -> Result<(StatusCode, Vec<u8>, Vec<(String, String)>), String> {
+) -> Result<BootstrapResponse, String> {
     let (mut sender, _conn_task) = connect_bootstrap_h2(addr, cert_path).await?;
     sender
         .ready()

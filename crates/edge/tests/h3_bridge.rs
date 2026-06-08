@@ -886,6 +886,177 @@ fn run_h3_client_collect_trailers(
     }
 }
 
+#[derive(Debug, Default)]
+struct H3CollectedResponse {
+    status: String,
+    body: Vec<u8>,
+    trailers: Vec<(String, String)>,
+    reset: bool,
+}
+
+fn run_h3_client_collect_response(
+    addr: SocketAddr,
+    req: Vec<quiche::h3::Header>,
+    fin: bool,
+    timeout: Duration,
+) -> Result<H3CollectedResponse, String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    let local_addr = socket.local_addr().map_err(|e| e.to_string())?;
+
+    let mut config =
+        quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| format!("config: {e:?}"))?;
+    config.verify_peer(false);
+    config
+        .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+        .map_err(|e| format!("alpn: {e:?}"))?;
+    config.set_max_idle_timeout(QUIC_IDLE_TIMEOUT_MS);
+    config.set_max_recv_udp_payload_size(MAX_UDP_PAYLOAD_BYTES);
+    config.set_max_send_udp_payload_size(MAX_UDP_PAYLOAD_BYTES);
+    config.set_initial_max_data(QUIC_INITIAL_MAX_DATA);
+    config.set_initial_max_stream_data_bidi_local(QUIC_INITIAL_STREAM_DATA);
+    config.set_initial_max_stream_data_bidi_remote(QUIC_INITIAL_STREAM_DATA);
+    config.set_initial_max_stream_data_uni(QUIC_INITIAL_STREAM_DATA);
+    config.set_initial_max_streams_bidi(QUIC_INITIAL_MAX_STREAMS_BIDI);
+    config.set_initial_max_streams_uni(QUIC_INITIAL_MAX_STREAMS_UNI);
+    config.set_disable_active_migration(true);
+
+    let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
+    rand::thread_rng().fill_bytes(&mut scid_bytes);
+    let scid = quiche::ConnectionId::from_ref(&scid_bytes);
+
+    let mut conn = quiche::connect(Some("localhost"), &scid, local_addr, addr, &mut config)
+        .map_err(|e| format!("connect: {e:?}"))?;
+    let h3_config = quiche::h3::Config::new().map_err(|e| format!("h3: {e:?}"))?;
+    let mut h3_conn: Option<quiche::h3::Connection> = None;
+
+    let mut out = [0u8; MAX_UDP_PAYLOAD_BYTES];
+    let mut buf = [0u8; MAX_DATAGRAM_SIZE_BYTES];
+    let mut request_sent = false;
+    let mut request_stream_id = None;
+    let start = Instant::now();
+    let mut response = H3CollectedResponse::default();
+
+    loop {
+        while let Ok((write, send_info)) = conn.send(&mut out) {
+            socket
+                .send_to(&out[..write], send_info.to)
+                .map_err(|e| format!("send_to: {e:?}"))?;
+        }
+
+        let read_timeout = conn
+            .timeout()
+            .unwrap_or(Duration::from_millis(50))
+            .min(Duration::from_millis(50));
+        let read_timeout = if read_timeout.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            read_timeout
+        };
+        socket
+            .set_read_timeout(Some(read_timeout))
+            .map_err(|e| format!("timeout: {e:?}"))?;
+
+        match socket.recv_from(&mut buf) {
+            Ok((len, from)) => {
+                let recv_info = quiche::RecvInfo {
+                    from,
+                    to: local_addr,
+                };
+                conn.recv(&mut buf[..len], recv_info)
+                    .map_err(|e| format!("recv: {e:?}"))?;
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                conn.on_timeout();
+            }
+            Err(e) => return Err(format!("recv: {e:?}")),
+        }
+
+        if conn.is_established() && h3_conn.is_none() {
+            h3_conn = Some(
+                quiche::h3::Connection::with_transport(&mut conn, &h3_config)
+                    .map_err(|e| format!("h3 conn: {e:?}"))?,
+            );
+        }
+
+        if let Some(h3c) = h3_conn.as_mut() {
+            if conn.is_established() && !request_sent {
+                let stream_id = h3c
+                    .send_request(&mut conn, &req, fin)
+                    .map_err(|e| format!("send_request: {e:?}"))?;
+                request_stream_id = Some(stream_id);
+                request_sent = true;
+            }
+
+            loop {
+                match h3c.poll(&mut conn) {
+                    Ok((sid, quiche::h3::Event::Headers { list, .. })) => {
+                        if Some(sid) != request_stream_id {
+                            continue;
+                        }
+                        if response.status.is_empty() {
+                            for header in &list {
+                                if header.name() == b":status" {
+                                    response.status =
+                                        String::from_utf8_lossy(header.value()).to_string();
+                                }
+                            }
+                        } else {
+                            for header in &list {
+                                response.trailers.push((
+                                    String::from_utf8_lossy(header.name()).to_string(),
+                                    String::from_utf8_lossy(header.value()).to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    Ok((sid, quiche::h3::Event::Data)) => {
+                        if Some(sid) != request_stream_id {
+                            continue;
+                        }
+                        loop {
+                            match h3c.recv_body(&mut conn, sid, &mut buf) {
+                                Ok(read) => response.body.extend_from_slice(&buf[..read]),
+                                Err(quiche::h3::Error::Done) => break,
+                                Err(e) => return Err(format!("recv_body: {e:?}")),
+                            }
+                        }
+                    }
+                    Ok((sid, quiche::h3::Event::Finished)) => {
+                        if Some(sid) != request_stream_id {
+                            continue;
+                        }
+                        return Ok(response);
+                    }
+                    Ok((sid, quiche::h3::Event::Reset(_))) => {
+                        if Some(sid) != request_stream_id {
+                            continue;
+                        }
+                        response.reset = true;
+                        return Ok(response);
+                    }
+                    Ok((_sid, quiche::h3::Event::PriorityUpdate)) => {}
+                    Ok((_sid, quiche::h3::Event::GoAway)) => {}
+                    Err(quiche::h3::Error::Done) => break,
+                    Err(e) => return Err(format!("poll: {e:?}")),
+                }
+            }
+        }
+
+        if start.elapsed() > timeout {
+            return Err(format!(
+                "timeout waiting for response (status='{}', body_len={}, trailers={}, reset={})",
+                response.status,
+                response.body.len(),
+                response.trailers.len(),
+                response.reset
+            ));
+        }
+    }
+}
+
 type TestBody = BoxBody<Bytes, Infallible>;
 
 struct DelayedChunkBody {
@@ -984,6 +1155,79 @@ async fn start_h2_backend_with_trailers() -> SocketAddr {
     addr
 }
 
+async fn start_h2_backend_with_grpc_routes() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let service = service_fn(|req: Request<Incoming>| async move {
+                    let response: Response<TestBody> = match req.uri().path() {
+                        "/grpc-ok" => {
+                            let mut trailers = HeaderMap::new();
+                            trailers.insert(
+                                http::HeaderName::from_static("grpc-status"),
+                                HeaderValue::from_static("0"),
+                            );
+                            trailers.insert(
+                                http::HeaderName::from_static("grpc-message"),
+                                HeaderValue::from_static("ok"),
+                            );
+                            Response::builder()
+                                .header("content-type", "application/grpc")
+                                .body(
+                                    TrailerThenEndBody::new(
+                                        Bytes::from_static(b"\x00\x00\x00\x00\x00"),
+                                        trailers,
+                                    )
+                                    .boxed(),
+                                )
+                                .expect("grpc ok response")
+                        }
+                        "/grpc-error" => {
+                            let mut trailers = HeaderMap::new();
+                            trailers.insert(
+                                http::HeaderName::from_static("grpc-status"),
+                                HeaderValue::from_static("14"),
+                            );
+                            trailers.insert(
+                                http::HeaderName::from_static("grpc-message"),
+                                HeaderValue::from_static("unavailable"),
+                            );
+                            Response::builder()
+                                .header("content-type", "application/grpc")
+                                .body(TrailerThenEndBody::new(Bytes::new(), trailers).boxed())
+                                .expect("grpc error response")
+                        }
+                        "/grpc-timeout" => {
+                            tokio::time::sleep(Duration::from_secs(BACKEND_TIMEOUT_SECS + 1))
+                                .await;
+                            Response::new(Full::new(Bytes::from_static(b"late\n")).boxed())
+                        }
+                        _ => Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(Full::new(Bytes::from_static(b"missing\n")).boxed())
+                            .expect("not found response"),
+                    };
+                    Ok::<_, hyper::Error>(response)
+                });
+
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, service)
+                    .await;
+            });
+        }
+    });
+
+    addr
+}
+
 fn read_test_root_store(cert_path: &str) -> Result<RootCertStore, String> {
     let file = File::open(cert_path).map_err(|err| format!("open cert file: {err}"))?;
     let mut reader = BufReader::new(file);
@@ -1069,6 +1313,66 @@ async fn run_bootstrap_h2_client_collect_trailers(
         .body(Empty::<Bytes>::new())
         .map_err(|err| format!("request build: {err}"))?;
 
+    let mut response = sender
+        .send_request(req)
+        .await
+        .map_err(|err| format!("send request: {err}"))?;
+    let status = response.status();
+    let mut body = Vec::new();
+    let mut trailers = Vec::new();
+
+    while let Some(frame) = response.body_mut().frame().await {
+        let frame = frame.map_err(|err| format!("read frame: {err}"))?;
+        match frame.into_data() {
+            Ok(data) => body.extend_from_slice(&data),
+            Err(frame) => {
+                if let Ok(trailer_map) = frame.into_trailers() {
+                    for (name, value) in &trailer_map {
+                        trailers.push((
+                            name.as_str().to_string(),
+                            value
+                                .to_str()
+                                .map_err(|err| format!("trailer utf8: {err}"))?
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((status, body, trailers))
+}
+
+async fn run_bootstrap_h2_client_request(
+    addr: SocketAddr,
+    cert_path: &str,
+    method: &str,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+) -> Result<(StatusCode, Vec<u8>, Vec<(String, String)>), String> {
+    let (mut sender, _conn_task) = connect_bootstrap_h2(addr, cert_path).await?;
+    sender
+        .ready()
+        .await
+        .map_err(|err| format!("sender ready: {err}"))?;
+
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(
+            Uri::builder()
+                .path_and_query(path)
+                .build()
+                .map_err(|err| format!("uri build: {err}"))?,
+        )
+        .header("host", "localhost");
+    for (name, value) in extra_headers {
+        builder = builder.header(*name, *value);
+    }
+
+    let req = builder
+        .body(Empty::<Bytes>::new())
+        .map_err(|err| format!("request build: {err}"))?;
     let mut response = sender
         .send_request(req)
         .await
@@ -1650,6 +1954,243 @@ fn bootstrap_h2_preserves_response_trailers() {
             .any(|(name, value)| name.eq_ignore_ascii_case("grpc-message") && value == "ok"),
         "expected grpc-message trailer, got {trailers:?}"
     );
+}
+
+#[test]
+fn http3_head_suppresses_response_body() {
+    let dir = tempdir().expect("failed to create temp dir");
+    let (cert, key) = write_test_certs(&dir);
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let backend_addr = rt.block_on(start_h2_backend_with_regression_routes());
+    let config = make_config(0, backend_addr.to_string(), cert, key);
+    let listener = QUICListener::new(config).expect("failed to create listener");
+    let listen_addr = listener.socket.local_addr().unwrap();
+    let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
+
+    let response = run_h3_client_collect_response(
+        listen_addr,
+        vec![
+            quiche::h3::Header::new(b":method", b"HEAD"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/stream"),
+            quiche::h3::Header::new(b"user-agent", b"spooky-regression-test"),
+        ],
+        true,
+        Duration::from_secs(REQUEST_TIMEOUT_SECS),
+    )
+    .expect("HEAD request failed");
+
+    assert_eq!(response.status, "200");
+    assert!(response.body.is_empty(), "HEAD response must not include a body");
+    assert!(!response.reset, "HEAD response should complete cleanly");
+}
+
+#[test]
+fn bootstrap_h2_head_suppresses_response_body() {
+    let dir = tempdir().expect("failed to create temp dir");
+    let (cert, key) = write_test_certs(&dir);
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let backend_addr = rt.block_on(start_h2_backend_with_regression_routes());
+    let config = make_config(0, backend_addr.to_string(), cert.clone(), key);
+    let listener = QUICListener::new(config).expect("failed to create listener");
+    let listen_addr = listener.socket.local_addr().unwrap();
+    let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
+
+    let (status, body, _trailers) = rt
+        .block_on(run_bootstrap_h2_client_request(
+            SocketAddr::new(listen_addr.ip(), listen_addr.port()),
+            &cert,
+            "HEAD",
+            "/stream",
+            &[],
+        ))
+        .expect("bootstrap HEAD request failed");
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_empty(), "bootstrap HEAD response must not include a body");
+}
+
+#[test]
+fn http3_rejects_upgrade_style_requests() {
+    let dir = tempdir().expect("failed to create temp dir");
+    let (cert, key) = write_test_certs(&dir);
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let backend_addr = rt.block_on(start_h2_backend());
+    let config = make_config(0, backend_addr.to_string(), cert, key);
+    let listener = QUICListener::new(config).expect("failed to create listener");
+    let listen_addr = listener.socket.local_addr().unwrap();
+    let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
+
+    let response = run_h3_client_collect_response(
+        listen_addr,
+        vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/"),
+            quiche::h3::Header::new(b"connection", b"Upgrade"),
+            quiche::h3::Header::new(b"upgrade", b"websocket"),
+        ],
+        true,
+        Duration::from_secs(REQUEST_TIMEOUT_SECS),
+    )
+    .expect("upgrade-style request failed");
+
+    assert_eq!(response.status, "400");
+    assert!(
+        String::from_utf8_lossy(&response.body).contains("Upgrade"),
+        "expected explicit Upgrade rejection body, got {:?}",
+        String::from_utf8_lossy(&response.body)
+    );
+    assert!(!response.reset, "upgrade rejection should be an HTTP response");
+}
+
+#[test]
+fn http3_to_http2_preserves_grpc_error_trailers() {
+    let dir = tempdir().expect("failed to create temp dir");
+    let (cert, key) = write_test_certs(&dir);
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let backend_addr = rt.block_on(start_h2_backend_with_grpc_routes());
+    let config = make_config(0, backend_addr.to_string(), cert, key);
+    let listener = QUICListener::new(config).expect("failed to create listener");
+    let listen_addr = listener.socket.local_addr().unwrap();
+    let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
+
+    let response = run_h3_client_collect_response(
+        listen_addr,
+        vec![
+            quiche::h3::Header::new(b":method", b"POST"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/grpc-error"),
+            quiche::h3::Header::new(b"content-type", b"application/grpc"),
+        ],
+        true,
+        Duration::from_secs(REQUEST_TIMEOUT_SECS),
+    )
+    .expect("grpc error request failed");
+
+    assert_eq!(response.status, "200");
+    assert!(response.body.is_empty(), "grpc error should be trailer-only");
+    assert!(
+        response
+            .trailers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("grpc-status") && value == "14"),
+        "expected grpc-status=14 trailer, got {:?}",
+        response.trailers
+    );
+    assert!(
+        response
+            .trailers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("grpc-message") && value == "unavailable"),
+        "expected grpc-message trailer, got {:?}",
+        response.trailers
+    );
+}
+
+#[test]
+fn grpc_timeout_returns_recoverable_proxy_error() {
+    let dir = tempdir().expect("failed to create temp dir");
+    let (cert, key) = write_test_certs(&dir);
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let backend_addr = rt.block_on(start_h2_backend_with_grpc_routes());
+    let mut config = make_config(0, backend_addr.to_string(), cert, key);
+    config.performance.backend_timeout_ms = 150;
+    let listener = QUICListener::new(config).expect("failed to create listener");
+    let listen_addr = listener.socket.local_addr().unwrap();
+    let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
+
+    let response = run_h3_client_collect_response(
+        listen_addr,
+        vec![
+            quiche::h3::Header::new(b":method", b"POST"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/grpc-timeout"),
+            quiche::h3::Header::new(b"content-type", b"application/grpc"),
+        ],
+        true,
+        Duration::from_secs(REQUEST_TIMEOUT_SECS + 4),
+    )
+    .expect("grpc timeout request failed");
+
+    assert_eq!(response.status, "503");
+    assert!(
+        String::from_utf8_lossy(&response.body).contains("upstream timeout"),
+        "timeout body should explain the proxy failure"
+    );
+    assert!(!response.reset, "grpc timeout should surface as an HTTP response");
+}
+
+#[test]
+fn grpc_client_cancel_before_response_releases_stream() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(&dir);
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+    let backend_addr = rt.block_on(start_h2_backend_with_regression_routes());
+    let mut config = make_config(0, backend_addr.to_string(), cert, key);
+    config.performance.global_inflight_limit = 1;
+
+    let listener = QUICListener::new(config).expect("listener");
+    let listen_addr = listener.socket.local_addr().unwrap();
+    let _guard = ListenerTaskGuard::spawn(&rt, listener);
+
+    let (socket, local_addr, mut conn, mut h3) =
+        make_quic_client(listen_addr).expect("quic client");
+    let mut out = [0u8; MAX_UDP_PAYLOAD_BYTES];
+    let mut buf = [0u8; MAX_DATAGRAM_SIZE_BYTES];
+
+    let grpc_headers = vec![
+        quiche::h3::Header::new(b":method", b"POST"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", b"localhost"),
+        quiche::h3::Header::new(b":path", b"/slow"),
+        quiche::h3::Header::new(b"content-type", b"application/grpc"),
+        quiche::h3::Header::new(b"content-length", b"0"),
+    ];
+    let stream_id = h3
+        .send_request(&mut conn, &grpc_headers, false)
+        .expect("send grpc request");
+
+    flush_quic(&mut conn, &socket, &mut out);
+    conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0)
+        .expect("stream shutdown");
+    flush_quic(&mut conn, &socket, &mut out);
+
+    let pump_end = Instant::now() + Duration::from_millis(200);
+    let mut events = Vec::new();
+    let mut io = PumpIo {
+        socket: &socket,
+        local_addr,
+        out: &mut out,
+        buf: &mut buf,
+    };
+    pump_h3_until(
+        &mut conn,
+        &mut h3,
+        &mut io,
+        stream_id,
+        pump_end,
+        &mut events,
+    );
+
+    let followup = run_h3_client_concurrent_get(
+        listen_addr,
+        &["/fast"],
+        Duration::from_secs(REQUEST_TIMEOUT_SECS + 4),
+    )
+    .expect("follow-up /fast request failed");
+    let fast = observation_for(&followup, "/fast");
+    assert_eq!(fast.status.as_deref(), Some("200"));
 }
 
 /// While draining, new QUIC Initial packets must be silently dropped so no new

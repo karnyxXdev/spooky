@@ -77,6 +77,7 @@ pub struct Metrics {
     pub health_failure_timeout: AtomicU64,
     pub health_failure_transport: AtomicU64,
     pub health_failure_tls: AtomicU64,
+    pub downstream_tls_handshake_success: AtomicU64,
     pub backend_dns_refresh_success: AtomicU64,
     pub backend_dns_refresh_failure: AtomicU64,
     pub backend_dns_refresh_address_changes: AtomicU64,
@@ -92,6 +93,9 @@ pub struct Metrics {
     backend_dns_state: RwLock<HashMap<String, BackendDnsState>>,
     backend_rotation_state: RwLock<HashMap<String, BackendRotationState>>,
     backend_connect_attempts: RwLock<HashMap<BackendConnectAttemptKey, u64>>,
+    downstream_tls_handshake_failures: RwLock<HashMap<DownstreamTlsHandshakeFailureKey, u64>>,
+    downstream_tls_cert_selections: RwLock<HashMap<DownstreamTlsCertSelectionKey, u64>>,
+    downstream_tls_alpn_negotiated: RwLock<HashMap<DownstreamTlsAlpnKey, u64>>,
 }
 
 #[derive(Default, Clone)]
@@ -110,6 +114,24 @@ pub(crate) struct BackendConnectAttemptKey {
     pub(crate) backend: String,
     pub(crate) hostname: String,
     pub(crate) resolved_addr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct DownstreamTlsHandshakeFailureKey {
+    pub(crate) listener: String,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct DownstreamTlsCertSelectionKey {
+    pub(crate) listener: String,
+    pub(crate) selection: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct DownstreamTlsAlpnKey {
+    pub(crate) listener: String,
+    pub(crate) protocol: String,
 }
 
 const LATENCY_BUCKETS_MS: [u64; 14] = [
@@ -362,6 +384,7 @@ impl Metrics {
             health_failure_timeout: AtomicU64::new(0),
             health_failure_transport: AtomicU64::new(0),
             health_failure_tls: AtomicU64::new(0),
+            downstream_tls_handshake_success: AtomicU64::new(0),
             backend_dns_refresh_success: AtomicU64::new(0),
             backend_dns_refresh_failure: AtomicU64::new(0),
             backend_dns_refresh_address_changes: AtomicU64::new(0),
@@ -377,6 +400,9 @@ impl Metrics {
             backend_dns_state: RwLock::new(HashMap::new()),
             backend_rotation_state: RwLock::new(HashMap::new()),
             backend_connect_attempts: RwLock::new(HashMap::new()),
+            downstream_tls_handshake_failures: RwLock::new(HashMap::new()),
+            downstream_tls_cert_selections: RwLock::new(HashMap::new()),
+            downstream_tls_alpn_negotiated: RwLock::new(HashMap::new()),
         }
     }
 
@@ -685,6 +711,64 @@ impl Metrics {
             .unwrap_or_default()
     }
 
+    pub(crate) fn snapshot_downstream_tls_handshake_failures(
+        &self,
+    ) -> Vec<(DownstreamTlsHandshakeFailureKey, u64)> {
+        self.downstream_tls_handshake_failures
+            .read()
+            .map(|guard| {
+                let mut entries = guard
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value))
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| {
+                    left.listener
+                        .cmp(&right.listener)
+                        .then_with(|| left.reason.cmp(&right.reason))
+                });
+                entries
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn snapshot_downstream_tls_cert_selections(
+        &self,
+    ) -> Vec<(DownstreamTlsCertSelectionKey, u64)> {
+        self.downstream_tls_cert_selections
+            .read()
+            .map(|guard| {
+                let mut entries = guard
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value))
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| {
+                    left.listener
+                        .cmp(&right.listener)
+                        .then_with(|| left.selection.cmp(&right.selection))
+                });
+                entries
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn snapshot_downstream_tls_alpn(&self) -> Vec<(DownstreamTlsAlpnKey, u64)> {
+        self.downstream_tls_alpn_negotiated
+            .read()
+            .map(|guard| {
+                let mut entries = guard
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value))
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| {
+                    left.listener
+                        .cmp(&right.listener)
+                        .then_with(|| left.protocol.cmp(&right.protocol))
+                });
+                entries
+            })
+            .unwrap_or_default()
+    }
+
     fn current_worker_stats(&self) -> Option<&WorkerStatsAtomic> {
         let idx = WORKER_METRICS_SLOT.with(|current| current.get());
         self.worker_stats
@@ -872,6 +956,44 @@ impl Metrics {
                 self.health_failure_tls.fetch_add(1, Ordering::Relaxed);
             }
             HealthFailureReason::CircuitOpen => {}
+        }
+    }
+
+    pub fn inc_downstream_tls_handshake_success(&self) {
+        self.downstream_tls_handshake_success
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_downstream_tls_handshake_failure(&self, listener: &str, reason: &str) {
+        if let Ok(mut guard) = self.downstream_tls_handshake_failures.write() {
+            *guard
+                .entry(DownstreamTlsHandshakeFailureKey {
+                    listener: listener.to_string(),
+                    reason: reason.to_string(),
+                })
+                .or_default() += 1;
+        }
+    }
+
+    pub fn record_downstream_tls_cert_selection(&self, listener: &str, selection: &str) {
+        if let Ok(mut guard) = self.downstream_tls_cert_selections.write() {
+            *guard
+                .entry(DownstreamTlsCertSelectionKey {
+                    listener: listener.to_string(),
+                    selection: selection.to_string(),
+                })
+                .or_default() += 1;
+        }
+    }
+
+    pub fn record_downstream_tls_alpn(&self, listener: &str, protocol: &str) {
+        if let Ok(mut guard) = self.downstream_tls_alpn_negotiated.write() {
+            *guard
+                .entry(DownstreamTlsAlpnKey {
+                    listener: listener.to_string(),
+                    protocol: protocol.to_string(),
+                })
+                .or_default() += 1;
         }
     }
 

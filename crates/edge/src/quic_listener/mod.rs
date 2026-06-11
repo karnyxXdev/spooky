@@ -1208,6 +1208,8 @@ impl QUICListener {
             routing_scids: HashSet::from([Arc::from(&scid_bytes[..])]),
             packets_since_rotation: 0,
             last_scid_rotation: Instant::now(),
+            tls_observed: false,
+            tls_client_auth_failure_recorded: false,
             last_peer_error_snapshot: None,
             last_local_error_snapshot: None,
         };
@@ -1595,10 +1597,19 @@ impl QUICListener {
             connection.quic.is_closed()
         );
 
+        self.maybe_record_quic_tls_observation(&mut connection);
+
         if self.require_client_cert
             && connection.quic.is_established()
             && connection.quic.peer_cert().is_none()
         {
+            if !connection.tls_client_auth_failure_recorded {
+                self.metrics.record_downstream_tls_handshake_failure(
+                    &Self::listener_label(&self.config),
+                    "missing_client_cert",
+                );
+                connection.tls_client_auth_failure_recorded = true;
+            }
             warn!(
                 "closing connection {}: downstream mTLS requires a client certificate",
                 connection.quic.trace_id()
@@ -4390,6 +4401,97 @@ impl QUICListener {
         Self::build_server_tls_acceptor(config, true, vec![b"h2".to_vec(), b"http/1.1".to_vec()])
     }
 
+    fn listener_label(config: &ListenerRuntimeConfig) -> String {
+        format!(
+            "{}:{}",
+            config.listen.listen.address, config.listen.listen.port
+        )
+    }
+
+    fn classify_downstream_tls_cert_selection<'a>(
+        listener_tls: &'a RuntimeListenerTls,
+        requested_sni: Option<&str>,
+    ) -> (&'static str, &'a RuntimeTlsIdentity) {
+        let normalized_sni =
+            requested_sni.map(|value| value.trim().trim_end_matches('.').to_ascii_lowercase());
+        if let Some(sni) = normalized_sni.as_deref()
+            && let Some(identity) = listener_tls.sni_identities.get(sni)
+        {
+            return ("exact_sni", identity);
+        }
+
+        if requested_sni.is_none() {
+            if listener_tls.sni_identities.is_empty() {
+                ("default_only", &listener_tls.default_identity)
+            } else {
+                ("fallback_no_sni", &listener_tls.default_identity)
+            }
+        } else if listener_tls.sni_identities.is_empty() {
+            ("default_only", &listener_tls.default_identity)
+        } else {
+            ("fallback_unmatched_sni", &listener_tls.default_identity)
+        }
+    }
+
+    fn classify_downstream_tls_failure_reason(error: &str) -> &'static str {
+        let lower = error.to_ascii_lowercase();
+        if lower.contains("peer sent no certificates")
+            || lower.contains("peer sent no certificate")
+            || lower.contains("certificate required")
+        {
+            "missing_client_cert"
+        } else if lower.contains("certificate") || lower.contains("cert") {
+            "client_certificate"
+        } else if lower.contains("alpn") {
+            "alpn"
+        } else {
+            "handshake"
+        }
+    }
+
+    fn maybe_record_quic_tls_observation(&self, connection: &mut QuicConnection) {
+        if connection.tls_observed || !connection.quic.is_established() {
+            return;
+        }
+
+        let listener_label = Self::listener_label(&self.config);
+        let listener_tls = match Self::runtime_listener_tls(&self.config) {
+            Ok(listener_tls) => listener_tls,
+            Err(err) => {
+                debug!(
+                    "Skipping QUIC TLS observation for listener {}: {}",
+                    listener_label, err
+                );
+                return;
+            }
+        };
+        let requested_sni = connection.quic.server_name();
+        let (selection, identity) =
+            Self::classify_downstream_tls_cert_selection(&listener_tls, requested_sni);
+        let alpn = std::str::from_utf8(connection.quic.application_proto())
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("none");
+        let client_cert_present = connection.quic.peer_cert().is_some();
+
+        self.metrics.inc_downstream_tls_handshake_success();
+        self.metrics
+            .record_downstream_tls_cert_selection(&listener_label, selection);
+        self.metrics
+            .record_downstream_tls_alpn(&listener_label, alpn);
+        debug!(
+            "QUIC TLS established listener={} peer={} sni={:?} selection={} cert='{}' alpn={} client_cert_present={}",
+            listener_label,
+            connection.peer_address,
+            requested_sni,
+            selection,
+            identity.cert_path,
+            alpn,
+            client_cert_present
+        );
+        connection.tls_observed = true;
+    }
+
     pub fn spawn_bootstrap_tls_listener(
         config: &ListenerRuntimeConfig,
         shared_state: &SharedRuntimeState,
@@ -4412,6 +4514,8 @@ impl QUICListener {
         let max_connections = config.performance.max_active_connections.max(1);
         let connection_timeout =
             Duration::from_millis(config.performance.client_body_idle_timeout_ms.max(1));
+        let listener_label = Self::listener_label(config);
+        let listener_tls = Self::runtime_listener_tls(config)?;
 
         let h2_pool = Arc::clone(&shared_state.h2_pool);
         let backend_endpoints = Arc::clone(&shared_state.backend_endpoints);
@@ -4496,18 +4600,54 @@ impl QUICListener {
                 let max_request_body_bytes = max_request_body_bytes;
                 let max_response_body_bytes = max_response_body_bytes;
                 let timeout = connection_timeout;
+                let listener_label = listener_label.clone();
+                let listener_tls = listener_tls.clone();
 
                 tokio::spawn(async move {
                     let _permit = permit;
                     let tls_stream = match acceptor.accept(stream).await {
                         Ok(s) => s,
                         Err(err) => {
-                            debug!("Bootstrap TLS handshake failed from {}: {}", peer, err);
+                            let err_text = err.to_string();
+                            let reason = Self::classify_downstream_tls_failure_reason(&err_text);
+                            metrics
+                                .record_downstream_tls_handshake_failure(&listener_label, reason);
+                            debug!(
+                                "Bootstrap TLS handshake failed listener={} peer={} reason={} error={}",
+                                listener_label, peer, reason, err_text
+                            );
                             return;
                         }
                     };
 
+                    let requested_sni = tls_stream.get_ref().1.server_name().map(str::to_string);
+                    let (selection, identity) = Self::classify_downstream_tls_cert_selection(
+                        &listener_tls,
+                        requested_sni.as_deref(),
+                    );
                     let negotiated = tls_stream.get_ref().1.alpn_protocol().map(|p| p.to_vec());
+                    let negotiated_label = negotiated
+                        .as_deref()
+                        .and_then(|value| std::str::from_utf8(value).ok())
+                        .unwrap_or("none");
+                    let client_cert_present = tls_stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .is_some_and(|certs| !certs.is_empty());
+                    metrics.inc_downstream_tls_handshake_success();
+                    metrics.record_downstream_tls_cert_selection(&listener_label, selection);
+                    metrics.record_downstream_tls_alpn(&listener_label, negotiated_label);
+                    debug!(
+                        "Bootstrap TLS handshake success listener={} peer={} sni={:?} selection={} cert='{}' alpn={} client_cert_present={}",
+                        listener_label,
+                        peer,
+                        requested_sni,
+                        selection,
+                        identity.cert_path,
+                        negotiated_label,
+                        client_cert_present
+                    );
                     let use_h2 = negotiated.as_deref() == Some(b"h2");
 
                     let io = TokioIo::new(tls_stream);

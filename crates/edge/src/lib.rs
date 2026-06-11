@@ -245,6 +245,27 @@ mod tests {
     }
 
     #[test]
+    fn metrics_render_includes_downstream_tls_telemetry() {
+        let metrics = Metrics::default();
+        metrics.inc_downstream_tls_handshake_success();
+        metrics.record_downstream_tls_handshake_failure("127.0.0.1:9889", "missing_client_cert");
+        metrics.record_downstream_tls_cert_selection("127.0.0.1:9889", "exact_sni");
+        metrics.record_downstream_tls_alpn("127.0.0.1:9889", "h2");
+
+        let output = metrics.render_prometheus();
+        assert!(output.contains("spooky_downstream_tls_handshake_success_total 1"));
+        assert!(output.contains(
+            "spooky_downstream_tls_handshake_failure_total{listener=\"127.0.0.1:9889\",reason=\"missing_client_cert\"} 1"
+        ));
+        assert!(output.contains(
+            "spooky_downstream_tls_certificate_selection_total{listener=\"127.0.0.1:9889\",selection=\"exact_sni\"} 1"
+        ));
+        assert!(output.contains(
+            "spooky_downstream_tls_alpn_total{listener=\"127.0.0.1:9889\",protocol=\"h2\"} 1"
+        ));
+    }
+
+    #[test]
     fn stable_hash64_is_deterministic() {
         let first = stable_hash64(b"/api/orders");
         let second = stable_hash64(b"/api/orders");

@@ -475,6 +475,51 @@ impl Metrics {
             self.health_failure_tls.load(Ordering::Relaxed)
         ));
         out.push_str(
+            "# HELP spooky_downstream_tls_handshake_success_total Successful downstream TLS handshakes.\n",
+        );
+        out.push_str("# TYPE spooky_downstream_tls_handshake_success_total counter\n");
+        out.push_str(&format!(
+            "spooky_downstream_tls_handshake_success_total {}\n",
+            self.downstream_tls_handshake_success
+                .load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP spooky_downstream_tls_handshake_failure_total Downstream TLS handshake failures grouped by listener and reason.\n",
+        );
+        out.push_str("# TYPE spooky_downstream_tls_handshake_failure_total counter\n");
+        for (key, value) in self.snapshot_downstream_tls_handshake_failures() {
+            out.push_str(&format!(
+                "spooky_downstream_tls_handshake_failure_total{{listener=\"{}\",reason=\"{}\"}} {}\n",
+                escape_prometheus_label(&key.listener),
+                escape_prometheus_label(&key.reason),
+                value
+            ));
+        }
+        out.push_str(
+            "# HELP spooky_downstream_tls_certificate_selection_total Downstream TLS certificate selection outcomes grouped by listener.\n",
+        );
+        out.push_str("# TYPE spooky_downstream_tls_certificate_selection_total counter\n");
+        for (key, value) in self.snapshot_downstream_tls_cert_selections() {
+            out.push_str(&format!(
+                "spooky_downstream_tls_certificate_selection_total{{listener=\"{}\",selection=\"{}\"}} {}\n",
+                escape_prometheus_label(&key.listener),
+                escape_prometheus_label(&key.selection),
+                value
+            ));
+        }
+        out.push_str(
+            "# HELP spooky_downstream_tls_alpn_total Negotiated downstream ALPN protocols grouped by listener.\n",
+        );
+        out.push_str("# TYPE spooky_downstream_tls_alpn_total counter\n");
+        for (key, value) in self.snapshot_downstream_tls_alpn() {
+            out.push_str(&format!(
+                "spooky_downstream_tls_alpn_total{{listener=\"{}\",protocol=\"{}\"}} {}\n",
+                escape_prometheus_label(&key.listener),
+                escape_prometheus_label(&key.protocol),
+                value
+            ));
+        }
+        out.push_str(
             "# HELP spooky_backend_dns_refresh_success_total Total successful backend DNS refreshes.\n",
         );
         out.push_str("# TYPE spooky_backend_dns_refresh_success_total counter\n");

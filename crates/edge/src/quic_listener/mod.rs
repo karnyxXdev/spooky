@@ -55,8 +55,11 @@ use tracing::{Instrument, info_span};
 
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
-    config::UpstreamTls,
-    runtime::{ListenerRuntimeConfig, RuntimeConfig, RuntimeListenerTls, RuntimeUpstreamPolicy},
+    config::{ClientAuth, UpstreamTls},
+    runtime::{
+        ListenerRuntimeConfig, RuntimeConfig, RuntimeListenerTls, RuntimeTlsIdentity,
+        RuntimeUpstreamPolicy,
+    },
 };
 
 use crate::{
@@ -96,11 +99,42 @@ use validation::{
     RequestBufferError, extract_header_value, generated_span_id, generated_trace_id,
     parse_traceparent, validate_http_request, validate_request_headers,
 };
+use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
 #[derive(Debug)]
 struct FallbackServerCertResolver {
     sni_resolver: ResolvesServerCertUsingSni,
     fallback: Arc<CertifiedKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TlsCertificateMetadata {
+    serial_hex: String,
+    not_before_unix_seconds: u64,
+    not_after_unix_seconds: u64,
+    dns_names: Vec<String>,
+}
+
+#[derive(Clone)]
+struct LoadedListenerIdentity {
+    identity: RuntimeTlsIdentity,
+    certified_key: Arc<CertifiedKey>,
+    metadata: TlsCertificateMetadata,
+}
+
+#[derive(Clone)]
+struct LoadedClientAuthCa {
+    ca_file: String,
+    certificate_count: usize,
+    roots: Arc<RootCertStore>,
+}
+
+#[derive(Clone)]
+struct LoadedListenerTlsMaterial {
+    default_identity: LoadedListenerIdentity,
+    sni_identities: HashMap<String, LoadedListenerIdentity>,
+    client_auth: ClientAuth,
+    client_auth_ca: Option<LoadedClientAuthCa>,
 }
 
 impl ResolvesServerCert for FallbackServerCertResolver {
@@ -922,9 +956,22 @@ impl QUICListener {
         let mut quic_config = Config::new(quiche::PROTOCOL_VERSION)
             .map_err(|err| ProxyError::Transport(format!("failed to create QUIC config: {err}")))?;
 
-        let listener_tls = Self::runtime_listener_tls(config)?;
-        let default_cert = listener_tls.default_identity.cert_path.as_str();
-        let default_key = listener_tls.default_identity.key_path.as_str();
+        let loaded_tls = Self::load_listener_tls_material(config)?;
+        debug!(
+            "Loaded downstream default TLS identity cert='{}' serial={} san_dns={:?} sni_identities={}",
+            loaded_tls.default_identity.identity.cert_path,
+            loaded_tls.default_identity.metadata.serial_hex,
+            loaded_tls.default_identity.metadata.dns_names,
+            loaded_tls.sni_identities.len()
+        );
+        if let Some(client_auth_ca) = loaded_tls.client_auth_ca.as_ref() {
+            debug!(
+                "Loaded downstream client-auth CA bundle '{}' with {} certificates",
+                client_auth_ca.ca_file, client_auth_ca.certificate_count
+            );
+        }
+        let default_cert = loaded_tls.default_identity.identity.cert_path.as_str();
+        let default_key = loaded_tls.default_identity.identity.key_path.as_str();
 
         match quic_config.load_cert_chain_from_pem_file(default_cert) {
             Ok(_) => debug!("Certificate loaded successfully"),
@@ -967,24 +1014,24 @@ impl QUICListener {
         quic_config.set_initial_max_streams_uni(config.performance.quic_initial_max_streams_uni);
         quic_config.set_disable_active_migration(true);
 
-        if listener_tls.client_auth.enabled {
-            let ca_file = listener_tls.client_auth.ca_file.as_ref().ok_or_else(|| {
+        if loaded_tls.client_auth.enabled {
+            let client_auth_ca = loaded_tls.client_auth_ca.as_ref().ok_or_else(|| {
                 ProxyError::Tls(
                     "listen.tls.client_auth.ca_file is required when mTLS is enabled".to_string(),
                 )
             })?;
             quic_config
-                .load_verify_locations_from_file(ca_file)
+                .load_verify_locations_from_file(&client_auth_ca.ca_file)
                 .map_err(|err| {
                     ProxyError::Tls(format!(
                         "failed to load listen.tls.client_auth.ca_file '{}': {}",
-                        ca_file, err
+                        client_auth_ca.ca_file, err
                     ))
                 })?;
             quic_config.verify_peer(true);
             info!(
                 "Downstream mTLS enabled (require_client_cert={})",
-                listener_tls.client_auth.require_client_cert
+                loaded_tls.client_auth.require_client_cert
             );
         } else {
             quic_config.verify_peer(false);
@@ -4139,49 +4186,163 @@ impl QUICListener {
         Ok(certified)
     }
 
+    fn load_tls_certificate_metadata(
+        cert: &CertificateDer<'static>,
+        cert_field: &str,
+        cert_path: &str,
+    ) -> Result<TlsCertificateMetadata, ProxyError> {
+        let (_, certificate) = parse_x509_certificate(cert.as_ref()).map_err(|err| {
+            ProxyError::Tls(format!(
+                "failed to parse X.509 metadata from {cert_field} '{}': {}",
+                cert_path, err
+            ))
+        })?;
+
+        let validity = certificate.validity();
+        let mut dns_names = Vec::new();
+        if let Ok(Some(san)) = certificate.tbs_certificate.subject_alternative_name() {
+            for general_name in &san.value.general_names {
+                if let GeneralName::DNSName(name) = general_name {
+                    dns_names.push(name.to_string());
+                }
+            }
+        }
+        for common_name in certificate.subject().iter_common_name() {
+            if let Ok(name) = common_name.as_str() {
+                dns_names.push(name.to_string());
+            }
+        }
+        dns_names.sort();
+        dns_names.dedup();
+
+        Ok(TlsCertificateMetadata {
+            serial_hex: certificate.tbs_certificate.raw_serial_as_string(),
+            not_before_unix_seconds: validity.not_before.timestamp().max(0) as u64,
+            not_after_unix_seconds: validity.not_after.timestamp().max(0) as u64,
+            dns_names,
+        })
+    }
+
+    fn load_listener_identity(
+        identity: &RuntimeTlsIdentity,
+        cert_field: &str,
+        key_field: &str,
+    ) -> Result<LoadedListenerIdentity, ProxyError> {
+        let certified_key = Arc::new(Self::load_certified_key(
+            &identity.cert_path,
+            &identity.key_path,
+            cert_field,
+            key_field,
+        )?);
+        let leaf = certified_key.cert.first().ok_or_else(|| {
+            ProxyError::Tls(format!(
+                "{cert_field} '{}' did not produce a leaf certificate",
+                identity.cert_path
+            ))
+        })?;
+        let metadata = Self::load_tls_certificate_metadata(leaf, cert_field, &identity.cert_path)?;
+
+        Ok(LoadedListenerIdentity {
+            identity: identity.clone(),
+            certified_key,
+            metadata,
+        })
+    }
+
+    fn load_client_auth_ca(
+        client_auth: &ClientAuth,
+    ) -> Result<Option<LoadedClientAuthCa>, ProxyError> {
+        if !client_auth.enabled {
+            return Ok(None);
+        }
+
+        let ca_file = client_auth.ca_file.as_ref().ok_or_else(|| {
+            ProxyError::Tls(
+                "listen.tls.client_auth.ca_file is required when mTLS is enabled".to_string(),
+            )
+        })?;
+        let ca_bytes = std::fs::read(ca_file).map_err(|err| {
+            ProxyError::Tls(format!(
+                "failed to read listen.tls.client_auth.ca_file '{}': {}",
+                ca_file, err
+            ))
+        })?;
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut std::io::BufReader::new(ca_bytes.as_slice()))
+                .collect::<Result<_, _>>()
+                .map_err(|err| {
+                    ProxyError::Tls(format!(
+                        "failed to parse listen.tls.client_auth.ca_file PEM: {}",
+                        err
+                    ))
+                })?;
+        let mut roots = RootCertStore::empty();
+        for cert in certs {
+            roots.add(cert).map_err(|err| {
+                ProxyError::Tls(format!(
+                    "failed to add certificate from listen.tls.client_auth.ca_file '{}': {}",
+                    ca_file, err
+                ))
+            })?;
+        }
+
+        Ok(Some(LoadedClientAuthCa {
+            ca_file: ca_file.clone(),
+            certificate_count: roots.len(),
+            roots: Arc::new(roots),
+        }))
+    }
+
+    fn load_listener_tls_material(
+        config: &ListenerRuntimeConfig,
+    ) -> Result<LoadedListenerTlsMaterial, ProxyError> {
+        let listener_tls = Self::runtime_listener_tls(config)?;
+        let default_identity = Self::load_listener_identity(
+            &listener_tls.default_identity,
+            "listen.tls.default_identity.cert",
+            "listen.tls.default_identity.key",
+        )?;
+
+        let mut sni_identities = HashMap::new();
+        for (server_name, identity) in &listener_tls.sni_identities {
+            let cert_field = format!("listen.tls.certificates['{server_name}'].cert");
+            let key_field = format!("listen.tls.certificates['{server_name}'].key");
+            sni_identities.insert(
+                server_name.clone(),
+                Self::load_listener_identity(identity, &cert_field, &key_field)?,
+            );
+        }
+
+        Ok(LoadedListenerTlsMaterial {
+            default_identity,
+            sni_identities,
+            client_auth_ca: Self::load_client_auth_ca(&listener_tls.client_auth)?,
+            client_auth: listener_tls.client_auth,
+        })
+    }
+
     fn build_server_tls_acceptor(
         config: &ListenerRuntimeConfig,
         enforce_client_auth: bool,
         alpn_protocols: Vec<Vec<u8>>,
     ) -> Result<TlsAcceptor, ProxyError> {
-        use rustls_pemfile::certs;
-        use std::io::BufReader;
+        let loaded_tls = Self::load_listener_tls_material(config)?;
+        debug!(
+            "Building rustls downstream acceptor with default cert='{}' serial={} and {} explicit SNI identities",
+            loaded_tls.default_identity.identity.cert_path,
+            loaded_tls.default_identity.metadata.serial_hex,
+            loaded_tls.sni_identities.len()
+        );
 
-        let listener_tls = Self::runtime_listener_tls(config)?;
-
-        let builder = if enforce_client_auth && listener_tls.client_auth.enabled {
-            let ca_file = listener_tls.client_auth.ca_file.as_ref().ok_or_else(|| {
+        let builder = if enforce_client_auth && loaded_tls.client_auth.enabled {
+            let client_auth_ca = loaded_tls.client_auth_ca.clone().ok_or_else(|| {
                 ProxyError::Tls(
                     "listen.tls.client_auth.ca_file is required when mTLS is enabled".to_string(),
                 )
             })?;
-            let ca_bytes = std::fs::read(ca_file).map_err(|err| {
-                ProxyError::Tls(format!(
-                    "failed to read listen.tls.client_auth.ca_file '{}': {}",
-                    ca_file, err
-                ))
-            })?;
-            let client_ca_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-                certs(&mut BufReader::new(ca_bytes.as_slice()))
-                    .collect::<Result<_, _>>()
-                    .map_err(|err| {
-                        ProxyError::Tls(format!(
-                            "failed to parse listen.tls.client_auth.ca_file PEM: {}",
-                            err
-                        ))
-                    })?;
-            let mut roots = RootCertStore::empty();
-            for cert in client_ca_certs {
-                roots.add(cert).map_err(|err| {
-                    ProxyError::Tls(format!(
-                        "failed to add certificate from listen.tls.client_auth.ca_file '{}': {}",
-                        ca_file, err
-                    ))
-                })?;
-            }
 
-            let verifier_builder = WebPkiClientVerifier::builder(Arc::new(roots));
-            let verifier = if listener_tls.client_auth.require_client_cert {
+            let verifier_builder = WebPkiClientVerifier::builder(client_auth_ca.roots.clone());
+            let verifier = if loaded_tls.client_auth.require_client_cert {
                 verifier_builder.build()
             } else {
                 verifier_builder.allow_unauthenticated().build()
@@ -4198,49 +4359,25 @@ impl QUICListener {
             RustlsServerConfig::builder().with_no_client_auth()
         };
 
-        let fallback = Self::load_certified_key(
-            &listener_tls.default_identity.cert_path,
-            &listener_tls.default_identity.key_path,
-            "listen.tls.default_identity.cert",
-            "listen.tls.default_identity.key",
-        )?;
-
-        let mut tls_config = if listener_tls.sni_identities.is_empty() {
-            let certs = fallback.cert.clone();
-            let key = Self::load_tls_private_key_from_pem_file(
-                listener_tls.default_identity.key_path.as_str(),
-                "listen.tls.default_identity.key",
-            )?;
-            builder.with_single_cert(certs, key).map_err(|err| {
-                ProxyError::Tls(format!("failed to build rustls ServerConfig: {}", err))
-            })?
-        } else {
-            let mut sni_resolver = ResolvesServerCertUsingSni::new();
-            for (server_name, identity) in &listener_tls.sni_identities {
-                let cert_field = format!("listen.tls.certificates['{server_name}'].cert");
-                let key_field = format!("listen.tls.certificates['{server_name}'].key");
-                let certified = Self::load_certified_key(
-                    &identity.cert_path,
-                    &identity.key_path,
-                    &cert_field,
-                    &key_field,
-                )?;
-
-                sni_resolver
-                    .add(server_name.as_str(), certified.clone())
-                    .map_err(|err| {
-                        ProxyError::Tls(format!(
-                            "failed to add SNI certificate mapping for '{server_name}': {}",
-                            err
-                        ))
-                    })?;
-            }
-            let resolver = Arc::new(FallbackServerCertResolver {
-                sni_resolver,
-                fallback: Arc::new(fallback),
-            });
-            builder.with_cert_resolver(resolver)
-        };
+        let mut sni_resolver = ResolvesServerCertUsingSni::new();
+        for (server_name, identity) in &loaded_tls.sni_identities {
+            sni_resolver
+                .add(
+                    server_name.as_str(),
+                    identity.certified_key.as_ref().clone(),
+                )
+                .map_err(|err| {
+                    ProxyError::Tls(format!(
+                        "failed to add SNI certificate mapping for '{server_name}': {}",
+                        err
+                    ))
+                })?;
+        }
+        let resolver = Arc::new(FallbackServerCertResolver {
+            sni_resolver,
+            fallback: loaded_tls.default_identity.certified_key.clone(),
+        });
+        let mut tls_config = builder.with_cert_resolver(resolver);
 
         tls_config.alpn_protocols = alpn_protocols;
 
@@ -5468,6 +5605,62 @@ mod tests {
             vec![b"h2".to_vec()],
         );
         assert!(acceptor.is_ok());
+    }
+
+    #[test]
+    fn load_listener_tls_material_extracts_leaf_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let (api_cert, api_key) = write_test_cert_for_name(dir.path(), "api", "api.example.com");
+        let runtime_config = tls_test_listener_config(&tls_test_config(
+            String::new(),
+            String::new(),
+            vec![TlsCertificate {
+                server_name: "api.example.com".to_string(),
+                cert: api_cert.clone(),
+                key: api_key.clone(),
+            }],
+        ));
+
+        let loaded = super::QUICListener::load_listener_tls_material(&runtime_config)
+            .expect("loaded listener tls");
+        let metadata = &loaded.default_identity.metadata;
+        assert!(
+            !metadata.serial_hex.is_empty(),
+            "serial should be populated"
+        );
+        assert!(
+            metadata.not_after_unix_seconds >= metadata.not_before_unix_seconds,
+            "certificate validity should be ordered"
+        );
+        assert!(
+            metadata
+                .dns_names
+                .iter()
+                .any(|name| name == "api.example.com"),
+            "expected SAN/CN metadata to include the configured hostname"
+        );
+    }
+
+    #[test]
+    fn load_listener_tls_material_loads_client_auth_ca_roots() {
+        let dir = tempdir().expect("tempdir");
+        let (server_cert, server_key) =
+            write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let (client_ca_cert, _client_ca_key) =
+            write_test_cert_for_name(dir.path(), "client-ca", "client-ca.example.com");
+        let mut config = tls_test_config(server_cert, server_key, Vec::new());
+        config.listen.tls.client_auth = ClientAuth {
+            enabled: true,
+            require_client_cert: true,
+            ca_file: Some(client_ca_cert.clone()),
+        };
+
+        let loaded =
+            super::QUICListener::load_listener_tls_material(&tls_test_listener_config(&config))
+                .expect("loaded listener tls");
+        let client_auth_ca = loaded.client_auth_ca.expect("client auth ca");
+        assert_eq!(client_auth_ca.ca_file, client_ca_cert);
+        assert_eq!(client_auth_ca.certificate_count, 1);
     }
 
     #[test]

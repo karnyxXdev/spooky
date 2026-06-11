@@ -30,6 +30,7 @@ tokio-rustls.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 subtle.workspace = true
+x509-parser = "0.16"
 
 [dev-dependencies]
 rand.workspace = true

@@ -599,6 +599,21 @@ impl QUICListener {
                     )
                 };
                 backend_resolutions.push(resolution);
+                let authority_kind = if endpoint.authority_is_ip_literal() {
+                    "ip_literal"
+                } else {
+                    "hostname"
+                };
+                debug!(
+                    "Configured upstream TLS policy backend={} upstream={} verify_certificates={} strict_sni={} ca_file={:?} ca_dir={:?} authority_kind={}",
+                    backend.backend.address,
+                    upstream_name,
+                    upstream_tls_client.verify_certificates,
+                    upstream_tls_client.strict_sni,
+                    upstream_tls_client.ca_file,
+                    upstream_tls_client.ca_dir,
+                    authority_kind
+                );
                 backend_tls_configs
                     .insert(backend.backend.address.clone(), upstream_tls_client.clone());
             }
@@ -5669,6 +5684,7 @@ mod tests {
         should_strip_bootstrap_response_header, should_strip_h3_response_header,
         sweep_closed_connections,
     };
+    use spooky_lb::HealthFailureReason;
     type RoutingMaps = (
         HashMap<Arc<[u8]>, Arc<[u8]>>,
         CidRadix,
@@ -6055,6 +6071,42 @@ mod tests {
             err.to_string()
                 .contains("failed to add SNI certificate mapping"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn classify_upstream_failure_reason_distinguishes_tls_causes() {
+        assert_eq!(
+            super::QUICListener::classify_upstream_failure_reason(
+                true,
+                "tls handshake failed: UnknownIssuer"
+            ),
+            (HealthFailureReason::Tls, "unknown_issuer")
+        );
+        assert_eq!(
+            super::QUICListener::classify_upstream_failure_reason(
+                true,
+                "certificate expired while verifying backend"
+            ),
+            (HealthFailureReason::Tls, "expired_certificate")
+        );
+        assert_eq!(
+            super::QUICListener::classify_upstream_failure_reason(
+                true,
+                "certificate not valid for dns name api.example.com"
+            ),
+            (HealthFailureReason::Tls, "hostname_mismatch")
+        );
+        assert_eq!(
+            super::QUICListener::classify_upstream_failure_reason(
+                true,
+                "ALPN negotiation failed"
+            ),
+            (HealthFailureReason::Tls, "alpn")
+        );
+        assert_eq!(
+            super::QUICListener::classify_upstream_failure_reason(false, "backend timed out"),
+            (HealthFailureReason::Timeout, "timeout")
         );
     }
 

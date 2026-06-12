@@ -266,6 +266,29 @@ mod tests {
     }
 
     #[test]
+    fn metrics_render_includes_upstream_tls_telemetry() {
+        let metrics = Metrics::default();
+        metrics.record_upstream_tls_failure(
+            "backend.internal:443",
+            "data_plane",
+            "unknown_issuer",
+        );
+        metrics.record_upstream_tls_failure(
+            "backend.internal:443",
+            "health_check",
+            "hostname_mismatch",
+        );
+
+        let output = metrics.render_prometheus();
+        assert!(output.contains(
+            "spooky_upstream_tls_failure_total{backend=\"backend.internal:443\",phase=\"data_plane\",reason=\"unknown_issuer\"} 1"
+        ));
+        assert!(output.contains(
+            "spooky_upstream_tls_failure_total{backend=\"backend.internal:443\",phase=\"health_check\",reason=\"hostname_mismatch\"} 1"
+        ));
+    }
+
+    #[test]
     fn stable_hash64_is_deterministic() {
         let first = stable_hash64(b"/api/orders");
         let second = stable_hash64(b"/api/orders");

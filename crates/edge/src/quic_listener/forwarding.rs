@@ -71,39 +71,57 @@ pub(crate) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> Stre
 }
 
 impl QUICListener {
-    fn classify_send_error_detail(is_connect: bool, detail: &str) -> HealthFailureReason {
+    pub(super) fn classify_upstream_failure_reason(
+        is_connect: bool,
+        detail: &str,
+    ) -> (HealthFailureReason, &'static str) {
         let normalized = detail.to_ascii_lowercase();
         if normalized.contains("timeout") || normalized.contains("timed out") {
-            return HealthFailureReason::Timeout;
+            return (HealthFailureReason::Timeout, "timeout");
         }
 
-        if is_connect
-            && (normalized.contains("tls")
-                || normalized.contains("rustls")
-                || normalized.contains("webpki")
-                || normalized.contains("certificate")
-                || normalized.contains("x509")
-                || normalized.contains("hostname")
+        if is_connect {
+            if normalized.contains("unknownissuer") || normalized.contains("unknown issuer") {
+                return (HealthFailureReason::Tls, "unknown_issuer");
+            }
+            if normalized.contains("expired")
+                || normalized.contains("not yet valid")
+                || normalized.contains("validity")
+            {
+                return (HealthFailureReason::Tls, "expired_certificate");
+            }
+            if normalized.contains("hostname")
                 || normalized.contains("dns name")
                 || normalized.contains("subjectaltname")
-                || normalized.contains("unknownissuer")
-                || normalized.contains("invalidcertificate")
-                || normalized.contains("alpn"))
-        {
-            return HealthFailureReason::Tls;
+                || normalized.contains("not valid for")
+            {
+                return (HealthFailureReason::Tls, "hostname_mismatch");
+            }
+            if normalized.contains("alpn") {
+                return (HealthFailureReason::Tls, "alpn");
+            }
+            if normalized.contains("invalidcertificate")
+                || normalized.contains("certificate")
+                || normalized.contains("x509")
+                || normalized.contains("rustls")
+                || normalized.contains("webpki")
+                || normalized.contains("tls")
+            {
+                return (HealthFailureReason::Tls, "handshake");
+            }
         }
 
-        HealthFailureReason::Transport
+        (HealthFailureReason::Transport, "transport")
     }
 
-    fn send_error_health_failure_reason(
+    pub(super) fn send_error_health_failure_reason(
         err: &hyper_util::client::legacy::Error,
-    ) -> HealthFailureReason {
+    ) -> (HealthFailureReason, &'static str) {
         let detail = Self::format_error_chain(err);
-        Self::classify_send_error_detail(err.is_connect(), &detail)
+        Self::classify_upstream_failure_reason(err.is_connect(), &detail)
     }
 
-    fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
+    pub(super) fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
         let mut detail = err.to_string();
         let mut source = err.source();
         while let Some(cause) = source {
@@ -329,12 +347,15 @@ impl QUICListener {
                 // Log full upstream send/connect detail and map it into a backend
                 // health failure reason so repeated failures can eject unhealthy backends.
                 let send_err_detail = Self::format_error_chain(send_err);
-                let failure_reason = Self::send_error_health_failure_reason(send_err);
+                let (failure_reason, tls_reason) = Self::send_error_health_failure_reason(send_err);
                 error!(
-                    "Upstream send failed for {} (health_reason={:?}): {}",
-                    backend_addr, failure_reason, send_err_detail
+                    "Upstream send failed for {} (health_reason={:?}, tls_reason={}): {}",
+                    backend_addr, failure_reason, tls_reason, send_err_detail
                 );
                 metrics.inc_health_failure(failure_reason);
+                if failure_reason == HealthFailureReason::Tls {
+                    metrics.record_upstream_tls_failure(backend_addr, "data_plane", tls_reason);
+                }
                 if let Some(pool) = &upstream_pool
                     && let Some(t) = pool.write().ok().and_then(|mut p| {
                         p.pool.mark_request_failure(backend_index, failure_reason)
@@ -575,30 +596,30 @@ mod tests {
     #[test]
     fn send_connect_error_with_tls_details_maps_to_tls_health_failure() {
         assert_eq!(
-            QUICListener::classify_send_error_detail(
+            QUICListener::classify_upstream_failure_reason(
                 true,
                 "client error (Connect): tls handshake failed: invalid certificate"
             ),
-            HealthFailureReason::Tls
+            (HealthFailureReason::Tls, "handshake")
         );
     }
 
     #[test]
     fn send_connect_error_without_tls_details_maps_to_transport_health_failure() {
         assert_eq!(
-            QUICListener::classify_send_error_detail(
+            QUICListener::classify_upstream_failure_reason(
                 true,
                 "client error (Connect): connection refused"
             ),
-            HealthFailureReason::Transport
+            (HealthFailureReason::Transport, "transport")
         );
     }
 
     #[test]
     fn send_error_with_timeout_detail_maps_to_timeout_health_failure() {
         assert_eq!(
-            QUICListener::classify_send_error_detail(false, "request timed out"),
-            HealthFailureReason::Timeout
+            QUICListener::classify_upstream_failure_reason(false, "request timed out"),
+            (HealthFailureReason::Timeout, "timeout")
         );
     }
 

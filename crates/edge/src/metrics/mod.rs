@@ -96,6 +96,7 @@ pub struct Metrics {
     downstream_tls_handshake_failures: RwLock<HashMap<DownstreamTlsHandshakeFailureKey, u64>>,
     downstream_tls_cert_selections: RwLock<HashMap<DownstreamTlsCertSelectionKey, u64>>,
     downstream_tls_alpn_negotiated: RwLock<HashMap<DownstreamTlsAlpnKey, u64>>,
+    upstream_tls_failures: RwLock<HashMap<UpstreamTlsFailureKey, u64>>,
 }
 
 #[derive(Default, Clone)]
@@ -132,6 +133,13 @@ pub(crate) struct DownstreamTlsCertSelectionKey {
 pub(crate) struct DownstreamTlsAlpnKey {
     pub(crate) listener: String,
     pub(crate) protocol: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct UpstreamTlsFailureKey {
+    pub(crate) backend: String,
+    pub(crate) phase: String,
+    pub(crate) reason: String,
 }
 
 const LATENCY_BUCKETS_MS: [u64; 14] = [
@@ -403,6 +411,7 @@ impl Metrics {
             downstream_tls_handshake_failures: RwLock::new(HashMap::new()),
             downstream_tls_cert_selections: RwLock::new(HashMap::new()),
             downstream_tls_alpn_negotiated: RwLock::new(HashMap::new()),
+            upstream_tls_failures: RwLock::new(HashMap::new()),
         }
     }
 
@@ -769,6 +778,25 @@ impl Metrics {
             .unwrap_or_default()
     }
 
+    pub(crate) fn snapshot_upstream_tls_failures(&self) -> Vec<(UpstreamTlsFailureKey, u64)> {
+        self.upstream_tls_failures
+            .read()
+            .map(|guard| {
+                let mut entries = guard
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value))
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| {
+                    left.backend
+                        .cmp(&right.backend)
+                        .then_with(|| left.phase.cmp(&right.phase))
+                        .then_with(|| left.reason.cmp(&right.reason))
+                });
+                entries
+            })
+            .unwrap_or_default()
+    }
+
     fn current_worker_stats(&self) -> Option<&WorkerStatsAtomic> {
         let idx = WORKER_METRICS_SLOT.with(|current| current.get());
         self.worker_stats
@@ -992,6 +1020,18 @@ impl Metrics {
                 .entry(DownstreamTlsAlpnKey {
                     listener: listener.to_string(),
                     protocol: protocol.to_string(),
+                })
+                .or_default() += 1;
+        }
+    }
+
+    pub fn record_upstream_tls_failure(&self, backend: &str, phase: &str, reason: &str) {
+        if let Ok(mut guard) = self.upstream_tls_failures.write() {
+            *guard
+                .entry(UpstreamTlsFailureKey {
+                    backend: backend.to_string(),
+                    phase: phase.to_string(),
+                    reason: reason.to_string(),
                 })
                 .or_default() += 1;
         }

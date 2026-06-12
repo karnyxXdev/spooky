@@ -520,6 +520,19 @@ impl Metrics {
             ));
         }
         out.push_str(
+            "# HELP spooky_upstream_tls_failure_total Upstream TLS failures grouped by backend, request phase, and reason.\n",
+        );
+        out.push_str("# TYPE spooky_upstream_tls_failure_total counter\n");
+        for (key, value) in self.snapshot_upstream_tls_failures() {
+            out.push_str(&format!(
+                "spooky_upstream_tls_failure_total{{backend=\"{}\",phase=\"{}\",reason=\"{}\"}} {}\n",
+                escape_prometheus_label(&key.backend),
+                escape_prometheus_label(&key.phase),
+                escape_prometheus_label(&key.reason),
+                value
+            ));
+        }
+        out.push_str(
             "# HELP spooky_backend_dns_refresh_success_total Total successful backend DNS refreshes.\n",
         );
         out.push_str("# TYPE spooky_backend_dns_refresh_success_total counter\n");

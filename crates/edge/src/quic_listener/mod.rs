@@ -6283,7 +6283,9 @@ mod tests {
 
         let quic_config =
             super::QUICListener::build_quic_config(&tls_test_listener_config(&config));
-        assert!(quic_config.is_ok(), "unexpected error: {quic_config:?}");
+        if let Err(err) = quic_config {
+            panic!("unexpected error: {err}");
+        }
     }
 
     #[test]

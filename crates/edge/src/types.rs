@@ -1,12 +1,14 @@
 use bytes::Bytes;
 use core::net::SocketAddr;
+use rustls::ServerConfig as RustlsServerConfig;
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
-    runtime::{ListenerRuntimeConfig, RuntimeListenerTls, RuntimeTlsIdentity, RuntimeUpstreamPolicy},
+    runtime::{
+        ListenerRuntimeConfig, RuntimeListenerTls, RuntimeTlsIdentity, RuntimeUpstreamPolicy,
+    },
 };
 use spooky_errors::ProxyError;
 use spooky_lb::UpstreamPool;
-use rustls::ServerConfig as RustlsServerConfig;
 use spooky_transport::{h2_client::SharedDnsResolver, h2_pool::H2Pool};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -185,11 +187,10 @@ impl ListenerTlsReloadStore {
     }
 
     pub fn inventory(&self, listener: &str) -> Option<ListenerTlsInventory> {
-        self.listeners.read().ok().and_then(|listeners| {
-            listeners
-                .get(listener)
-                .map(|state| state.inventory.clone())
-        })
+        self.listeners
+            .read()
+            .ok()
+            .and_then(|listeners| listeners.get(listener).map(|state| state.inventory.clone()))
     }
 
     pub fn replace_listener(

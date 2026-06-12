@@ -805,12 +805,15 @@ impl QUICListener {
 
         let listener_label = Self::listener_label(&config);
         let listener_tls_store = Arc::clone(&shared_state.listener_tls_store);
-        let tls_reload_generation = listener_tls_store.generation(&listener_label).ok_or_else(|| {
-            ProxyError::Transport(format!(
-                "missing TLS reload state for listener '{}'",
-                listener_label
-            ))
-        })?;
+        let tls_reload_generation =
+            listener_tls_store
+                .generation(&listener_label)
+                .ok_or_else(|| {
+                    ProxyError::Transport(format!(
+                        "missing TLS reload state for listener '{}'",
+                        listener_label
+                    ))
+                })?;
         let quic_config = Self::build_quic_config(&config)?;
         let h3_config =
             Arc::new(quiche::h3::Config::new().map_err(|err| {
@@ -1075,19 +1078,34 @@ impl QUICListener {
         Ok(quic_config)
     }
 
-    fn sync_tls_reload_state_if_needed(&mut self) -> Result<(), ProxyError> {
-        let current_generation =
-            self.listener_tls_store
-                .generation(&self.listener_label)
-                .ok_or_else(|| {
-                    ProxyError::Transport(format!(
-                        "missing TLS reload state for listener '{}'",
-                        self.listener_label
-                    ))
-                })?;
-        if current_generation == self.tls_reload_generation {
-            return Ok(());
+    fn tls_reload_generation_if_needed(
+        listener_label: &str,
+        current_generation: u64,
+        listener_tls_store: &ListenerTlsReloadStore,
+    ) -> Result<Option<u64>, ProxyError> {
+        let next_generation = listener_tls_store
+            .generation(listener_label)
+            .ok_or_else(|| {
+                ProxyError::Transport(format!(
+                    "missing TLS reload state for listener '{}'",
+                    listener_label
+                ))
+            })?;
+        if next_generation == current_generation {
+            return Ok(None);
         }
+        Ok(Some(next_generation))
+    }
+
+    fn sync_tls_reload_state_if_needed(&mut self) -> Result<(), ProxyError> {
+        let Some(current_generation) = Self::tls_reload_generation_if_needed(
+            &self.listener_label,
+            self.tls_reload_generation,
+            &self.listener_tls_store,
+        )?
+        else {
+            return Ok(());
+        };
 
         self.quic_config = Self::build_quic_config(&self.config)?;
         self.tls_reload_generation = current_generation;
@@ -4406,9 +4424,7 @@ impl QUICListener {
                 sni_identities: loaded_tls
                     .sni_identities
                     .iter()
-                    .map(|(server_name, identity)| {
-                        (server_name.clone(), identity.identity.clone())
-                    })
+                    .map(|(server_name, identity)| (server_name.clone(), identity.identity.clone()))
                     .collect(),
                 client_auth: loaded_tls.client_auth.clone(),
             },
@@ -4429,13 +4445,12 @@ impl QUICListener {
                     )
                 })
                 .collect(),
-            client_auth_ca: loaded_tls
-                .client_auth_ca
-                .as_ref()
-                .map(|client_auth_ca| RuntimeLoadedClientAuthCa {
+            client_auth_ca: loaded_tls.client_auth_ca.as_ref().map(|client_auth_ca| {
+                RuntimeLoadedClientAuthCa {
                     ca_file: client_auth_ca.ca_file.clone(),
                     certificate_count: client_auth_ca.certificate_count,
-                }),
+                }
+            }),
         }
     }
 
@@ -4560,12 +4575,17 @@ impl QUICListener {
             "__default__".to_string(),
             inventory.default_identity.metadata.not_after_unix_seconds,
         ));
-        certs.extend(inventory.sni_identities.iter().map(|(server_name, identity)| {
-            (
-                server_name.clone(),
-                identity.metadata.not_after_unix_seconds,
-            )
-        }));
+        certs.extend(
+            inventory
+                .sni_identities
+                .iter()
+                .map(|(server_name, identity)| {
+                    (
+                        server_name.clone(),
+                        identity.metadata.not_after_unix_seconds,
+                    )
+                }),
+        );
         metrics.replace_downstream_tls_cert_expiry(listener_label, certs);
     }
 
@@ -5818,7 +5838,7 @@ mod tests {
             .expect("listener runtime config")
     }
 
-    fn dns_resolution_test_config() -> SpookyConfigConfig {
+    fn dns_resolution_test_config(cert: String, key: String) -> SpookyConfigConfig {
         let mut upstreams = HashMap::new();
         upstreams.insert(
             "api".to_string(),
@@ -5859,8 +5879,8 @@ mod tests {
                 port: 9889,
                 address: "127.0.0.1".to_string(),
                 tls: Tls {
-                    cert: "cert.pem".to_string(),
-                    key: "key.pem".to_string(),
+                    cert,
+                    key,
                     certificates: Vec::new(),
                     client_auth: ClientAuth::default(),
                 },
@@ -6002,8 +6022,15 @@ mod tests {
             .listener_tls_store
             .inventory(listener_label)
             .expect("initial inventory");
-        let initial_serial = initial_inventory.default_identity.metadata.serial_hex.clone();
-        assert_eq!(shared.listener_tls_store.generation(listener_label), Some(0));
+        let initial_serial = initial_inventory
+            .default_identity
+            .metadata
+            .serial_hex
+            .clone();
+        assert_eq!(
+            shared.listener_tls_store.generation(listener_label),
+            Some(0)
+        );
 
         let (_rotated_cert, _rotated_key) =
             write_test_cert_for_name(dir.path(), "server", "api.example.com");
@@ -6045,14 +6072,16 @@ mod tests {
         let listener_config = runtime
             .primary_listener_runtime_config()
             .expect("listener runtime config");
-        let socket = super::QUICListener::bind_socket(&listener_config, false).expect("socket");
-        let mut listener = super::QUICListener::new_with_socket_and_shared_state(
-            listener_config.clone(),
-            socket,
-            Arc::clone(&shared),
-        )
-        .expect("listener");
-        assert_eq!(listener.tls_reload_generation, 0);
+        let listener_label = super::QUICListener::listener_label(&listener_config);
+        assert_eq!(
+            super::QUICListener::tls_reload_generation_if_needed(
+                &listener_label,
+                0,
+                &shared.listener_tls_store
+            )
+            .expect("initial generation"),
+            None
+        );
 
         let (_rotated_cert, _rotated_key) =
             write_test_cert_for_name(dir.path(), "server", "api.example.com");
@@ -6061,16 +6090,21 @@ mod tests {
         shared
             .listener_tls_store
             .replace_listener(
-                &listener.listener_label,
+                &listener_label,
                 reloaded_state.inventory,
                 reloaded_state.bootstrap_server_config,
             )
             .expect("replace listener");
 
-        listener
-            .sync_tls_reload_state_if_needed()
-            .expect("sync tls reload state");
-        assert_eq!(listener.tls_reload_generation, 1);
+        assert_eq!(
+            super::QUICListener::tls_reload_generation_if_needed(
+                &listener_label,
+                0,
+                &shared.listener_tls_store
+            )
+            .expect("reloaded generation"),
+            Some(1)
+        );
     }
 
     #[test]
@@ -6125,10 +6159,7 @@ mod tests {
             (HealthFailureReason::Tls, "hostname_mismatch")
         );
         assert_eq!(
-            super::QUICListener::classify_upstream_failure_reason(
-                true,
-                "ALPN negotiation failed"
-            ),
+            super::QUICListener::classify_upstream_failure_reason(true, "ALPN negotiation failed"),
             (HealthFailureReason::Tls, "alpn")
         );
         assert_eq!(
@@ -6152,22 +6183,21 @@ mod tests {
             "unknown_issuer"
         );
         assert_eq!(
-            super::QUICListener::classify_downstream_tls_failure_reason(
-                "certificate expired"
-            ),
+            super::QUICListener::classify_downstream_tls_failure_reason("certificate expired"),
             "expired_client_cert"
         );
         assert_eq!(
-            super::QUICListener::classify_downstream_tls_failure_reason(
-                "bad certificate"
-            ),
+            super::QUICListener::classify_downstream_tls_failure_reason("bad certificate"),
             "invalid_client_cert"
         );
     }
 
     #[test]
     fn build_shared_state_separates_backend_identity_from_resolution_state() {
-        let runtime = RuntimeConfig::from_config(&dns_resolution_test_config()).expect("runtime");
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let runtime =
+            RuntimeConfig::from_config(&dns_resolution_test_config(cert, key)).expect("runtime");
         let shared = super::QUICListener::build_shared_state(&runtime).expect("shared state");
         let snapshot = shared.backend_resolution_store.snapshot();
 

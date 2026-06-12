@@ -268,11 +268,7 @@ mod tests {
     #[test]
     fn metrics_render_includes_upstream_tls_telemetry() {
         let metrics = Metrics::default();
-        metrics.record_upstream_tls_failure(
-            "backend.internal:443",
-            "data_plane",
-            "unknown_issuer",
-        );
+        metrics.record_upstream_tls_failure("backend.internal:443", "data_plane", "unknown_issuer");
         metrics.record_upstream_tls_failure(
             "backend.internal:443",
             "health_check",

@@ -39,9 +39,14 @@ listen:
 
 upstream_tls:
     verify_certificates: true  # safe-by-default for HTTPS upstreams
-    strict_sni: true           # send backend host as SNI for HTTPS upstream connections
+    strict_sni: true           # send backend authority host as SNI for HTTPS upstream connections
     ca_file: null              # optional PEM CA bundle for private PKI
     ca_dir: null               # optional directory of PEM CA bundles for private PKI
+    # Verification semantics:
+    # - hostname backends: verify SAN/CN against the configured backend host
+    # - IP literal backends: verify against the configured IP identity
+    # - strict_sni=false: keep certificate verification on, but do not send SNI
+    # - verify_certificates=false: disables upstream certificate validation entirely
 
 upstream:
   api_pool:
@@ -161,6 +166,7 @@ observability:
         ready_path: "/ready"
         runtime_path: "/admin/runtime"
         restart_path: "/admin/runtime/restart"
+        reload_certs_path: "/admin/runtime/reload-certs"  # hot-reload listener cert/key material for new handshakes
         auth_token: "replace-with-strong-token"
         max_connections: 256
         connection_timeout_ms: 30000

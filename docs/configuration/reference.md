@@ -109,6 +109,7 @@ Precedence rules:
 4. Upstream TLS precedence is:
    1. `upstream.<name>.tls`
    2. global `upstream_tls`
+5. Listener certificate reload updates listener TLS material for new handshakes through `observability.control_api.reload_certs_path` without restarting the process.
 
 Startup rejects ambiguous or contradictory combinations, including duplicate effective listener binds, duplicate normalized route matchers, partial legacy listener cert/key pairs, invalid or duplicate SNI `server_name` entries, `host_policy.host` outside `mode: rewrite`, and `CONNECT` routing/policy conflicts.
 
@@ -197,6 +198,13 @@ Certificate selection order:
 1. Exact SNI match in `listen.tls.certificates`.
 2. Fallback to `listen.tls.cert`/`listen.tls.key` when configured.
 3. If legacy pair is not configured, fallback to the first entry in `listen.tls.certificates`.
+
+Operational notes:
+
+- Spooky exports downstream certificate expiry gauges:
+  - `spooky_downstream_tls_certificate_not_after_seconds`
+  - `spooky_downstream_tls_certificate_days_remaining`
+- Certificate reload affects new QUIC and bootstrap TLS handshakes only. Existing connections continue with the TLS session they already negotiated.
 
 ### Examples
 
@@ -557,11 +565,18 @@ Each upstream can optionally override the global `upstream_tls` settings with it
 | Property | Type | Required | Default | Description |
 |----------|------|----------|---------|-------------|
 | `verify_certificates` | bool | No | `true` | Verify upstream TLS certificates |
-| `strict_sni` | bool | No | `true` | Send backend hostname as SNI |
+| `strict_sni` | bool | No | `true` | Send backend authority host as SNI |
 | `ca_file` | string | No | - | Path to a PEM CA bundle for this upstream |
 | `ca_dir` | string | No | - | Path to a directory of PEM CA bundles for this upstream |
 
 This is useful when backends have heterogeneous trust requirements — for example, one upstream uses a private internal CA while another uses a public CA.
+
+Verification semantics:
+
+- Hostname backends verify the upstream certificate against the configured backend hostname.
+- IP-literal backends verify against the configured IP identity.
+- `strict_sni: false` disables only the SNI extension; verification still remains enabled unless `verify_certificates: false`.
+- `verify_certificates: false` disables upstream certificate validation entirely.
 
 #### Examples
 
@@ -1062,7 +1077,8 @@ Key fields:
 
 Key fields:
 
-- `observability.control_api.auth_token`: bearer token required for runtime and restart endpoints (`Authorization: Bearer <token>`).
+- `observability.control_api.auth_token`: bearer token required for runtime, reload-certs, and restart endpoints (`Authorization: Bearer <token>`).
+- `observability.control_api.reload_certs_path`: authenticated POST endpoint that reloads listener certificate and client-auth CA material for new handshakes.
 - `observability.control_api.max_connections` (default: `256`): concurrent connection cap.
 - `observability.control_api.connection_timeout_ms` (default: `30000`): per-connection lifetime timeout.
 

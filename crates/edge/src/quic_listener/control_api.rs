@@ -221,10 +221,9 @@ impl QUICListener {
 
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let Some(server_config) =
-                            state.listener_tls_store.bootstrap_server_config(
-                                &state.primary_listener_label,
-                            )
+                        let Some(server_config) = state
+                            .listener_tls_store
+                            .bootstrap_server_config(&state.primary_listener_label)
                         else {
                             error!(
                                 "Control API endpoint missing live TLS config for listener {}",

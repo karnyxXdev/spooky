@@ -135,6 +135,12 @@ upstream_tls:
   ca_dir: null                # directory of PEM CA bundles (alternative to ca_file)
 ```
 
+Semantics:
+- Hostname backends are verified against the configured backend hostname.
+- IP-literal backends are verified against the configured IP identity.
+- `strict_sni: false` disables only the SNI extension; certificate verification still stays enabled unless `verify_certificates: false`.
+- `verify_certificates: false` disables upstream certificate validation entirely and should only be used in trusted environments.
+
 To trust a private CA:
 ```yaml
 upstream_tls:
@@ -389,12 +395,22 @@ observability:
     auth_token: "replace-with-strong-token"   # required when enabled
     health_path: "/health"
     ready_path:  "/ready"
+    runtime_path: "/admin/runtime"
+    restart_path: "/admin/runtime/restart"
+    reload_certs_path: "/admin/runtime/reload-certs"
 ```
 
 Check readiness:
 ```bash
 curl http://127.0.0.1:9902/ready
 curl http://127.0.0.1:9902/health
+```
+
+Reload listener certificates without restarting the process:
+```bash
+curl -X POST \
+  -H 'Authorization: Bearer replace-with-strong-token' \
+  https://127.0.0.1:9902/admin/runtime/reload-certs
 ```
 
 ---

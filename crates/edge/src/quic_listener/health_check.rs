@@ -130,8 +130,7 @@ impl QUICListener {
                                     classify_active_health_check_response(response.status())
                                 }
                                 Ok(Err(PoolError::Send(send_err))) => {
-                                    let send_err_detail =
-                                        Self::format_error_chain(&send_err);
+                                    let send_err_detail = Self::format_error_chain(&send_err);
                                     let (failure_reason, tls_reason) =
                                         Self::send_error_health_failure_reason(&send_err);
                                     if failure_reason == HealthFailureReason::Tls {

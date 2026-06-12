@@ -207,6 +207,33 @@ tls:
   key: "/etc/spooky/certs/multi-domain.key"
 ```
 
+### Multi-Certificate SNI Configuration
+
+Use `listen.tls.certificates` when one listener must present different certificates by hostname:
+
+```yaml
+listen:
+  protocol: http3
+  address: "0.0.0.0"
+  port: 9889
+  tls:
+    cert: "/etc/spooky/certs/default-fullchain.pem"
+    key: "/etc/spooky/certs/default-privkey.pem"
+    certificates:
+      - server_name: "api.example.com"
+        cert: "/etc/spooky/certs/api-fullchain.pem"
+        key: "/etc/spooky/certs/api-privkey.pem"
+      - server_name: "www.example.com"
+        cert: "/etc/spooky/certs/www-fullchain.pem"
+        key: "/etc/spooky/certs/www-privkey.pem"
+```
+
+Selection order:
+
+1. Exact `server_name` match in `listen.tls.certificates`
+2. Fallback `listen.tls.cert` + `listen.tls.key`
+3. If no legacy fallback pair is configured, the first `certificates[]` entry becomes the default identity
+
 ## File Permissions and Security
 
 ### Recommended Permissions
@@ -252,6 +279,9 @@ drwx------ 2 spooky spooky 4096 Dec 15 10:00 .
    - Monitor expiration dates
    - Set up renewal automation for Let's Encrypt
    - Implement alerting for certificates expiring within 30 days
+   - Scrape:
+     - `spooky_downstream_tls_certificate_not_after_seconds`
+     - `spooky_downstream_tls_certificate_days_remaining`
 
 ## Certificate Validation
 
@@ -328,8 +358,10 @@ sudo systemctl status certbot.timer
 # Manually renew certificates
 sudo certbot renew
 
-# Restart Spooky after renewal (hot reload planned)
-sudo systemctl restart spooky
+# Reload listener certificates for new handshakes
+curl -X POST \
+  -H "Authorization: Bearer ${SPOOKY_CONTROL_API_TOKEN}" \
+  https://127.0.0.1:9902/admin/runtime/reload-certs
 ```
 
 ### Manual Certificate Rotation
@@ -349,12 +381,19 @@ sudo cp new-server.key /etc/spooky/certs/server.key
 sudo chmod 644 /etc/spooky/certs/server.crt
 sudo chmod 600 /etc/spooky/certs/server.key
 
-# Restart Spooky (hot reload planned for future release)
-sudo systemctl restart spooky
+# Reload listener certificates for new handshakes
+curl -X POST \
+  -H "Authorization: Bearer ${SPOOKY_CONTROL_API_TOKEN}" \
+  https://127.0.0.1:9902/admin/runtime/reload-certs
 
 # Verify new certificates are loaded
 openssl s_client -connect localhost:9889 -servername localhost < /dev/null 2>/dev/null | openssl x509 -noout -dates
 ```
+
+Reload behavior:
+
+- New QUIC and bootstrap TLS handshakes use the updated certificate material immediately after reload succeeds.
+- Existing connections are not interrupted or re-handshaken.
 
 ### Monitoring Certificate Expiry
 

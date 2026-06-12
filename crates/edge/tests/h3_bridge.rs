@@ -3,7 +3,7 @@ use std::{
     convert::Infallible,
     fs::File,
     io::BufReader,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -30,7 +30,9 @@ use hyper_util::{
 };
 use quiche::h3::NameValue;
 use rand::RngCore;
-use rcgen::{Certificate, CertificateParams, SanType};
+use rcgen::{
+    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, IsCa, SanType,
+};
 use tempfile::{TempDir, tempdir};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{
@@ -40,7 +42,7 @@ use tokio_rustls::{
 
 use spooky_config::config::{
     Backend, ClientAuth, Config, HealthCheck, Listen, LoadBalancing, Log, LogFormat, Security, Tls,
-    UpstreamTls,
+    TlsCertificate, UpstreamTls,
 };
 use spooky_config::runtime::RuntimeConfig;
 use spooky_edge::QUICListener;
@@ -56,21 +58,91 @@ type H3TrailerResponse = (String, Vec<u8>, TrailerPairs);
 type BootstrapResponse = (StatusCode, Vec<u8>, TrailerPairs);
 
 fn write_test_certs(dir: &TempDir) -> (String, String) {
-    let mut params = CertificateParams::new(vec!["localhost".into()]);
-    params
-        .subject_alt_names
-        .push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
+    write_named_test_cert(dir, "cert", &["localhost"], &[IpAddr::from([127, 0, 0, 1])])
+}
+
+fn write_named_test_cert(
+    dir: &TempDir,
+    file_prefix: &str,
+    dns_names: &[&str],
+    ip_sans: &[IpAddr],
+) -> (String, String) {
+    let mut params = CertificateParams::new(
+        dns_names
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>(),
+    );
+    for dns_name in dns_names {
+        params
+            .subject_alt_names
+            .push(SanType::DnsName((*dns_name).to_string()));
+    }
+    for ip in ip_sans {
+        params.subject_alt_names.push(SanType::IpAddress(*ip));
+    }
+    if let Some(common_name) = dns_names.first() {
+        let mut distinguished_name = DistinguishedName::new();
+        distinguished_name.push(DnType::CommonName, *common_name);
+        params.distinguished_name = distinguished_name;
+    }
     let cert = Certificate::from_params(params).expect("failed to build cert");
 
-    let cert_path = dir.path().join("cert.pem");
-    let key_path = dir.path().join("key.pem");
+    let cert_path = dir.path().join(format!("{file_prefix}.pem"));
+    let key_path = dir.path().join(format!("{file_prefix}.key.pem"));
 
-    std::fs::write(&cert_path, cert.serialize_pem().unwrap()).unwrap();
-    std::fs::write(&key_path, cert.serialize_private_key_pem()).unwrap();
+    std::fs::write(&cert_path, cert.serialize_pem().expect("serialize cert")).expect("write cert");
+    std::fs::write(&key_path, cert.serialize_private_key_pem()).expect("write key");
 
     (
         cert_path.to_string_lossy().to_string(),
         key_path.to_string_lossy().to_string(),
+    )
+}
+
+fn write_test_ca_and_client_cert(
+    dir: &TempDir,
+    ca_name: &str,
+    client_name: &str,
+) -> (String, String, String) {
+    let mut ca_params = CertificateParams::new(Vec::new());
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let mut ca_dn = DistinguishedName::new();
+    ca_dn.push(DnType::CommonName, ca_name);
+    ca_params.distinguished_name = ca_dn;
+    let ca = Certificate::from_params(ca_params).expect("build ca");
+
+    let ca_cert_path = dir.path().join(format!("{ca_name}.pem"));
+    std::fs::write(
+        &ca_cert_path,
+        ca.serialize_pem().expect("serialize ca cert"),
+    )
+    .expect("write ca cert");
+
+    let mut client_params = CertificateParams::new(vec![client_name.to_string()]);
+    let mut client_dn = DistinguishedName::new();
+    client_dn.push(DnType::CommonName, client_name);
+    client_params.distinguished_name = client_dn;
+    client_params
+        .subject_alt_names
+        .push(SanType::DnsName(client_name.to_string()));
+    let client = Certificate::from_params(client_params).expect("build client cert");
+
+    let client_cert_path = dir.path().join(format!("{client_name}.pem"));
+    let client_key_path = dir.path().join(format!("{client_name}.key.pem"));
+    std::fs::write(
+        &client_cert_path,
+        client
+            .serialize_pem_with_signer(&ca)
+            .expect("serialize client cert"),
+    )
+    .expect("write client cert");
+    std::fs::write(&client_key_path, client.serialize_private_key_pem()).expect("write client key");
+
+    (
+        ca_cert_path.to_string_lossy().to_string(),
+        client_cert_path.to_string_lossy().to_string(),
+        client_key_path.to_string_lossy().to_string(),
     )
 }
 
@@ -1272,6 +1344,47 @@ fn read_test_root_store(cert_path: &str) -> Result<RootCertStore, String> {
     Ok(roots)
 }
 
+fn read_test_leaf_der(cert_path: &str) -> Result<Vec<u8>, String> {
+    let file = File::open(cert_path).map_err(|err| format!("open cert file: {err}"))?;
+    let mut reader = BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("parse certs: {err}"))?;
+    certs
+        .first()
+        .map(|cert| cert.as_ref().to_vec())
+        .ok_or_else(|| "missing leaf cert".to_string())
+}
+
+fn read_test_private_key(
+    key_path: &str,
+) -> Result<tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>, String> {
+    let file = File::open(key_path).map_err(|err| format!("open key file: {err}"))?;
+    let mut reader = BufReader::new(file);
+    rustls_pemfile::private_key(&mut reader)
+        .map_err(|err| format!("parse private key: {err}"))?
+        .ok_or_else(|| "missing private key".to_string())
+}
+
+#[derive(Clone, Debug)]
+struct H3TlsClientOptions<'a> {
+    server_name: &'a str,
+    authority: &'a str,
+    path: &'a str,
+    verify_peer: bool,
+    root_cert_path: Option<&'a str>,
+    client_identity: Option<(&'a str, &'a str)>,
+    application_protos: &'a [&'a [u8]],
+    send_request: bool,
+}
+
+#[derive(Debug)]
+struct H3TlsObservation {
+    body: Vec<u8>,
+    peer_cert: Option<Vec<u8>>,
+    alpn: Vec<u8>,
+}
+
 async fn connect_bootstrap_h2(
     addr: SocketAddr,
     cert_path: &str,
@@ -1315,6 +1428,232 @@ async fn connect_bootstrap_h2(
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             Err(err) => return Err(format!("tcp connect: {err}")),
+        }
+    }
+}
+
+async fn connect_bootstrap_h2_with_client_auth(
+    addr: SocketAddr,
+    cert_path: &str,
+    client_identity: Option<(&str, &str)>,
+) -> Result<
+    (
+        hyper::client::conn::http2::SendRequest<Empty<Bytes>>,
+        tokio::task::JoinHandle<()>,
+    ),
+    String,
+> {
+    let roots = read_test_root_store(cert_path)?;
+    let builder = ClientConfig::builder().with_root_certificates(roots);
+    let mut tls_config = if let Some((client_cert_path, client_key_path)) = client_identity {
+        let client_chain = {
+            let file =
+                File::open(client_cert_path).map_err(|err| format!("open cert file: {err}"))?;
+            let mut reader = BufReader::new(file);
+            rustls_pemfile::certs(&mut reader)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|err| format!("parse certs: {err}"))?
+        };
+        builder
+            .with_client_auth_cert(client_chain, read_test_private_key(client_key_path)?)
+            .map_err(|err| format!("client auth cert: {err}"))?
+    } else {
+        builder.with_no_client_auth()
+    };
+    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+    let connector = TlsConnector::from(Arc::new(tls_config));
+
+    let server_name = ServerName::try_from("localhost")
+        .map_err(|err| format!("server name: {err}"))?
+        .to_owned();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                let tls_stream = connector
+                    .connect(server_name.clone(), stream)
+                    .await
+                    .map_err(|err| format!("tls connect: {err}"))?;
+                let (sender, conn) =
+                    http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream))
+                        .await
+                        .map_err(|err| format!("h2 handshake: {err}"))?;
+                let conn_task = tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                return Ok((sender, conn_task));
+            }
+            Err(err) if Instant::now() < deadline => {
+                let _ = err;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(err) => return Err(format!("tcp connect: {err}")),
+        }
+    }
+}
+
+fn run_h3_client_with_tls(
+    addr: SocketAddr,
+    options: H3TlsClientOptions<'_>,
+) -> Result<H3TlsObservation, String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    let local_addr = socket.local_addr().map_err(|e| e.to_string())?;
+
+    let mut config =
+        quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| format!("config: {e:?}"))?;
+    if options.verify_peer {
+        let root_cert_path = options
+            .root_cert_path
+            .ok_or_else(|| "root_cert_path is required when verify_peer=true".to_string())?;
+        config.verify_peer(true);
+        config
+            .load_verify_locations_from_file(root_cert_path)
+            .map_err(|e| format!("load verify locations: {e:?}"))?;
+    } else {
+        config.verify_peer(false);
+    }
+    if let Some((client_cert_path, client_key_path)) = options.client_identity {
+        config
+            .load_cert_chain_from_pem_file(client_cert_path)
+            .map_err(|e| format!("load client cert: {e:?}"))?;
+        config
+            .load_priv_key_from_pem_file(client_key_path)
+            .map_err(|e| format!("load client key: {e:?}"))?;
+    }
+    config
+        .set_application_protos(options.application_protos)
+        .map_err(|e| format!("alpn: {e:?}"))?;
+    config.set_max_idle_timeout(QUIC_IDLE_TIMEOUT_MS);
+    config.set_max_recv_udp_payload_size(MAX_UDP_PAYLOAD_BYTES);
+    config.set_max_send_udp_payload_size(MAX_UDP_PAYLOAD_BYTES);
+    config.set_initial_max_data(QUIC_INITIAL_MAX_DATA);
+    config.set_initial_max_stream_data_bidi_local(QUIC_INITIAL_STREAM_DATA);
+    config.set_initial_max_stream_data_bidi_remote(QUIC_INITIAL_STREAM_DATA);
+    config.set_initial_max_stream_data_uni(QUIC_INITIAL_STREAM_DATA);
+    config.set_initial_max_streams_bidi(QUIC_INITIAL_MAX_STREAMS_BIDI);
+    config.set_initial_max_streams_uni(QUIC_INITIAL_MAX_STREAMS_UNI);
+    config.set_disable_active_migration(true);
+
+    let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
+    rand::thread_rng().fill_bytes(&mut scid_bytes);
+    let scid = quiche::ConnectionId::from_ref(&scid_bytes);
+
+    let mut conn = quiche::connect(
+        Some(options.server_name),
+        &scid,
+        local_addr,
+        addr,
+        &mut config,
+    )
+    .map_err(|e| format!("connect: {e:?}"))?;
+    let h3_config = quiche::h3::Config::new().map_err(|e| format!("h3: {e:?}"))?;
+    let mut h3_conn: Option<quiche::h3::Connection> = None;
+
+    let mut out = [0u8; MAX_UDP_PAYLOAD_BYTES];
+    let mut buf = [0u8; MAX_DATAGRAM_SIZE_BYTES];
+    let mut request_sent = false;
+    let start = Instant::now();
+    let timeout = Duration::from_secs(REQUEST_TIMEOUT_SECS);
+    let mut body = Vec::new();
+
+    loop {
+        while let Ok((write, send_info)) = conn.send(&mut out) {
+            socket
+                .send_to(&out[..write], send_info.to)
+                .map_err(|e| format!("send_to: {e:?}"))?;
+        }
+
+        if conn.is_closed() && !conn.is_established() {
+            return Err(format!(
+                "connection closed before establishment: local_error={:?} peer_error={:?}",
+                conn.local_error(),
+                conn.peer_error()
+            ));
+        }
+
+        let read_timeout = quic_read_timeout(&conn);
+        socket
+            .set_read_timeout(Some(read_timeout))
+            .map_err(|e| format!("timeout: {e:?}"))?;
+
+        match socket.recv_from(&mut buf) {
+            Ok((len, from)) => {
+                let recv_info = quiche::RecvInfo {
+                    from,
+                    to: local_addr,
+                };
+                conn.recv(&mut buf[..len], recv_info)
+                    .map_err(|e| format!("recv: {e:?}"))?;
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                conn.on_timeout();
+            }
+            Err(e) => return Err(format!("recv: {e:?}")),
+        }
+
+        if conn.is_established() && !options.send_request {
+            return Ok(H3TlsObservation {
+                body: Vec::new(),
+                peer_cert: conn.peer_cert().map(|cert| cert.to_vec()),
+                alpn: conn.application_proto().to_vec(),
+            });
+        }
+
+        if conn.is_established() && h3_conn.is_none() {
+            h3_conn = Some(
+                quiche::h3::Connection::with_transport(&mut conn, &h3_config)
+                    .map_err(|e| format!("h3 conn: {e:?}"))?,
+            );
+        }
+
+        if let Some(h3) = h3_conn.as_mut() {
+            if conn.is_established() && !request_sent {
+                let req = vec![
+                    quiche::h3::Header::new(b":method", b"GET"),
+                    quiche::h3::Header::new(b":scheme", b"https"),
+                    quiche::h3::Header::new(b":authority", options.authority.as_bytes()),
+                    quiche::h3::Header::new(b":path", options.path.as_bytes()),
+                    quiche::h3::Header::new(b"user-agent", b"spooky-tls-integration"),
+                ];
+                h3.send_request(&mut conn, &req, true)
+                    .map_err(|e| format!("send_request: {e:?}"))?;
+                request_sent = true;
+            }
+
+            loop {
+                match h3.poll(&mut conn) {
+                    Ok((stream_id, quiche::h3::Event::Data)) => loop {
+                        match h3.recv_body(&mut conn, stream_id, &mut buf) {
+                            Ok(read) => body.extend_from_slice(&buf[..read]),
+                            Err(quiche::h3::Error::Done) => break,
+                            Err(e) => return Err(format!("recv_body: {e:?}")),
+                        }
+                    },
+                    Ok((_stream_id, quiche::h3::Event::Headers { .. })) => {}
+                    Ok((_stream_id, quiche::h3::Event::Finished)) => {
+                        return Ok(H3TlsObservation {
+                            body,
+                            peer_cert: conn.peer_cert().map(|cert| cert.to_vec()),
+                            alpn: conn.application_proto().to_vec(),
+                        });
+                    }
+                    Ok((_stream_id, quiche::h3::Event::Reset(_))) => {
+                        return Err("stream reset".to_string());
+                    }
+                    Ok((_stream_id, quiche::h3::Event::PriorityUpdate)) => {}
+                    Ok((_stream_id, quiche::h3::Event::GoAway)) => {}
+                    Err(quiche::h3::Error::Done) => break,
+                    Err(e) => return Err(format!("poll: {e:?}")),
+                }
+            }
+        }
+
+        if start.elapsed() > timeout {
+            return Err("timeout waiting for QUIC TLS response".to_string());
         }
     }
 }
@@ -1989,6 +2328,356 @@ fn bootstrap_h2_preserves_response_trailers() {
             .any(|(name, value)| name.eq_ignore_ascii_case("grpc-message") && value == "ok"),
         "expected grpc-message trailer, got {trailers:?}"
     );
+}
+
+#[test]
+#[serial_test::serial]
+fn http3_sni_selects_exact_and_fallback_certificates_on_real_handshake() {
+    let dir = tempdir().expect("failed to create temp dir");
+    let (fallback_cert, fallback_key) =
+        write_named_test_cert(&dir, "fallback", &["fallback.example.com"], &[]);
+    let (api_cert, api_key) = write_named_test_cert(&dir, "api", &["api.example.com"], &[]);
+    let expected_api_der = read_test_leaf_der(&api_cert).expect("api cert der");
+    let expected_fallback_der = read_test_leaf_der(&fallback_cert).expect("fallback cert der");
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let backend_addr = rt.block_on(start_h2_backend());
+
+    let listen_port = find_free_tcp_port();
+    let mut config = make_config(
+        listen_port as u32,
+        backend_addr.to_string(),
+        fallback_cert.clone(),
+        fallback_key,
+    );
+    config.listen.tls.certificates = vec![TlsCertificate {
+        server_name: "api.example.com".to_string(),
+        cert: api_cert.clone(),
+        key: api_key,
+    }];
+
+    let listener = make_listener_with_bootstrap(config);
+    let listen_addr = listener.socket.local_addr().expect("listener addr");
+    let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
+
+    let exact = run_h3_client_with_tls(
+        listen_addr,
+        H3TlsClientOptions {
+            server_name: "api.example.com",
+            authority: "api.example.com",
+            path: "/",
+            verify_peer: false,
+            root_cert_path: None,
+            client_identity: None,
+            application_protos: quiche::h3::APPLICATION_PROTOCOL,
+            send_request: true,
+        },
+    )
+    .expect("exact sni client request failed");
+    assert_eq!(exact.alpn, b"h3");
+    assert_eq!(
+        exact.peer_cert.as_deref(),
+        Some(expected_api_der.as_slice()),
+        "exact SNI should select api.example.com certificate"
+    );
+    assert_eq!(String::from_utf8_lossy(&exact.body), "backend ok\n");
+
+    let fallback = run_h3_client_with_tls(
+        listen_addr,
+        H3TlsClientOptions {
+            server_name: "other.example.com",
+            authority: "other.example.com",
+            path: "/",
+            verify_peer: false,
+            root_cert_path: None,
+            client_identity: None,
+            application_protos: quiche::h3::APPLICATION_PROTOCOL,
+            send_request: true,
+        },
+    )
+    .expect("fallback sni client request failed");
+    assert_eq!(fallback.alpn, b"h3");
+    assert_eq!(
+        fallback.peer_cert.as_deref(),
+        Some(expected_fallback_der.as_slice()),
+        "unmatched SNI should fall back to default certificate"
+    );
+    assert_eq!(String::from_utf8_lossy(&fallback.body), "backend ok\n");
+}
+
+#[test]
+#[serial_test::serial]
+fn bootstrap_h2_optional_client_auth_allows_requests_without_certificate() {
+    let dir = tempdir().expect("failed to create temp dir");
+    let (cert, key) = write_test_certs(&dir);
+    let (ca_cert, _client_cert, _client_key) =
+        write_test_ca_and_client_cert(&dir, "client-ca", "client.example.com");
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let backend_addr = rt.block_on(start_h2_backend());
+
+    let listen_port = find_free_tcp_port();
+    let mut config = make_config(
+        listen_port as u32,
+        backend_addr.to_string(),
+        cert.clone(),
+        key,
+    );
+    config.listen.tls.client_auth = ClientAuth {
+        enabled: true,
+        require_client_cert: false,
+        ca_file: Some(ca_cert),
+    };
+
+    let listener = make_listener_with_bootstrap(config);
+    let listen_addr = listener.socket.local_addr().expect("listener addr");
+    let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
+    let bootstrap_addr = SocketAddr::new(listen_addr.ip(), listen_port);
+
+    let response = rt
+        .block_on(run_bootstrap_h2_client_request(
+            bootstrap_addr,
+            &cert,
+            "GET",
+            "/",
+            &[],
+        ))
+        .expect("optional client-auth request failed");
+    assert_eq!(response.0, StatusCode::OK);
+    assert_eq!(String::from_utf8_lossy(&response.1), "backend ok\n");
+}
+
+#[test]
+#[serial_test::serial]
+fn bootstrap_h2_required_client_auth_rejects_missing_certificate_and_accepts_valid_certificate() {
+    let dir = tempdir().expect("failed to create temp dir");
+    let (cert, key) = write_test_certs(&dir);
+    let (ca_cert, client_cert, client_key) =
+        write_test_ca_and_client_cert(&dir, "client-ca", "client.example.com");
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let backend_addr = rt.block_on(start_h2_backend());
+
+    let listen_port = find_free_tcp_port();
+    let mut config = make_config(
+        listen_port as u32,
+        backend_addr.to_string(),
+        cert.clone(),
+        key,
+    );
+    config.listen.tls.client_auth = ClientAuth {
+        enabled: true,
+        require_client_cert: true,
+        ca_file: Some(ca_cert.clone()),
+    };
+
+    let listener = make_listener_with_bootstrap(config);
+    let listen_addr = listener.socket.local_addr().expect("listener addr");
+    let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
+    let bootstrap_addr = SocketAddr::new(listen_addr.ip(), listen_port);
+
+    let missing_cert_err = rt
+        .block_on(connect_bootstrap_h2_with_client_auth(
+            bootstrap_addr,
+            &cert,
+            None,
+        ))
+        .err()
+        .expect("missing client certificate should fail");
+    assert!(
+        missing_cert_err.contains("tls connect"),
+        "unexpected missing-client-cert error: {missing_cert_err}"
+    );
+
+    let response = rt
+        .block_on(async {
+            let (mut sender, _conn_task) = connect_bootstrap_h2_with_client_auth(
+                bootstrap_addr,
+                &cert,
+                Some((&client_cert, &client_key)),
+            )
+            .await?;
+            sender
+                .ready()
+                .await
+                .map_err(|err| format!("sender ready: {err}"))?;
+            let req = Request::builder()
+                .method("GET")
+                .uri(
+                    Uri::builder()
+                        .path_and_query("/")
+                        .build()
+                        .map_err(|err| format!("uri build: {err}"))?,
+                )
+                .header("host", "localhost")
+                .body(Empty::<Bytes>::new())
+                .map_err(|err| format!("request build: {err}"))?;
+            let mut response = sender
+                .send_request(req)
+                .await
+                .map_err(|err| format!("send request: {err}"))?;
+            let status = response.status();
+            let body = response
+                .body_mut()
+                .collect()
+                .await
+                .map_err(|err| format!("collect body: {err}"))?
+                .to_bytes()
+                .to_vec();
+            Ok::<_, String>((status, body))
+        })
+        .expect("client-authenticated bootstrap request failed");
+    assert_eq!(response.0, StatusCode::OK);
+    assert_eq!(String::from_utf8_lossy(&response.1), "backend ok\n");
+}
+
+#[test]
+#[serial_test::serial]
+fn quic_tls_metrics_capture_selection_and_failures() {
+    let dir = tempdir().expect("failed to create temp dir");
+    let (fallback_cert, fallback_key) =
+        write_named_test_cert(&dir, "fallback", &["fallback.example.com"], &[]);
+    let (api_cert, api_key) = write_named_test_cert(&dir, "api", &["api.example.com"], &[]);
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let backend_addr = rt.block_on(start_h2_backend());
+
+    let listen_port = find_free_tcp_port();
+    let metrics_port = find_free_tcp_port();
+    let mut config = make_config(
+        listen_port as u32,
+        backend_addr.to_string(),
+        fallback_cert.clone(),
+        fallback_key,
+    );
+    config.listen.tls.certificates = vec![TlsCertificate {
+        server_name: "api.example.com".to_string(),
+        cert: api_cert,
+        key: api_key,
+    }];
+    config.observability.metrics.enabled = true;
+    config.observability.metrics.address = "127.0.0.1".to_string();
+    config.observability.metrics.port = metrics_port;
+    config.observability.metrics.path = "/metrics".to_string();
+
+    let listener = make_listener_with_bootstrap(config);
+    let listen_addr = listener.socket.local_addr().expect("listener addr");
+    let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
+
+    run_h3_client_with_tls(
+        listen_addr,
+        H3TlsClientOptions {
+            server_name: "api.example.com",
+            authority: "api.example.com",
+            path: "/",
+            verify_peer: false,
+            root_cert_path: None,
+            client_identity: None,
+            application_protos: quiche::h3::APPLICATION_PROTOCOL,
+            send_request: true,
+        },
+    )
+    .expect("exact sni request failed");
+    run_h3_client_with_tls(
+        listen_addr,
+        H3TlsClientOptions {
+            server_name: "other.example.com",
+            authority: "other.example.com",
+            path: "/",
+            verify_peer: false,
+            root_cert_path: None,
+            client_identity: None,
+            application_protos: quiche::h3::APPLICATION_PROTOCOL,
+            send_request: true,
+        },
+    )
+    .expect("fallback sni request failed");
+    let alpn_err = run_h3_client_with_tls(
+        listen_addr,
+        H3TlsClientOptions {
+            server_name: "api.example.com",
+            authority: "api.example.com",
+            path: "/",
+            verify_peer: false,
+            root_cert_path: None,
+            client_identity: None,
+            application_protos: &[b"bogus"],
+            send_request: false,
+        },
+    )
+    .err()
+    .expect("bad ALPN should fail");
+    assert!(
+        alpn_err.contains("connection closed") || alpn_err.contains("timeout"),
+        "unexpected ALPN failure error: {alpn_err}"
+    );
+
+    let metrics = rt
+        .block_on(scrape_metrics(
+            metrics_port,
+            "/metrics",
+            Duration::from_secs(20),
+        ))
+        .expect("metrics endpoint should become reachable");
+    assert!(
+        metrics.contains("spooky_downstream_tls_certificate_selection_total{listener=\"127.0.0.1:")
+    );
+    assert!(metrics.contains("selection=\"exact_sni\""));
+    assert!(metrics.contains("selection=\"fallback_unmatched_sni\""));
+    assert!(metrics.contains("spooky_downstream_tls_alpn_total"));
+    assert!(metrics.contains("protocol=\"h3\""));
+    assert!(metrics.contains("spooky_downstream_tls_handshake_failure_total"));
+    assert!(metrics.contains("reason=\"alpn\""));
+}
+
+#[test]
+#[serial_test::serial]
+fn bootstrap_tls_metrics_capture_missing_client_certificate_failures() {
+    let dir = tempdir().expect("failed to create temp dir");
+    let (cert, key) = write_test_certs(&dir);
+    let (ca_cert, _client_cert, _client_key) =
+        write_test_ca_and_client_cert(&dir, "client-ca", "client.example.com");
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let backend_addr = rt.block_on(start_h2_backend());
+
+    let listen_port = find_free_tcp_port();
+    let metrics_port = find_free_tcp_port();
+    let mut config = make_config(
+        listen_port as u32,
+        backend_addr.to_string(),
+        cert.clone(),
+        key,
+    );
+    config.listen.tls.client_auth = ClientAuth {
+        enabled: true,
+        require_client_cert: true,
+        ca_file: Some(ca_cert),
+    };
+    config.observability.metrics.enabled = true;
+    config.observability.metrics.address = "127.0.0.1".to_string();
+    config.observability.metrics.port = metrics_port;
+    config.observability.metrics.path = "/metrics".to_string();
+
+    let listener = make_listener_with_bootstrap(config);
+    let listen_addr = listener.socket.local_addr().expect("listener addr");
+    let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
+    let bootstrap_addr = SocketAddr::new(listen_addr.ip(), listen_port);
+
+    let err = rt
+        .block_on(connect_bootstrap_h2_with_client_auth(
+            bootstrap_addr,
+            &cert,
+            None,
+        ))
+        .err()
+        .expect("missing client cert should fail");
+    assert!(err.contains("tls connect"), "unexpected error: {err}");
+
+    let metrics = rt
+        .block_on(scrape_metrics(
+            metrics_port,
+            "/metrics",
+            Duration::from_secs(20),
+        ))
+        .expect("metrics endpoint should become reachable");
+    assert!(metrics.contains("spooky_downstream_tls_handshake_failure_total"));
+    assert!(metrics.contains("reason=\"missing_client_cert\""));
 }
 
 #[test]

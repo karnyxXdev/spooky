@@ -1383,6 +1383,7 @@ impl QUICListener {
             packets_since_rotation: 0,
             last_scid_rotation: Instant::now(),
             tls_observed: false,
+            tls_handshake_failure_recorded: false,
             tls_client_auth_failure_recorded: false,
             last_peer_error_snapshot: None,
             last_local_error_snapshot: None,
@@ -1772,6 +1773,7 @@ impl QUICListener {
         );
 
         self.maybe_record_quic_tls_observation(&mut connection);
+        self.maybe_record_quic_tls_handshake_failure(&mut connection);
 
         if self.require_client_cert
             && connection.quic.is_established()
@@ -4759,7 +4761,10 @@ impl QUICListener {
             "expired_client_cert"
         } else if lower.contains("certificate") || lower.contains("cert") {
             "invalid_client_cert"
-        } else if lower.contains("alpn") {
+        } else if lower.contains("alpn")
+            || lower.contains("application protocol")
+            || lower.contains("no application protocol")
+        {
             "alpn"
         } else {
             "handshake"
@@ -4807,6 +4812,44 @@ impl QUICListener {
             client_cert_present
         );
         connection.tls_observed = true;
+    }
+
+    fn maybe_record_quic_tls_handshake_failure(&self, connection: &mut QuicConnection) {
+        if connection.tls_observed
+            || connection.tls_handshake_failure_recorded
+            || connection.quic.is_established()
+            || !connection.quic.is_closed()
+        {
+            return;
+        }
+
+        let Some(err) = connection
+            .quic
+            .local_error()
+            .or_else(|| connection.quic.peer_error())
+        else {
+            return;
+        };
+
+        let reason_text = if err.reason.is_empty() {
+            format!(
+                "quic handshake error code={} is_app={}",
+                err.error_code, err.is_app
+            )
+        } else {
+            String::from_utf8_lossy(&err.reason).into_owned()
+        };
+        let reason = Self::classify_downstream_tls_failure_reason(&reason_text);
+        self.metrics
+            .record_downstream_tls_handshake_failure(&Self::listener_label(&self.config), reason);
+        connection.tls_handshake_failure_recorded = true;
+        debug!(
+            "Recorded QUIC TLS handshake failure listener={} peer={} reason={} detail={}",
+            Self::listener_label(&self.config),
+            connection.peer_address,
+            reason,
+            reason_text
+        );
     }
 
     pub fn spawn_bootstrap_tls_listener(

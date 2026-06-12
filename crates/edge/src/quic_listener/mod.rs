@@ -14,6 +14,9 @@ use std::{
 
 use core::net::SocketAddr;
 
+use boring::ssl::{
+    NameType, SelectCertError, SslContext, SslContextBuilder, SslFiletype, SslMethod, SslVerifyMode,
+};
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
@@ -991,9 +994,6 @@ impl QUICListener {
     }
 
     fn build_quic_config(config: &ListenerRuntimeConfig) -> Result<Config, ProxyError> {
-        let mut quic_config = Config::new(quiche::PROTOCOL_VERSION)
-            .map_err(|err| ProxyError::Transport(format!("failed to create QUIC config: {err}")))?;
-
         let loaded_tls = Self::load_listener_tls_material(config)?;
         debug!(
             "Loaded downstream default TLS identity cert='{}' serial={} san_dns={:?} sni_identities={}",
@@ -1008,28 +1008,7 @@ impl QUICListener {
                 client_auth_ca.ca_file, client_auth_ca.certificate_count
             );
         }
-        let default_cert = loaded_tls.default_identity.identity.cert_path.as_str();
-        let default_key = loaded_tls.default_identity.identity.key_path.as_str();
-
-        match quic_config.load_cert_chain_from_pem_file(default_cert) {
-            Ok(_) => debug!("Certificate loaded successfully"),
-            Err(e) => {
-                return Err(ProxyError::Tls(format!(
-                    "Failed to load certificate '{}': {}",
-                    default_cert, e
-                )));
-            }
-        }
-
-        match quic_config.load_priv_key_from_pem_file(default_key) {
-            Ok(_) => debug!("Private key loaded successfully"),
-            Err(e) => {
-                return Err(ProxyError::Tls(format!(
-                    "Failed to load key '{}': {}",
-                    default_key, e
-                )));
-            }
-        }
+        let mut quic_config = Self::build_quic_config_from_loaded(&loaded_tls)?;
 
         quic_config
             .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
@@ -1053,20 +1032,6 @@ impl QUICListener {
         quic_config.set_disable_active_migration(true);
 
         if loaded_tls.client_auth.enabled {
-            let client_auth_ca = loaded_tls.client_auth_ca.as_ref().ok_or_else(|| {
-                ProxyError::Tls(
-                    "listen.tls.client_auth.ca_file is required when mTLS is enabled".to_string(),
-                )
-            })?;
-            quic_config
-                .load_verify_locations_from_file(&client_auth_ca.ca_file)
-                .map_err(|err| {
-                    ProxyError::Tls(format!(
-                        "failed to load listen.tls.client_auth.ca_file '{}': {}",
-                        client_auth_ca.ca_file, err
-                    ))
-                })?;
-            quic_config.verify_peer(true);
             info!(
                 "Downstream mTLS enabled (require_client_cert={})",
                 loaded_tls.client_auth.require_client_cert
@@ -1076,6 +1041,130 @@ impl QUICListener {
         }
 
         Ok(quic_config)
+    }
+
+    fn build_quic_config_from_loaded(
+        loaded_tls: &LoadedListenerTlsMaterial,
+    ) -> Result<Config, ProxyError> {
+        let tls_ctx_builder = Self::build_quic_ssl_context_builder(loaded_tls)?;
+        Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls_ctx_builder)
+            .map_err(|err| ProxyError::Transport(format!("failed to create QUIC config: {err}")))
+    }
+
+    fn build_quic_ssl_context_builder(
+        loaded_tls: &LoadedListenerTlsMaterial,
+    ) -> Result<SslContextBuilder, ProxyError> {
+        let mut default_builder = Self::build_quic_ssl_context_builder_for_identity(
+            &loaded_tls.default_identity.identity,
+            &loaded_tls.client_auth,
+            loaded_tls.client_auth_ca.as_ref(),
+        )?;
+
+        if loaded_tls.sni_identities.is_empty() {
+            return Ok(default_builder);
+        }
+
+        let mut sni_contexts = HashMap::with_capacity(loaded_tls.sni_identities.len());
+        for (server_name, identity) in &loaded_tls.sni_identities {
+            Self::validate_loaded_sni_identity(server_name, identity)?;
+            sni_contexts.insert(
+                server_name.clone(),
+                Self::build_quic_ssl_context_for_identity(
+                    &identity.identity,
+                    &loaded_tls.client_auth,
+                    loaded_tls.client_auth_ca.as_ref(),
+                )?,
+            );
+        }
+
+        let sni_contexts = Arc::new(sni_contexts);
+        default_builder.set_select_certificate_callback(move |mut hello| {
+            let Some(server_name) = hello.servername(NameType::HOST_NAME) else {
+                return Ok(());
+            };
+            let normalized_server_name = server_name.to_ascii_lowercase();
+            let Some(context) = sni_contexts.get(&normalized_server_name) else {
+                return Ok(());
+            };
+            hello.ssl_mut().set_ssl_context(context).map_err(|err| {
+                error!(
+                    "failed to switch QUIC TLS context for server_name='{}': {}",
+                    normalized_server_name, err
+                );
+                SelectCertError::ERROR
+            })?;
+            Ok(())
+        });
+        Ok(default_builder)
+    }
+
+    fn build_quic_ssl_context_for_identity(
+        identity: &RuntimeTlsIdentity,
+        client_auth: &ClientAuth,
+        client_auth_ca: Option<&LoadedClientAuthCa>,
+    ) -> Result<SslContext, ProxyError> {
+        Ok(Self::build_quic_ssl_context_builder_for_identity(
+            identity,
+            client_auth,
+            client_auth_ca,
+        )?
+        .build())
+    }
+
+    fn build_quic_ssl_context_builder_for_identity(
+        identity: &RuntimeTlsIdentity,
+        client_auth: &ClientAuth,
+        client_auth_ca: Option<&LoadedClientAuthCa>,
+    ) -> Result<SslContextBuilder, ProxyError> {
+        let mut builder = SslContextBuilder::new(SslMethod::tls()).map_err(|err| {
+            ProxyError::Tls(format!(
+                "failed to build downstream QUIC TLS context for '{}': {}",
+                identity.cert_path, err
+            ))
+        })?;
+
+        builder
+            .set_certificate_chain_file(&identity.cert_path)
+            .map_err(|err| {
+                ProxyError::Tls(format!(
+                    "failed to load certificate '{}': {}",
+                    identity.cert_path, err
+                ))
+            })?;
+        builder
+            .set_private_key_file(&identity.key_path, SslFiletype::PEM)
+            .map_err(|err| {
+                ProxyError::Tls(format!(
+                    "failed to load key '{}': {}",
+                    identity.key_path, err
+                ))
+            })?;
+
+        if client_auth.enabled {
+            let client_auth_ca = client_auth_ca.ok_or_else(|| {
+                ProxyError::Tls(
+                    "listen.tls.client_auth.ca_file is required when mTLS is enabled".to_string(),
+                )
+            })?;
+            builder
+                .set_ca_file(&client_auth_ca.ca_file)
+                .map_err(|err| {
+                    ProxyError::Tls(format!(
+                        "failed to load listen.tls.client_auth.ca_file '{}': {}",
+                        client_auth_ca.ca_file, err
+                    ))
+                })?;
+            let verify_mode = if client_auth.require_client_cert {
+                SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT
+            } else {
+                SslVerifyMode::PEER
+            };
+            builder.set_verify(verify_mode);
+        } else {
+            builder.set_verify(SslVerifyMode::NONE);
+        }
+
+        Ok(builder)
     }
 
     fn tls_reload_generation_if_needed(
@@ -4403,10 +4492,9 @@ impl QUICListener {
         for (server_name, identity) in &listener_tls.sni_identities {
             let cert_field = format!("listen.tls.certificates['{server_name}'].cert");
             let key_field = format!("listen.tls.certificates['{server_name}'].key");
-            sni_identities.insert(
-                server_name.clone(),
-                Self::load_listener_identity(identity, &cert_field, &key_field)?,
-            );
+            let loaded_identity = Self::load_listener_identity(identity, &cert_field, &key_field)?;
+            Self::validate_loaded_sni_identity(server_name, &loaded_identity)?;
+            sni_identities.insert(server_name.clone(), loaded_identity);
         }
 
         Ok(LoadedListenerTlsMaterial {
@@ -4486,6 +4574,7 @@ impl QUICListener {
 
         let mut sni_resolver = ResolvesServerCertUsingSni::new();
         for (server_name, identity) in &loaded_tls.sni_identities {
+            Self::validate_loaded_sni_identity(server_name, identity)?;
             sni_resolver
                 .add(
                     server_name.as_str(),
@@ -4505,6 +4594,49 @@ impl QUICListener {
         let mut tls_config = builder.with_cert_resolver(resolver);
         tls_config.alpn_protocols = alpn_protocols;
         Ok(tls_config)
+    }
+
+    fn validate_loaded_sni_identity(
+        server_name: &str,
+        identity: &LoadedListenerIdentity,
+    ) -> Result<(), ProxyError> {
+        if Self::certificate_covers_server_name(&identity.metadata, server_name) {
+            return Ok(());
+        }
+
+        Err(ProxyError::Tls(format!(
+            "failed to add SNI certificate mapping for '{server_name}': certificate SANs {:?} do not cover server name",
+            identity.metadata.dns_names
+        )))
+    }
+
+    fn certificate_covers_server_name(
+        metadata: &RuntimeTlsCertificateMetadata,
+        server_name: &str,
+    ) -> bool {
+        metadata
+            .dns_names
+            .iter()
+            .any(|dns_name| Self::certificate_name_matches(dns_name, server_name))
+    }
+
+    fn certificate_name_matches(pattern: &str, server_name: &str) -> bool {
+        if pattern.eq_ignore_ascii_case(server_name) {
+            return true;
+        }
+
+        let Some(suffix) = pattern.strip_prefix("*.") else {
+            return false;
+        };
+        let suffix = suffix.to_ascii_lowercase();
+        let server_name = server_name.to_ascii_lowercase();
+        let Some(prefix) = server_name.strip_suffix(&suffix) else {
+            return false;
+        };
+        let Some(label) = prefix.strip_suffix('.') else {
+            return false;
+        };
+        !label.is_empty() && !label.contains('.')
     }
 
     fn build_listener_tls_reload_state(
@@ -6133,6 +6265,65 @@ mod tests {
                 .contains("failed to add SNI certificate mapping"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn build_quic_config_accepts_sni_certs_without_legacy_pair() {
+        let dir = tempdir().expect("tempdir");
+        let (api_cert, api_key) = write_test_cert_for_name(dir.path(), "api", "api.example.com");
+        let config = tls_test_config(
+            String::new(),
+            String::new(),
+            vec![TlsCertificate {
+                server_name: "api.example.com".to_string(),
+                cert: api_cert,
+                key: api_key,
+            }],
+        );
+
+        let quic_config =
+            super::QUICListener::build_quic_config(&tls_test_listener_config(&config));
+        assert!(quic_config.is_ok(), "unexpected error: {quic_config:?}");
+    }
+
+    #[test]
+    fn build_quic_config_rejects_mismatched_sni_certificate_mapping() {
+        let dir = tempdir().expect("tempdir");
+        let (api_cert, api_key) = write_test_cert_for_name(dir.path(), "api", "api.example.com");
+        let config = tls_test_config(
+            String::new(),
+            String::new(),
+            vec![TlsCertificate {
+                server_name: "other.example.com".to_string(),
+                cert: api_cert,
+                key: api_key,
+            }],
+        );
+
+        let err = super::QUICListener::build_quic_config(&tls_test_listener_config(&config))
+            .err()
+            .expect("mismatched SNI cert mapping should fail");
+        assert!(
+            err.to_string()
+                .contains("failed to add SNI certificate mapping"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn certificate_name_matches_single_label_wildcards_only() {
+        assert!(super::QUICListener::certificate_name_matches(
+            "*.example.com",
+            "api.example.com"
+        ));
+        assert!(!super::QUICListener::certificate_name_matches(
+            "*.example.com",
+            "deep.api.example.com"
+        ));
+        assert!(!super::QUICListener::certificate_name_matches(
+            "*.example.com",
+            "example.com"
+        ));
     }
 
     #[test]

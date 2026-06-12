@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+boring.workspace = true
 log.workspace = true
 quiche.workspace = true
 spooky-config = { path = "../config" }

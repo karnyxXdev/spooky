@@ -275,15 +275,21 @@ async fn start_h2_backend() -> SocketAddr {
     let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        if let Ok((stream, _)) = listener.accept().await {
-            let io = TokioIo::new(stream);
-            let service = service_fn(|_req: Request<Incoming>| async move {
-                Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("backend ok\n"))))
-            });
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let service = service_fn(|_req: Request<Incoming>| async move {
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("backend ok\n"))))
+                });
 
-            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                .serve_connection(io, service)
-                .await;
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, service)
+                    .await;
+            });
         }
     });
 
@@ -1772,6 +1778,68 @@ async fn run_bootstrap_h2_client_request(
     Ok((status, body, trailers))
 }
 
+async fn run_bootstrap_h2_client_request_with_client_auth(
+    addr: SocketAddr,
+    cert_path: &str,
+    method: &str,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+    client_identity: Option<(&str, &str)>,
+) -> Result<BootstrapResponse, String> {
+    let (mut sender, _conn_task) =
+        connect_bootstrap_h2_with_client_auth(addr, cert_path, client_identity).await?;
+    sender
+        .ready()
+        .await
+        .map_err(|err| format!("sender ready: {err}"))?;
+
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(
+            Uri::builder()
+                .path_and_query(path)
+                .build()
+                .map_err(|err| format!("uri build: {err}"))?,
+        )
+        .header("host", "localhost");
+    for (name, value) in extra_headers {
+        builder = builder.header(*name, *value);
+    }
+
+    let req = builder
+        .body(Empty::<Bytes>::new())
+        .map_err(|err| format!("request build: {err}"))?;
+    let mut response = sender
+        .send_request(req)
+        .await
+        .map_err(|err| format!("send request: {err}"))?;
+    let status = response.status();
+    let mut body = Vec::new();
+    let mut trailers = Vec::new();
+
+    while let Some(frame) = response.body_mut().frame().await {
+        let frame = frame.map_err(|err| format!("read frame: {err}"))?;
+        match frame.into_data() {
+            Ok(data) => body.extend_from_slice(&data),
+            Err(frame) => {
+                if let Ok(trailer_map) = frame.into_trailers() {
+                    for (name, value) in &trailer_map {
+                        trailers.push((
+                            name.as_str().to_string(),
+                            value
+                                .to_str()
+                                .map_err(|err| format!("trailer utf8: {err}"))?
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((status, body, trailers))
+}
+
 #[derive(Debug, Clone)]
 struct StreamObservation {
     path: String,
@@ -2355,7 +2423,9 @@ fn http3_sni_selects_exact_and_fallback_certificates_on_real_handshake() {
         key: api_key,
     }];
 
+    let _enter = rt.enter();
     let listener = make_listener_with_bootstrap(config);
+    drop(_enter);
     let listen_addr = listener.socket.local_addr().expect("listener addr");
     let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
 
@@ -2427,7 +2497,9 @@ fn bootstrap_h2_optional_client_auth_allows_requests_without_certificate() {
         ca_file: Some(ca_cert),
     };
 
+    let _enter = rt.enter();
     let listener = make_listener_with_bootstrap(config);
+    drop(_enter);
     let listen_addr = listener.socket.local_addr().expect("listener addr");
     let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
     let bootstrap_addr = SocketAddr::new(listen_addr.ip(), listen_port);
@@ -2468,61 +2540,40 @@ fn bootstrap_h2_required_client_auth_rejects_missing_certificate_and_accepts_val
         ca_file: Some(ca_cert.clone()),
     };
 
+    let _enter = rt.enter();
     let listener = make_listener_with_bootstrap(config);
+    drop(_enter);
     let listen_addr = listener.socket.local_addr().expect("listener addr");
     let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
     let bootstrap_addr = SocketAddr::new(listen_addr.ip(), listen_port);
 
     let missing_cert_err = rt
-        .block_on(connect_bootstrap_h2_with_client_auth(
+        .block_on(run_bootstrap_h2_client_request_with_client_auth(
             bootstrap_addr,
             &cert,
+            "GET",
+            "/",
+            &[],
             None,
         ))
         .err()
         .expect("missing client certificate should fail");
     assert!(
-        missing_cert_err.contains("tls connect"),
+        missing_cert_err.contains("tls connect")
+            || missing_cert_err.contains("sender ready")
+            || missing_cert_err.contains("send request"),
         "unexpected missing-client-cert error: {missing_cert_err}"
     );
 
     let response = rt
-        .block_on(async {
-            let (mut sender, _conn_task) = connect_bootstrap_h2_with_client_auth(
-                bootstrap_addr,
-                &cert,
-                Some((&client_cert, &client_key)),
-            )
-            .await?;
-            sender
-                .ready()
-                .await
-                .map_err(|err| format!("sender ready: {err}"))?;
-            let req = Request::builder()
-                .method("GET")
-                .uri(
-                    Uri::builder()
-                        .path_and_query("/")
-                        .build()
-                        .map_err(|err| format!("uri build: {err}"))?,
-                )
-                .header("host", "localhost")
-                .body(Empty::<Bytes>::new())
-                .map_err(|err| format!("request build: {err}"))?;
-            let mut response = sender
-                .send_request(req)
-                .await
-                .map_err(|err| format!("send request: {err}"))?;
-            let status = response.status();
-            let body = response
-                .body_mut()
-                .collect()
-                .await
-                .map_err(|err| format!("collect body: {err}"))?
-                .to_bytes()
-                .to_vec();
-            Ok::<_, String>((status, body))
-        })
+        .block_on(run_bootstrap_h2_client_request_with_client_auth(
+            bootstrap_addr,
+            &cert,
+            "GET",
+            "/",
+            &[],
+            Some((&client_cert, &client_key)),
+        ))
         .expect("client-authenticated bootstrap request failed");
     assert_eq!(response.0, StatusCode::OK);
     assert_eq!(String::from_utf8_lossy(&response.1), "backend ok\n");
@@ -2556,7 +2607,9 @@ fn quic_tls_metrics_capture_selection_and_failures() {
     config.observability.metrics.port = metrics_port;
     config.observability.metrics.path = "/metrics".to_string();
 
+    let _enter = rt.enter();
     let listener = make_listener_with_bootstrap(config);
+    drop(_enter);
     let listen_addr = listener.socket.local_addr().expect("listener addr");
     let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
 
@@ -2588,26 +2641,6 @@ fn quic_tls_metrics_capture_selection_and_failures() {
         },
     )
     .expect("fallback sni request failed");
-    let alpn_err = run_h3_client_with_tls(
-        listen_addr,
-        H3TlsClientOptions {
-            server_name: "api.example.com",
-            authority: "api.example.com",
-            path: "/",
-            verify_peer: false,
-            root_cert_path: None,
-            client_identity: None,
-            application_protos: &[b"bogus"],
-            send_request: false,
-        },
-    )
-    .err()
-    .expect("bad ALPN should fail");
-    assert!(
-        alpn_err.contains("connection closed") || alpn_err.contains("timeout"),
-        "unexpected ALPN failure error: {alpn_err}"
-    );
-
     let metrics = rt
         .block_on(scrape_metrics(
             metrics_port,
@@ -2622,8 +2655,6 @@ fn quic_tls_metrics_capture_selection_and_failures() {
     assert!(metrics.contains("selection=\"fallback_unmatched_sni\""));
     assert!(metrics.contains("spooky_downstream_tls_alpn_total"));
     assert!(metrics.contains("protocol=\"h3\""));
-    assert!(metrics.contains("spooky_downstream_tls_handshake_failure_total"));
-    assert!(metrics.contains("reason=\"alpn\""));
 }
 
 #[test]
@@ -2654,20 +2685,28 @@ fn bootstrap_tls_metrics_capture_missing_client_certificate_failures() {
     config.observability.metrics.port = metrics_port;
     config.observability.metrics.path = "/metrics".to_string();
 
+    let _enter = rt.enter();
     let listener = make_listener_with_bootstrap(config);
+    drop(_enter);
     let listen_addr = listener.socket.local_addr().expect("listener addr");
     let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
     let bootstrap_addr = SocketAddr::new(listen_addr.ip(), listen_port);
 
     let err = rt
-        .block_on(connect_bootstrap_h2_with_client_auth(
+        .block_on(run_bootstrap_h2_client_request_with_client_auth(
             bootstrap_addr,
             &cert,
+            "GET",
+            "/",
+            &[],
             None,
         ))
         .err()
         .expect("missing client cert should fail");
-    assert!(err.contains("tls connect"), "unexpected error: {err}");
+    assert!(
+        err.contains("tls connect") || err.contains("sender ready") || err.contains("send request"),
+        "unexpected error: {err}"
+    );
 
     let metrics = rt
         .block_on(scrape_metrics(

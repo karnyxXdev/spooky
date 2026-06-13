@@ -14,9 +14,11 @@ use std::{
 
 use core::net::SocketAddr;
 
+use boring::pkey::{PKey, Private};
 use boring::ssl::{
-    NameType, SelectCertError, SslContext, SslContextBuilder, SslFiletype, SslMethod, SslVerifyMode,
+    NameType, SelectCertError, SslContextBuilder, SslFiletype, SslMethod, SslVerifyMode,
 };
+use boring::x509::X509;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
@@ -134,6 +136,12 @@ struct LoadedListenerTlsMaterial {
     sni_identities: HashMap<String, LoadedListenerIdentity>,
     client_auth: ClientAuth,
     client_auth_ca: Option<LoadedClientAuthCa>,
+}
+
+struct QuicSniCertMaterial {
+    leaf: X509,
+    chain: Vec<X509>,
+    key: PKey<Private>,
 }
 
 impl ResolvesServerCert for FallbackServerCertResolver {
@@ -1064,31 +1072,77 @@ impl QUICListener {
             return Ok(default_builder);
         }
 
-        let mut sni_contexts = HashMap::with_capacity(loaded_tls.sni_identities.len());
+        let mut sni_certs: HashMap<String, QuicSniCertMaterial> =
+            HashMap::with_capacity(loaded_tls.sni_identities.len());
         for (server_name, identity) in &loaded_tls.sni_identities {
             Self::validate_loaded_sni_identity(server_name, identity)?;
-            sni_contexts.insert(
+            let cert_pem = std::fs::read(&identity.identity.cert_path).map_err(|err| {
+                ProxyError::Tls(format!(
+                    "failed to read SNI cert '{}': {}",
+                    identity.identity.cert_path, err
+                ))
+            })?;
+            let mut certs = X509::stack_from_pem(&cert_pem).map_err(|err| {
+                ProxyError::Tls(format!(
+                    "failed to parse SNI cert '{}': {}",
+                    identity.identity.cert_path, err
+                ))
+            })?;
+            if certs.is_empty() {
+                return Err(ProxyError::Tls(format!(
+                    "SNI cert '{}' contains no certificates",
+                    identity.identity.cert_path
+                )));
+            }
+            let leaf = certs.remove(0);
+            let chain = certs;
+            let key_pem = std::fs::read(&identity.identity.key_path).map_err(|err| {
+                ProxyError::Tls(format!(
+                    "failed to read SNI key '{}': {}",
+                    identity.identity.key_path, err
+                ))
+            })?;
+            let key = PKey::private_key_from_pem(&key_pem).map_err(|err| {
+                ProxyError::Tls(format!(
+                    "failed to parse SNI key '{}': {}",
+                    identity.identity.key_path, err
+                ))
+            })?;
+            sni_certs.insert(
                 server_name.clone(),
-                Self::build_quic_ssl_context_for_identity(
-                    &identity.identity,
-                    &loaded_tls.client_auth,
-                    loaded_tls.client_auth_ca.as_ref(),
-                )?,
+                QuicSniCertMaterial { leaf, chain, key },
             );
         }
 
-        let sni_contexts = Arc::new(sni_contexts);
+        let sni_certs = Arc::new(sni_certs);
         default_builder.set_select_certificate_callback(move |mut hello| {
             let Some(server_name) = hello.servername(NameType::HOST_NAME) else {
                 return Ok(());
             };
             let normalized_server_name = server_name.to_ascii_lowercase();
-            let Some(context) = sni_contexts.get(&normalized_server_name) else {
+            let Some(data) = sni_certs.get(&normalized_server_name) else {
                 return Ok(());
             };
-            hello.ssl_mut().set_ssl_context(context).map_err(|err| {
+            let ssl = hello.ssl_mut();
+            ssl.set_certificate(&data.leaf).map_err(|err| {
                 error!(
-                    "failed to switch QUIC TLS context for server_name='{}': {}",
+                    "failed to set QUIC SNI certificate for server_name='{}': {}",
+                    normalized_server_name, err
+                );
+                SelectCertError::ERROR
+            })?;
+            for cert in &data.chain {
+                ssl.add_chain_cert(cert).map_err(|err| {
+                    error!(
+                        "failed to add QUIC SNI chain cert for server_name='{}': {}",
+                        normalized_server_name, err
+                    );
+                    SelectCertError::ERROR
+                })?;
+            }
+            ssl.set_private_key(&data.key).map_err(|err| {
+                error!(
+                    "failed to set QUIC SNI key for server_name='{}': {}",
                     normalized_server_name, err
                 );
                 SelectCertError::ERROR
@@ -1096,19 +1150,6 @@ impl QUICListener {
             Ok(())
         });
         Ok(default_builder)
-    }
-
-    fn build_quic_ssl_context_for_identity(
-        identity: &RuntimeTlsIdentity,
-        client_auth: &ClientAuth,
-        client_auth_ca: Option<&LoadedClientAuthCa>,
-    ) -> Result<SslContext, ProxyError> {
-        Ok(Self::build_quic_ssl_context_builder_for_identity(
-            identity,
-            client_auth,
-            client_auth_ca,
-        )?
-        .build())
     }
 
     fn build_quic_ssl_context_builder_for_identity(
@@ -4818,11 +4859,13 @@ impl QUICListener {
         if connection.tls_observed
             || connection.tls_handshake_failure_recorded
             || connection.quic.is_established()
-            || !connection.quic.is_closed()
         {
             return;
         }
 
+        // Record as soon as a connection error is present, not just when fully closed.
+        // local_error() is set the moment quiche sends CONNECTION_CLOSE, which happens
+        // during the draining period before is_closed() becomes true.
         let Some(err) = connection
             .quic
             .local_error()
@@ -4832,10 +4875,23 @@ impl QUICListener {
         };
 
         let reason_text = if err.reason.is_empty() {
-            format!(
-                "quic handshake error code={} is_app={}",
-                err.error_code, err.is_app
-            )
+            // QUIC CRYPTO_ERRORs (0x100–0x1ff) encode a TLS alert in the low byte (RFC 9001 §4.8).
+            // Map the alert to a description that classify_downstream_tls_failure_reason can match.
+            if !err.is_app && (0x100..=0x1ff).contains(&err.error_code) {
+                let tls_alert = err.error_code - 0x100;
+                match tls_alert {
+                    120 => "no application protocol".to_string(), // ALPN mismatch
+                    42 => "bad certificate".to_string(),
+                    45 => "certificate expired".to_string(),
+                    48 => "unknown certificate authority".to_string(),
+                    _ => format!("quic tls alert={}", tls_alert),
+                }
+            } else {
+                format!(
+                    "quic handshake error code={} is_app={}",
+                    err.error_code, err.is_app
+                )
+            }
         } else {
             String::from_utf8_lossy(&err.reason).into_owned()
         };

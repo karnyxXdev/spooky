@@ -34,33 +34,43 @@ nav:
       - Overview: getting-started/overview.md
       - Installation: getting-started/installation.md
       - Docker: getting-started/docker.md
+      - Minimum Production: getting-started/minimum-production.md
       - Quick Start: tutorials/quickstart.md
-  - Configuration:
-      - Reference: configuration/reference.md
-      - TLS Setup: configuration/tls.md
-  - How-To Guides:
-      - Overview: howto/README.md
-      - Certificates: howto/01-certificates.md
-      - Configuration: howto/02-configuration.md
-      - Run Spooky: howto/03-run.md
-  - User Guide:
+  - Concepts:
+      - Overview: concepts/overview.md
+      - Security Model: concepts/security-model.md
       - Basics: user-guide/basics.md
-      - Load Balancing: user-guide/load-balancing.md
-  - Architecture:
-      - Overview: architecture.md
-      - High-Level Design: architecture/overview.md
+      - Architecture Overview: architecture/overview.md
       - Components: architecture/components.md
-  - Deployment:
-      - Production: deployment/production.md
-      - Troubleshooting: troubleshooting/common-issues.md
-  - Development:
-      - Changelog: changelog.md
-  - Protocols:
       - HTTP/3: protocols/http3.md
       - QUIC: protocols/quic.md
-  - API:
-      - Overview: api/overview.md
-  - References: references.md
+  - Reference:
+      - Overview: reference/overview.md
+      - Feature Matrix: reference/feature-matrix.md
+      - Limitations: reference/limitations.md
+      - Configuration Reference: configuration/reference.md
+      - TLS Setup: configuration/tls.md
+      - API Overview: api/overview.md
+      - References: references.md
+  - Operations:
+      - Overview: operations/overview.md
+      - Production Readiness: operations/production-readiness.md
+      - Release Maturity: release-maturity.md
+      - Production Deployment: deployment/production.md
+      - Validation: deployment/validation.md
+      - Migration: deployment/migration.md
+      - Troubleshooting: troubleshooting/common-issues.md
+  - Development:
+      - Overview: development/overview.md
+      - How-To Overview: howto/README.md
+      - Certificates How-To: howto/01-certificates.md
+      - Configuration How-To: howto/02-configuration.md
+      - Run Spooky: howto/03-run.md
+      - Load Balancing Guide: user-guide/load-balancing.md
+      - Changelog: changelog.md
+  - Protocols:
+      - HTTP/3 Deep Dive: protocols/http3.md
+      - QUIC Deep Dive: protocols/quic.md
   - Roadmap: roadmap.md
 
 extra:

@@ -5,6 +5,66 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-beta] - 2026-06-18
+
+### Added
+
+**TLS**
+- Live listener certificate reload — certificates can be reloaded without restarting the process.
+- SNI-based server certificate selection with fallback for listener TLS, plus native QUIC SNI cert selection.
+- Per-upstream TLS policy override — each upstream can now specify its own TLS settings independent of the global config.
+- Certificate expiry telemetry — expiry timestamps exposed for monitoring.
+- Downstream handshake telemetry — TLS handshake metrics on the listener path.
+- Upstream TLS failure classification — failures are now categorized (cert, SNI mismatch, timeout, etc.) in logs and metrics.
+
+**Routing**
+- Wildcard host pattern matching in the route index with correct precedence over exact-host routes.
+- Multi-listener support — independent listener worker groups can be spawned per listener entry.
+
+**Forwarding**
+- CONNECT tunnel support — HTTP CONNECT requests are validated, translated, and lifecycle-managed over H3.
+- Response trailer forwarding over H3 — upstream response trailers are now relayed to the downstream client.
+- Configurable `X-Forwarded-For` policy — choose append vs. overwrite semantics per deployment.
+- Configurable Host header forwarding policy — preserve the original downstream `Host` or rewrite to the upstream authority.
+
+**DNS**
+- Periodic backend DNS refresh loop — backends are re-resolved at runtime without restart.
+- Shared DNS resolver cache with atomic update semantics.
+- Backend DNS refresh configuration (`performance.backend_dns_refresh_enabled`, `performance.backend_dns_refresh_interval_ms`).
+- Backend connect and rotation telemetry — metrics for DNS refresh events, connection rotation, and backend selection.
+
+**Config**
+- Canonical runtime config model — a normalized intermediate config representation validated before startup.
+- Cross-field normalization checks enforced at startup with classified error types.
+- Runtime startup drives from the normalized config rather than raw YAML structs.
+
+**Load Harness**
+- H3 client timeout retry and reconnect controls.
+- Config-gated inflight admission micro-wait.
+- Matrix profile override and selection knobs.
+- Improved worker model and ramp handling in load scenarios.
+
+### Fixed
+
+- `H2Client::default()` panicked on invalid TLS config — default construction no longer panics.
+- Bootstrap response streaming lacked a running body-size cap — body size is now enforced incrementally.
+- Hop-by-hop headers were not stripped from bootstrap responses.
+- Ambiguous route conflicts (overlapping prefix + host combinations) are now rejected at startup.
+- Backend hostnames are now validated more strictly at config load time.
+- Upstream send/connect failures are classified into backend health states instead of being silently swallowed.
+- SNI certificate hostnames containing whitespace are now rejected at config load.
+- Route decision reasons were unstable for wildcard and trie-level routes.
+- Authority/host normalization adapted to avoid unnecessary allocations on the hot path.
+- Insecure upstream TLS (`verify_certificates: false`) now always emits a startup warning log.
+
+### Changed
+
+- Bootstrap forwarding policy unified into a single code path.
+- Route precedence decisions made explicit in the routing layer.
+- Backend health identity made explicit — health checks align with live backend resolution.
+- Pooled clients are rotated when backend DNS changes are detected.
+- Listener TLS material loading centralized.
+
 ## [0.1.1-beta] - 2026-05-28
 
 ### Added

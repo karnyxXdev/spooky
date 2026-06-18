@@ -52,6 +52,8 @@ nav:
       - Configuration Examples: configuration/examples.md
       - TLS Setup: configuration/tls.md
       - API Overview: api/overview.md
+      - Metrics Reference: reference/metrics-reference.md
+      - Control API Reference: reference/control-api-reference.md
       - References: references.md
   - Operations:
       - Overview: operations/overview.md

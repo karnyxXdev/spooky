@@ -4,12 +4,12 @@ use crate::config::{
     UpstreamTls,
 };
 use log::{info, warn};
-use std::error::Error as StdError;
-use std::fmt;
-use std::sync::{Mutex, OnceLock};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::collections::HashMap;
+use std::error::Error as StdError;
+use std::fmt;
 use std::net::IpAddr;
+use std::sync::{Mutex, OnceLock};
 
 pub const VALID_LOG_LEVELS: &[&str] = &[
     "whisper",
@@ -45,7 +45,6 @@ pub const VALID_LB_TYPES: &[&str] = &[
     "cid-sticky",
     "cid_sticky",
 ];
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationError {
@@ -103,7 +102,6 @@ macro_rules! validation_error {
     }};
 }
 
-
 fn validate_pem_certificates(path: &str, field_name: &str) -> bool {
     let pem = match std::fs::read(path) {
         Ok(pem) => pem,
@@ -118,7 +116,9 @@ fn validate_pem_certificates(path: &str, field_name: &str) -> bool {
         Err(err) => {
             validation_error!(
                 "Cannot parse PEM certificates from {} '{}': {}",
-                field_name, path, err
+                field_name,
+                path,
+                err
             );
             return false;
         }
@@ -127,7 +127,8 @@ fn validate_pem_certificates(path: &str, field_name: &str) -> bool {
     if certs.is_empty() {
         validation_error!(
             "{} '{}' does not contain any PEM certificate blocks",
-            field_name, path
+            field_name,
+            path
         );
         return false;
     }
@@ -149,7 +150,9 @@ fn validate_pem_private_key(path: &str, field_name: &str) -> bool {
         Err(err) => {
             validation_error!(
                 "Cannot parse PEM private key from {} '{}': {}",
-                field_name, path, err
+                field_name,
+                path,
+                err
             );
             false
         }
@@ -199,7 +202,8 @@ fn validate_listen_config(listen: &Listen, field_prefix: &str) -> bool {
     if listen.protocol != "http3" {
         validation_error!(
             "{} protocol: expected 'http3', found '{}'",
-            field_prefix, listen.protocol
+            field_prefix,
+            listen.protocol
         );
         return false;
     }
@@ -212,7 +216,8 @@ fn validate_listen_config(listen: &Listen, field_prefix: &str) -> bool {
     if listen.port == 0 {
         validation_error!(
             "Invalid {} port: {} (must be between 1 and 65535)",
-            field_prefix, listen.port
+            field_prefix,
+            listen.port
         );
         return false;
     }
@@ -235,7 +240,8 @@ fn validate_listen_config(listen: &Listen, field_prefix: &str) -> bool {
         if legacy_cert.is_empty() || legacy_key.is_empty() {
             validation_error!(
                 "{}.cert and {}.key must both be set when either is provided",
-                tls_prefix, tls_prefix
+                tls_prefix,
+                tls_prefix
             );
             return false;
         }
@@ -255,7 +261,8 @@ fn validate_listen_config(listen: &Listen, field_prefix: &str) -> bool {
             None => {
                 validation_error!(
                     "{}.server_name '{}' is not a valid DNS hostname",
-                    field_prefix, entry.server_name
+                    field_prefix,
+                    entry.server_name
                 );
                 return false;
             }
@@ -264,7 +271,10 @@ fn validate_listen_config(listen: &Listen, field_prefix: &str) -> bool {
         if let Some(first_idx) = seen_sni_names.insert(sni_name.clone(), idx) {
             validation_error!(
                 "{}.server_name '{}' duplicates {}.certificates[{}].server_name",
-                field_prefix, entry.server_name, tls_prefix, first_idx
+                field_prefix,
+                entry.server_name,
+                tls_prefix,
+                first_idx
             );
             return false;
         }
@@ -467,7 +477,8 @@ fn validate_inner(config: &Config) -> bool {
             .join(", ");
         validation_error!(
             "Invalid version: found '{}', supported versions are [{}]",
-            config.version, supported
+            config.version,
+            supported
         );
         return false;
     }
@@ -509,7 +520,10 @@ fn validate_inner(config: &Config) -> bool {
         if let Some(existing) = seen_listener_bindings.insert(key, label.clone()) {
             validation_error!(
                 "listener binding conflict: {} duplicates {} on {}:{}",
-                label, existing, listen.address, listen.port
+                label,
+                existing,
+                listen.address,
+                listen.port
             );
             return false;
         }
@@ -707,7 +721,9 @@ fn validate_inner(config: &Config) -> bool {
     }
 
     if config.performance.unknown_length_response_prebuffer_bytes == 0 {
-        validation_error!("performance.unknown_length_response_prebuffer_bytes must be greater than 0");
+        validation_error!(
+            "performance.unknown_length_response_prebuffer_bytes must be greater than 0"
+        );
         return false;
     }
 
@@ -729,7 +745,9 @@ fn validate_inner(config: &Config) -> bool {
     if config.performance.backend_body_idle_timeout_ms
         > config.performance.backend_body_total_timeout_ms
     {
-        validation_error!("performance.backend_body_idle_timeout_ms must be <= backend_body_total_timeout_ms");
+        validation_error!(
+            "performance.backend_body_idle_timeout_ms must be <= backend_body_total_timeout_ms"
+        );
         return false;
     }
 
@@ -787,14 +805,16 @@ fn validate_inner(config: &Config) -> bool {
         if max_limit < config.resilience.adaptive_admission.min_limit {
             validation_error!(
                 "resilience.adaptive_admission.max_limit ({}) must be >= min_limit ({})",
-                max_limit, config.resilience.adaptive_admission.min_limit
+                max_limit,
+                config.resilience.adaptive_admission.min_limit
             );
             return false;
         }
         if max_limit > config.performance.global_inflight_limit {
             validation_error!(
                 "resilience.adaptive_admission.max_limit ({}) must be <= performance.global_inflight_limit ({})",
-                max_limit, config.performance.global_inflight_limit
+                max_limit,
+                config.performance.global_inflight_limit
             );
             return false;
         }
@@ -853,7 +873,9 @@ fn validate_inner(config: &Config) -> bool {
         .iter()
         .any(|method| method.trim().is_empty())
     {
-        validation_error!("resilience.protocol.early_data_safe_methods must not contain empty values");
+        validation_error!(
+            "resilience.protocol.early_data_safe_methods must not contain empty values"
+        );
         return false;
     }
 
@@ -875,7 +897,9 @@ fn validate_inner(config: &Config) -> bool {
         .iter()
         .any(|method| !is_valid_http_token(method))
     {
-        validation_error!("resilience.protocol.allowed_methods must contain valid HTTP method tokens");
+        validation_error!(
+            "resilience.protocol.allowed_methods must contain valid HTTP method tokens"
+        );
         return false;
     }
 
@@ -886,7 +910,9 @@ fn validate_inner(config: &Config) -> bool {
         .iter()
         .any(|prefix| prefix.is_empty() || !prefix.starts_with('/'))
     {
-        validation_error!("resilience.protocol.denied_path_prefixes must contain '/'-prefixed paths");
+        validation_error!(
+            "resilience.protocol.denied_path_prefixes must contain '/'-prefixed paths"
+        );
         return false;
     }
 
@@ -910,7 +936,9 @@ fn validate_inner(config: &Config) -> bool {
         .connect_allowed_ports
         .contains(&0)
     {
-        validation_error!("resilience.protocol.connect_allowed_ports must contain ports in range 1-65535");
+        validation_error!(
+            "resilience.protocol.connect_allowed_ports must contain ports in range 1-65535"
+        );
         return false;
     }
 
@@ -981,7 +1009,9 @@ fn validate_inner(config: &Config) -> bool {
     if config.resilience.brownout.recover_inflight_percent
         >= config.resilience.brownout.trigger_inflight_percent
     {
-        validation_error!("resilience.brownout.recover_inflight_percent must be < trigger_inflight_percent");
+        validation_error!(
+            "resilience.brownout.recover_inflight_percent must be < trigger_inflight_percent"
+        );
         return false;
     }
 
@@ -1011,7 +1041,9 @@ fn validate_inner(config: &Config) -> bool {
     }
 
     if config.resilience.watchdog.unhealthy_consecutive_windows == 0 {
-        validation_error!("resilience.watchdog.unhealthy_consecutive_windows must be greater than 0");
+        validation_error!(
+            "resilience.watchdog.unhealthy_consecutive_windows must be greater than 0"
+        );
         return false;
     }
 
@@ -1030,7 +1062,9 @@ fn validate_inner(config: &Config) -> bool {
             .trim()
             .is_empty()
     {
-        validation_error!("resilience.watchdog.restart_command[0] must be a non-empty executable path");
+        validation_error!(
+            "resilience.watchdog.restart_command[0] must be a non-empty executable path"
+        );
         return false;
     }
 
@@ -1044,7 +1078,9 @@ fn validate_inner(config: &Config) -> bool {
     // --- Validate observability ---
     if config.observability.metrics.enabled {
         if config.observability.metrics.address.is_empty() {
-            validation_error!("observability.metrics.address cannot be empty when metrics are enabled");
+            validation_error!(
+                "observability.metrics.address cannot be empty when metrics are enabled"
+            );
             return false;
         }
 
@@ -1078,7 +1114,9 @@ fn validate_inner(config: &Config) -> bool {
 
     if config.observability.control_api.enabled {
         if config.observability.control_api.address.is_empty() {
-            validation_error!("observability.control_api.address cannot be empty when control_api is enabled");
+            validation_error!(
+                "observability.control_api.address cannot be empty when control_api is enabled"
+            );
             return false;
         }
 
@@ -1122,7 +1160,9 @@ fn validate_inner(config: &Config) -> bool {
         }
 
         if config.observability.control_api.connection_timeout_ms == 0 {
-            validation_error!("observability.control_api.connection_timeout_ms must be greater than 0");
+            validation_error!(
+                "observability.control_api.connection_timeout_ms must be greater than 0"
+            );
             return false;
         }
 
@@ -1144,25 +1184,33 @@ fn validate_inner(config: &Config) -> bool {
     if config.observability.routing.expose_header
         && config.observability.routing.header_name.trim().is_empty()
     {
-        validation_error!("observability.routing.header_name must be non-empty when expose_header=true");
+        validation_error!(
+            "observability.routing.header_name must be non-empty when expose_header=true"
+        );
         return false;
     }
 
     // --- Validate privilege-drop security controls ---
     if config.security.privileges.enabled {
         if config.security.privileges.user.trim().is_empty() {
-            validation_error!("security.privileges.user must be non-empty when privilege drop is enabled");
+            validation_error!(
+                "security.privileges.user must be non-empty when privilege drop is enabled"
+            );
             return false;
         }
         if config.security.privileges.group.trim().is_empty() {
-            validation_error!("security.privileges.group must be non-empty when privilege drop is enabled");
+            validation_error!(
+                "security.privileges.group must be non-empty when privilege drop is enabled"
+            );
             return false;
         }
     }
 
     if config.observability.tracing.enabled {
         if config.observability.tracing.service_name.trim().is_empty() {
-            validation_error!("observability.tracing.service_name cannot be empty when tracing is enabled");
+            validation_error!(
+                "observability.tracing.service_name cannot be empty when tracing is enabled"
+            );
             return false;
         }
         if !(0.0..=1.0).contains(&config.observability.tracing.sample_ratio) {
@@ -1214,7 +1262,8 @@ fn validate_inner(config: &Config) -> bool {
             if !path.starts_with('/') {
                 validation_error!(
                     "Route path_prefix must start with '/' for upstream '{}': {}",
-                    upstream_name, path
+                    upstream_name,
+                    path
                 );
                 return false;
             }
@@ -1263,7 +1312,11 @@ fn validate_inner(config: &Config) -> bool {
         {
             validation_error!(
                 "Ambiguous route matcher detected: upstream '{}' conflicts with upstream '{}' for host={:?} path_prefix={:?} method={:?}",
-                upstream_name, existing_upstream, route_key.0, route_key.1, route_key.2
+                upstream_name,
+                existing_upstream,
+                route_key.0,
+                route_key.1,
+                route_key.2
             );
             return false;
         }
@@ -1284,7 +1337,8 @@ fn validate_inner(config: &Config) -> bool {
         {
             validation_error!(
                 "Invalid load balancing type '{}' for upstream '{}'",
-                upstream.load_balancing.lb_type, upstream_name
+                upstream.load_balancing.lb_type,
+                upstream_name
             );
             return false;
         }
@@ -1306,7 +1360,8 @@ fn validate_inner(config: &Config) -> bool {
             if backend.address.is_empty() {
                 validation_error!(
                     "Backend address is empty for backend '{}' in upstream '{}'",
-                    backend.id, upstream_name
+                    backend.id,
+                    upstream_name
                 );
                 return false;
             }
@@ -1316,7 +1371,9 @@ fn validate_inner(config: &Config) -> bool {
                 Err(reason) => {
                     validation_error!(
                         "Backend address '{}' in upstream '{}' is invalid: {}",
-                        backend.address, upstream_name, reason
+                        backend.address,
+                        upstream_name,
+                        reason
                     );
                     return false;
                 }
@@ -1334,7 +1391,11 @@ fn validate_inner(config: &Config) -> bool {
             {
                 validation_error!(
                     "Duplicate backend address '{}' detected: upstream '{}' backend '{}' conflicts with upstream '{}' backend '{}'",
-                    origin, upstream_name, backend.id, existing_upstream, existing_backend
+                    origin,
+                    upstream_name,
+                    backend.id,
+                    existing_upstream,
+                    existing_backend
                 );
                 return false;
             }
@@ -1343,7 +1404,9 @@ fn validate_inner(config: &Config) -> bool {
             if backend.weight == 0 || backend.weight > 1000 {
                 validation_error!(
                     "Backend '{}' in upstream '{}' has invalid weight {} (must be 1–1000)",
-                    backend.id, upstream_name, backend.weight
+                    backend.id,
+                    upstream_name,
+                    backend.weight
                 );
                 return false;
             }
@@ -1353,7 +1416,8 @@ fn validate_inner(config: &Config) -> bool {
                 if hc.interval == 0 {
                     validation_error!(
                         "Health check interval is invalid (0) for backend '{}' in upstream '{}'",
-                        backend.id, upstream_name
+                        backend.id,
+                        upstream_name
                     );
                     return false;
                 }
@@ -1361,7 +1425,8 @@ fn validate_inner(config: &Config) -> bool {
                 if hc.timeout_ms == 0 {
                     validation_error!(
                         "Health check timeout is invalid (0) for backend '{}' in upstream '{}'",
-                        backend.id, upstream_name
+                        backend.id,
+                        upstream_name
                     );
                     return false;
                 }
@@ -1369,7 +1434,8 @@ fn validate_inner(config: &Config) -> bool {
                 if hc.failure_threshold == 0 {
                     validation_error!(
                         "Health check failure threshold is invalid (0) for backend '{}' in upstream '{}'",
-                        backend.id, upstream_name
+                        backend.id,
+                        upstream_name
                     );
                     return false;
                 }
@@ -1377,7 +1443,8 @@ fn validate_inner(config: &Config) -> bool {
                 if hc.success_threshold == 0 {
                     validation_error!(
                         "Health check success threshold is invalid (0) for backend '{}' in upstream '{}'",
-                        backend.id, upstream_name
+                        backend.id,
+                        upstream_name
                     );
                     return false;
                 }
@@ -1385,7 +1452,8 @@ fn validate_inner(config: &Config) -> bool {
                 if hc.cooldown_ms == 0 {
                     validation_error!(
                         "Health check cooldown is invalid (0) for backend '{}' in upstream '{}'",
-                        backend.id, upstream_name
+                        backend.id,
+                        upstream_name
                     );
                     return false;
                 }

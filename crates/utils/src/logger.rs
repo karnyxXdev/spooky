@@ -99,10 +99,7 @@ fn configure_and_init_logger(
         if let Some(parent) = Path::new(log_file).parent()
             && let Err(err) = create_dir_all(parent)
         {
-            eprintln!(
-                "{}",
-                build_create_log_dir_error(log_file, parent, &err)
-            );
+            eprintln!("{}", build_create_log_dir_error(log_file, parent, &err));
             return try_init_builder(builder);
         }
 
@@ -140,8 +137,7 @@ fn build_create_log_dir_error(log_file: &str, parent: &Path, err: &std::io::Erro
 fn build_open_log_file_error(log_file: &str, err: &std::io::Error) -> String {
     format!(
         "Failed to open log file '{}': {}. Falling back to stderr logging.",
-        log_file,
-        err
+        log_file, err
     )
 }
 

@@ -1,3 +1,4 @@
+use std::fmt;
 use std::net::IpAddr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +13,12 @@ impl BackendScheme {
             Self::Http => "http",
             Self::Https => "https",
         }
+    }
+}
+
+impl fmt::Display for BackendScheme {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -230,6 +237,12 @@ fn validate_authority(authority: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{BackendEndpoint, BackendScheme};
+
+    #[test]
+    fn display_formats_backend_scheme() {
+        assert_eq!(BackendScheme::Http.to_string(), "http");
+        assert_eq!(format!("{}", BackendScheme::Https), "https");
+    }
 
     #[test]
     fn parse_host_port_defaults_to_https() {

@@ -691,7 +691,7 @@ Load balancing determines how requests are distributed across healthy backends w
 
 #### random
 
-Selects a backend randomly from all healthy backends. Weight values are currently ignored (weighted random is planned for future release).
+Selects a backend randomly from all healthy backends. Weight values are currently ignored.
 
 ```yaml
 upstream:
@@ -702,7 +702,7 @@ upstream:
 
 #### round-robin
 
-Distributes requests evenly across all healthy backends in sequential order. Weight values are currently ignored (weighted round-robin is planned for future release).
+Distributes requests evenly across all healthy backends in sequential order. Weight values are currently ignored.
 
 ```yaml
 upstream:

@@ -33,7 +33,7 @@ Spooky is an open-source HTTP/3 (QUIC) edge reverse proxy written in Rust that t
 | [Feature Matrix](reference/feature-matrix.md) | Strict feature-by-feature inventory of what is done, partial, and missing |
 | [Security Model](concepts/security-model.md) | Current trust boundaries, admin-plane assumptions, and missing security layers |
 | [API Overview](api/overview.md) | Metrics endpoint, control API (health, ready, runtime), bearer auth |
-| [Benchmarks](benchmarks/load.md) | Load test results: throughput, latency percentiles, test environment |
+| [Benchmarking](development/benchmarking.md) | Benchmark crate, micro/macro suites, and regression-gate workflow |
 | [Roadmap](roadmap.md) | Planned features, GA exit criteria, known limitations |
 | [Changelog](changelog.md) | Version history with added, fixed, and changed entries |
 

@@ -3,7 +3,10 @@ use crate::config::{
     CURRENT_CONFIG_VERSION, Config, Listen, SUPPORTED_CONFIG_VERSIONS, UpstreamHostPolicyMode,
     UpstreamTls,
 };
-use log::{error, info, warn};
+use log::{info, warn};
+use std::error::Error as StdError;
+use std::fmt;
+use std::sync::{Mutex, OnceLock};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -43,18 +46,77 @@ pub const VALID_LB_TYPES: &[&str] = &[
     "cid_sticky",
 ];
 
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationError {
+    pub message: String,
+}
+
+impl ValidationError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl StdError for ValidationError {}
+
+static LAST_VALIDATION_ERROR: OnceLock<Mutex<Option<ValidationError>>> = OnceLock::new();
+
+fn validation_error_slot() -> &'static Mutex<Option<ValidationError>> {
+    LAST_VALIDATION_ERROR.get_or_init(|| Mutex::new(None))
+}
+
+fn clear_validation_error() {
+    if let Ok(mut guard) = validation_error_slot().lock() {
+        *guard = None;
+    }
+}
+
+fn record_validation_error(message: String) {
+    if let Ok(mut guard) = validation_error_slot().lock()
+        && guard.is_none()
+    {
+        *guard = Some(ValidationError::new(message));
+    }
+}
+
+fn take_validation_error() -> Option<ValidationError> {
+    validation_error_slot()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+macro_rules! validation_error {
+    ($($arg:tt)*) => {{
+        let message = format!($($arg)*);
+        record_validation_error(message.clone());
+        log::error!("{}", message);
+    }};
+}
+
+
 fn validate_pem_certificates(path: &str, field_name: &str) -> bool {
-    let certs = match CertificateDer::pem_file_iter(path) {
-        Ok(iter) => iter.collect::<Result<Vec<_>, _>>(),
+    let pem = match std::fs::read(path) {
+        Ok(pem) => pem,
         Err(err) => {
-            error!("Cannot open {} '{}': {}", field_name, path, err);
+            validation_error!("Cannot open {} '{}': {}", field_name, path, err);
             return false;
         }
     };
-    let certs = match certs {
+
+    let certs = match CertificateDer::pem_slice_iter(&pem).collect::<Result<Vec<_>, _>>() {
         Ok(certs) => certs,
         Err(err) => {
-            error!(
+            validation_error!(
                 "Cannot parse PEM certificates from {} '{}': {}",
                 field_name, path, err
             );
@@ -63,7 +125,7 @@ fn validate_pem_certificates(path: &str, field_name: &str) -> bool {
     };
 
     if certs.is_empty() {
-        error!(
+        validation_error!(
             "{} '{}' does not contain any PEM certificate blocks",
             field_name, path
         );
@@ -74,10 +136,18 @@ fn validate_pem_certificates(path: &str, field_name: &str) -> bool {
 }
 
 fn validate_pem_private_key(path: &str, field_name: &str) -> bool {
-    match PrivateKeyDer::from_pem_file(path) {
+    let pem = match std::fs::read(path) {
+        Ok(pem) => pem,
+        Err(err) => {
+            validation_error!("Cannot open {} '{}': {}", field_name, path, err);
+            return false;
+        }
+    };
+
+    match PrivateKeyDer::from_pem_slice(&pem) {
         Ok(_) => true,
         Err(err) => {
-            error!(
+            validation_error!(
                 "Cannot parse PEM private key from {} '{}': {}",
                 field_name, path, err
             );
@@ -96,7 +166,7 @@ fn validate_upstream_tls(field_prefix: &str, tls: &UpstreamTls) -> bool {
 
     if let Some(ca_file) = tls.ca_file.as_ref() {
         if ca_file.trim().is_empty() {
-            error!("{}.ca_file cannot be empty when provided", field_prefix);
+            validation_error!("{}.ca_file cannot be empty when provided", field_prefix);
             return false;
         }
         if !validate_pem_certificates(ca_file, &format!("{}.ca_file", field_prefix)) {
@@ -106,18 +176,18 @@ fn validate_upstream_tls(field_prefix: &str, tls: &UpstreamTls) -> bool {
 
     if let Some(ca_dir) = tls.ca_dir.as_ref() {
         if ca_dir.trim().is_empty() {
-            error!("{}.ca_dir cannot be empty when provided", field_prefix);
+            validation_error!("{}.ca_dir cannot be empty when provided", field_prefix);
             return false;
         }
         let metadata = match std::fs::metadata(ca_dir) {
             Ok(metadata) => metadata,
             Err(err) => {
-                error!("Cannot stat {}.ca_dir '{}': {}", field_prefix, ca_dir, err);
+                validation_error!("Cannot stat {}.ca_dir '{}': {}", field_prefix, ca_dir, err);
                 return false;
             }
         };
         if !metadata.is_dir() {
-            error!("{}.ca_dir must be a directory: {}", field_prefix, ca_dir);
+            validation_error!("{}.ca_dir must be a directory: {}", field_prefix, ca_dir);
             return false;
         }
     }
@@ -127,7 +197,7 @@ fn validate_upstream_tls(field_prefix: &str, tls: &UpstreamTls) -> bool {
 
 fn validate_listen_config(listen: &Listen, field_prefix: &str) -> bool {
     if listen.protocol != "http3" {
-        error!(
+        validation_error!(
             "{} protocol: expected 'http3', found '{}'",
             field_prefix, listen.protocol
         );
@@ -135,12 +205,12 @@ fn validate_listen_config(listen: &Listen, field_prefix: &str) -> bool {
     }
 
     if listen.address.is_empty() {
-        error!("{} address is empty", field_prefix);
+        validation_error!("{} address is empty", field_prefix);
         return false;
     }
 
     if listen.port == 0 {
-        error!(
+        validation_error!(
             "Invalid {} port: {} (must be between 1 and 65535)",
             field_prefix, listen.port
         );
@@ -154,7 +224,7 @@ fn validate_listen_config(listen: &Listen, field_prefix: &str) -> bool {
     let has_sni_certificates = !listen.tls.certificates.is_empty();
 
     if !has_legacy_cert_pair && !has_sni_certificates {
-        error!(
+        validation_error!(
             "{} requires either cert/key or certificates entries",
             tls_prefix
         );
@@ -163,7 +233,7 @@ fn validate_listen_config(listen: &Listen, field_prefix: &str) -> bool {
 
     if has_legacy_cert_pair {
         if legacy_cert.is_empty() || legacy_key.is_empty() {
-            error!(
+            validation_error!(
                 "{}.cert and {}.key must both be set when either is provided",
                 tls_prefix, tls_prefix
             );
@@ -183,7 +253,7 @@ fn validate_listen_config(listen: &Listen, field_prefix: &str) -> bool {
         let sni_name = match normalize_sni_server_name(&entry.server_name) {
             Some(sni) => sni,
             None => {
-                error!(
+                validation_error!(
                     "{}.server_name '{}' is not a valid DNS hostname",
                     field_prefix, entry.server_name
                 );
@@ -192,7 +262,7 @@ fn validate_listen_config(listen: &Listen, field_prefix: &str) -> bool {
         };
 
         if let Some(first_idx) = seen_sni_names.insert(sni_name.clone(), idx) {
-            error!(
+            validation_error!(
                 "{}.server_name '{}' duplicates {}.certificates[{}].server_name",
                 field_prefix, entry.server_name, tls_prefix, first_idx
             );
@@ -201,7 +271,7 @@ fn validate_listen_config(listen: &Listen, field_prefix: &str) -> bool {
 
         let cert = entry.cert.trim();
         if cert.is_empty() {
-            error!("{}.cert cannot be empty", field_prefix);
+            validation_error!("{}.cert cannot be empty", field_prefix);
             return false;
         }
         if !validate_pem_certificates(cert, &format!("{}.cert", field_prefix)) {
@@ -210,7 +280,7 @@ fn validate_listen_config(listen: &Listen, field_prefix: &str) -> bool {
 
         let key = entry.key.trim();
         if key.is_empty() {
-            error!("{}.key cannot be empty", field_prefix);
+            validation_error!("{}.key cannot be empty", field_prefix);
             return false;
         }
         if !validate_pem_private_key(key, &format!("{}.key", field_prefix)) {
@@ -219,7 +289,7 @@ fn validate_listen_config(listen: &Listen, field_prefix: &str) -> bool {
     }
 
     if listen.tls.client_auth.require_client_cert && !listen.tls.client_auth.enabled {
-        error!(
+        validation_error!(
             "{}.client_auth.require_client_cert requires client_auth.enabled=true",
             tls_prefix
         );
@@ -228,14 +298,14 @@ fn validate_listen_config(listen: &Listen, field_prefix: &str) -> bool {
 
     if listen.tls.client_auth.enabled {
         let Some(ca_file) = listen.tls.client_auth.ca_file.as_ref() else {
-            error!(
+            validation_error!(
                 "{}.client_auth.ca_file is required when client_auth.enabled=true",
                 tls_prefix
             );
             return false;
         };
         if ca_file.trim().is_empty() {
-            error!("{}.client_auth.ca_file cannot be empty", tls_prefix);
+            validation_error!("{}.client_auth.ca_file cannot be empty", tls_prefix);
             return false;
         }
         if !validate_pem_certificates(ca_file, &format!("{}.client_auth.ca_file", tls_prefix)) {
@@ -374,7 +444,18 @@ fn normalize_sni_server_name(raw: &str) -> Option<String> {
 
 type RouteMatcherKey = (Option<String>, Option<String>, Option<String>);
 
-pub fn validate(config: &Config) -> bool {
+pub fn validate(config: &Config) -> Result<(), ValidationError> {
+    clear_validation_error();
+    if validate_inner(config) {
+        Ok(())
+    } else {
+        Err(take_validation_error().unwrap_or_else(|| {
+            ValidationError::new("configuration validation failed for an unspecified reason")
+        }))
+    }
+}
+
+fn validate_inner(config: &Config) -> bool {
     info!("Starting configuration validation...");
 
     // --- Validate version ---
@@ -384,7 +465,7 @@ pub fn validate(config: &Config) -> bool {
             .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(", ");
-        error!(
+        validation_error!(
             "Invalid version: found '{}', supported versions are [{}]",
             config.version, supported
         );
@@ -426,7 +507,7 @@ pub fn validate(config: &Config) -> bool {
     for (label, listen) in effective_listeners {
         let key = (listen.address.clone(), listen.port);
         if let Some(existing) = seen_listener_bindings.insert(key, label.clone()) {
-            error!(
+            validation_error!(
                 "listener binding conflict: {} duplicates {} on {}:{}",
                 label, existing, listen.address, listen.port
             );
@@ -439,7 +520,7 @@ pub fn validate(config: &Config) -> bool {
         .iter()
         .any(|lvl| lvl.eq_ignore_ascii_case(&config.log.level))
     {
-        error!("Invalid log level: {}", config.log.level);
+        validation_error!("Invalid log level: {}", config.log.level);
         return false;
     }
 
@@ -449,48 +530,48 @@ pub fn validate(config: &Config) -> bool {
             .iter()
             .any(|lb_type| lb_type.eq_ignore_ascii_case(&lb.lb_type))
     {
-        error!("Invalid global load balancing type: {}", lb.lb_type);
+        validation_error!("Invalid global load balancing type: {}", lb.lb_type);
         return false;
     }
 
     // --- Validate performance controls ---
     if config.performance.worker_threads == 0 {
-        error!("performance.worker_threads must be greater than 0");
+        validation_error!("performance.worker_threads must be greater than 0");
         return false;
     }
 
     if config.performance.control_plane_threads == 0 {
-        error!("performance.control_plane_threads must be greater than 0");
+        validation_error!("performance.control_plane_threads must be greater than 0");
         return false;
     }
 
     if config.performance.packet_shards_per_worker == 0 {
-        error!("performance.packet_shards_per_worker must be greater than 0");
+        validation_error!("performance.packet_shards_per_worker must be greater than 0");
         return false;
     }
 
     if config.performance.packet_shard_queue_capacity == 0 {
-        error!("performance.packet_shard_queue_capacity must be greater than 0");
+        validation_error!("performance.packet_shard_queue_capacity must be greater than 0");
         return false;
     }
 
     if config.performance.packet_shard_queue_max_bytes == 0 {
-        error!("performance.packet_shard_queue_max_bytes must be greater than 0");
+        validation_error!("performance.packet_shard_queue_max_bytes must be greater than 0");
         return false;
     }
 
     if config.performance.worker_threads > 1 && !config.performance.reuseport {
-        error!("performance.reuseport must be true when performance.worker_threads > 1");
+        validation_error!("performance.reuseport must be true when performance.worker_threads > 1");
         return false;
     }
 
     if config.performance.global_inflight_limit == 0 {
-        error!("performance.global_inflight_limit must be greater than 0");
+        validation_error!("performance.global_inflight_limit must be greater than 0");
         return false;
     }
 
     if config.performance.per_upstream_inflight_limit == 0 {
-        error!("performance.per_upstream_inflight_limit must be greater than 0");
+        validation_error!("performance.per_upstream_inflight_limit must be greater than 0");
         return false;
     }
 
@@ -502,97 +583,97 @@ pub fn validate(config: &Config) -> bool {
     }
 
     if config.performance.backend_timeout_ms == 0 {
-        error!("performance.backend_timeout_ms must be greater than 0");
+        validation_error!("performance.backend_timeout_ms must be greater than 0");
         return false;
     }
 
     if config.performance.backend_connect_timeout_ms == 0 {
-        error!("performance.backend_connect_timeout_ms must be greater than 0");
+        validation_error!("performance.backend_connect_timeout_ms must be greater than 0");
         return false;
     }
 
     if config.performance.backend_body_idle_timeout_ms == 0 {
-        error!("performance.backend_body_idle_timeout_ms must be greater than 0");
+        validation_error!("performance.backend_body_idle_timeout_ms must be greater than 0");
         return false;
     }
 
     if config.performance.backend_body_total_timeout_ms == 0 {
-        error!("performance.backend_body_total_timeout_ms must be greater than 0");
+        validation_error!("performance.backend_body_total_timeout_ms must be greater than 0");
         return false;
     }
 
     if config.performance.backend_total_request_timeout_ms == 0 {
-        error!("performance.backend_total_request_timeout_ms must be greater than 0");
+        validation_error!("performance.backend_total_request_timeout_ms must be greater than 0");
         return false;
     }
 
     if config.performance.shutdown_drain_timeout_ms == 0 {
-        error!("performance.shutdown_drain_timeout_ms must be greater than 0");
+        validation_error!("performance.shutdown_drain_timeout_ms must be greater than 0");
         return false;
     }
 
     if config.performance.udp_recv_buffer_bytes == 0 {
-        error!("performance.udp_recv_buffer_bytes must be greater than 0");
+        validation_error!("performance.udp_recv_buffer_bytes must be greater than 0");
         return false;
     }
 
     if config.performance.udp_send_buffer_bytes == 0 {
-        error!("performance.udp_send_buffer_bytes must be greater than 0");
+        validation_error!("performance.udp_send_buffer_bytes must be greater than 0");
         return false;
     }
 
     if config.performance.h2_pool_max_idle_per_backend == 0 {
-        error!("performance.h2_pool_max_idle_per_backend must be greater than 0");
+        validation_error!("performance.h2_pool_max_idle_per_backend must be greater than 0");
         return false;
     }
 
     if config.performance.h2_pool_idle_timeout_ms == 0 {
-        error!("performance.h2_pool_idle_timeout_ms must be greater than 0");
+        validation_error!("performance.h2_pool_idle_timeout_ms must be greater than 0");
         return false;
     }
 
     if config.performance.backend_dns_refresh_interval_ms == 0 {
-        error!("performance.backend_dns_refresh_interval_ms must be greater than 0");
+        validation_error!("performance.backend_dns_refresh_interval_ms must be greater than 0");
         return false;
     }
 
     if config.performance.per_backend_inflight_limit == 0 {
-        error!("performance.per_backend_inflight_limit must be greater than 0");
+        validation_error!("performance.per_backend_inflight_limit must be greater than 0");
         return false;
     }
 
     if config.performance.new_connections_per_sec == 0 {
-        error!("performance.new_connections_per_sec must be greater than 0");
+        validation_error!("performance.new_connections_per_sec must be greater than 0");
         return false;
     }
 
     if config.performance.new_connections_burst == 0 {
-        error!("performance.new_connections_burst must be greater than 0");
+        validation_error!("performance.new_connections_burst must be greater than 0");
         return false;
     }
 
     if config.performance.max_active_connections == 0 {
-        error!("performance.max_active_connections must be greater than 0");
+        validation_error!("performance.max_active_connections must be greater than 0");
         return false;
     }
 
     if config.performance.quic_max_idle_timeout_ms == 0 {
-        error!("performance.quic_max_idle_timeout_ms must be greater than 0");
+        validation_error!("performance.quic_max_idle_timeout_ms must be greater than 0");
         return false;
     }
 
     if config.performance.quic_initial_max_data == 0 {
-        error!("performance.quic_initial_max_data must be greater than 0");
+        validation_error!("performance.quic_initial_max_data must be greater than 0");
         return false;
     }
 
     if config.performance.quic_initial_max_stream_data == 0 {
-        error!("performance.quic_initial_max_stream_data must be greater than 0");
+        validation_error!("performance.quic_initial_max_stream_data must be greater than 0");
         return false;
     }
 
     if config.performance.quic_initial_max_stream_data > config.performance.quic_initial_max_data {
-        error!(
+        validation_error!(
             "performance.quic_initial_max_stream_data ({}) must be <= quic_initial_max_data ({})",
             config.performance.quic_initial_max_stream_data,
             config.performance.quic_initial_max_data
@@ -601,61 +682,61 @@ pub fn validate(config: &Config) -> bool {
     }
 
     if config.performance.quic_initial_max_streams_bidi == 0 {
-        error!("performance.quic_initial_max_streams_bidi must be greater than 0");
+        validation_error!("performance.quic_initial_max_streams_bidi must be greater than 0");
         return false;
     }
 
     if config.performance.quic_initial_max_streams_uni == 0 {
-        error!("performance.quic_initial_max_streams_uni must be greater than 0");
+        validation_error!("performance.quic_initial_max_streams_uni must be greater than 0");
         return false;
     }
 
     if config.performance.max_response_body_bytes == 0 {
-        error!("performance.max_response_body_bytes must be greater than 0");
+        validation_error!("performance.max_response_body_bytes must be greater than 0");
         return false;
     }
 
     if config.performance.max_request_body_bytes == 0 {
-        error!("performance.max_request_body_bytes must be greater than 0");
+        validation_error!("performance.max_request_body_bytes must be greater than 0");
         return false;
     }
 
     if config.performance.request_buffer_global_cap_bytes == 0 {
-        error!("performance.request_buffer_global_cap_bytes must be greater than 0");
+        validation_error!("performance.request_buffer_global_cap_bytes must be greater than 0");
         return false;
     }
 
     if config.performance.unknown_length_response_prebuffer_bytes == 0 {
-        error!("performance.unknown_length_response_prebuffer_bytes must be greater than 0");
+        validation_error!("performance.unknown_length_response_prebuffer_bytes must be greater than 0");
         return false;
     }
 
     if config.performance.client_body_idle_timeout_ms == 0 {
-        error!("performance.client_body_idle_timeout_ms must be greater than 0");
+        validation_error!("performance.client_body_idle_timeout_ms must be greater than 0");
         return false;
     }
 
     if config.performance.backend_connect_timeout_ms > config.performance.backend_timeout_ms {
-        error!("performance.backend_connect_timeout_ms must be <= backend_timeout_ms");
+        validation_error!("performance.backend_connect_timeout_ms must be <= backend_timeout_ms");
         return false;
     }
 
     if config.performance.backend_timeout_ms > config.performance.backend_body_idle_timeout_ms {
-        error!("performance.backend_timeout_ms must be <= backend_body_idle_timeout_ms");
+        validation_error!("performance.backend_timeout_ms must be <= backend_body_idle_timeout_ms");
         return false;
     }
 
     if config.performance.backend_body_idle_timeout_ms
         > config.performance.backend_body_total_timeout_ms
     {
-        error!("performance.backend_body_idle_timeout_ms must be <= backend_body_total_timeout_ms");
+        validation_error!("performance.backend_body_idle_timeout_ms must be <= backend_body_total_timeout_ms");
         return false;
     }
 
     if config.performance.backend_body_total_timeout_ms
         > config.performance.backend_total_request_timeout_ms
     {
-        error!(
+        validation_error!(
             "performance.backend_body_total_timeout_ms must be <= backend_total_request_timeout_ms"
         );
         return false;
@@ -664,7 +745,7 @@ pub fn validate(config: &Config) -> bool {
     if config.performance.max_request_body_bytes
         > config.performance.quic_initial_max_stream_data as usize
     {
-        error!(
+        validation_error!(
             "performance.max_request_body_bytes ({}) must be <= quic_initial_max_stream_data ({})",
             config.performance.max_request_body_bytes,
             config.performance.quic_initial_max_stream_data
@@ -675,7 +756,7 @@ pub fn validate(config: &Config) -> bool {
     if config.performance.request_buffer_global_cap_bytes
         < config.performance.max_request_body_bytes
     {
-        error!(
+        validation_error!(
             "performance.request_buffer_global_cap_bytes ({}) must be >= max_request_body_bytes ({})",
             config.performance.request_buffer_global_cap_bytes,
             config.performance.max_request_body_bytes
@@ -686,7 +767,7 @@ pub fn validate(config: &Config) -> bool {
     if config.performance.unknown_length_response_prebuffer_bytes
         > config.performance.max_response_body_bytes
     {
-        error!(
+        validation_error!(
             "performance.unknown_length_response_prebuffer_bytes ({}) must be <= max_response_body_bytes ({})",
             config.performance.unknown_length_response_prebuffer_bytes,
             config.performance.max_response_body_bytes
@@ -695,23 +776,23 @@ pub fn validate(config: &Config) -> bool {
     }
 
     if config.resilience.adaptive_admission.min_limit == 0 {
-        error!("resilience.adaptive_admission.min_limit must be greater than 0");
+        validation_error!("resilience.adaptive_admission.min_limit must be greater than 0");
         return false;
     }
     if let Some(max_limit) = config.resilience.adaptive_admission.max_limit {
         if max_limit == 0 {
-            error!("resilience.adaptive_admission.max_limit must be greater than 0");
+            validation_error!("resilience.adaptive_admission.max_limit must be greater than 0");
             return false;
         }
         if max_limit < config.resilience.adaptive_admission.min_limit {
-            error!(
+            validation_error!(
                 "resilience.adaptive_admission.max_limit ({}) must be >= min_limit ({})",
                 max_limit, config.resilience.adaptive_admission.min_limit
             );
             return false;
         }
         if max_limit > config.performance.global_inflight_limit {
-            error!(
+            validation_error!(
                 "resilience.adaptive_admission.max_limit ({}) must be <= performance.global_inflight_limit ({})",
                 max_limit, config.performance.global_inflight_limit
             );
@@ -720,27 +801,27 @@ pub fn validate(config: &Config) -> bool {
     }
 
     if config.resilience.adaptive_admission.decrease_step == 0 {
-        error!("resilience.adaptive_admission.decrease_step must be greater than 0");
+        validation_error!("resilience.adaptive_admission.decrease_step must be greater than 0");
         return false;
     }
 
     if config.resilience.adaptive_admission.increase_step == 0 {
-        error!("resilience.adaptive_admission.increase_step must be greater than 0");
+        validation_error!("resilience.adaptive_admission.increase_step must be greater than 0");
         return false;
     }
 
     if config.resilience.route_queue.default_cap == 0 {
-        error!("resilience.route_queue.default_cap must be greater than 0");
+        validation_error!("resilience.route_queue.default_cap must be greater than 0");
         return false;
     }
 
     if config.resilience.route_queue.global_cap == 0 {
-        error!("resilience.route_queue.global_cap must be greater than 0");
+        validation_error!("resilience.route_queue.global_cap must be greater than 0");
         return false;
     }
 
     if config.resilience.route_queue.shed_retry_after_seconds == 0 {
-        error!("resilience.route_queue.shed_retry_after_seconds must be greater than 0");
+        validation_error!("resilience.route_queue.shed_retry_after_seconds must be greater than 0");
         return false;
     }
 
@@ -751,17 +832,17 @@ pub fn validate(config: &Config) -> bool {
         .values()
         .any(|cap| *cap == 0)
     {
-        error!("resilience.route_queue.caps values must be greater than 0");
+        validation_error!("resilience.route_queue.caps values must be greater than 0");
         return false;
     }
 
     if config.resilience.protocol.max_headers_count == 0 {
-        error!("resilience.protocol.max_headers_count must be greater than 0");
+        validation_error!("resilience.protocol.max_headers_count must be greater than 0");
         return false;
     }
 
     if config.resilience.protocol.max_headers_bytes == 0 {
-        error!("resilience.protocol.max_headers_bytes must be greater than 0");
+        validation_error!("resilience.protocol.max_headers_bytes must be greater than 0");
         return false;
     }
 
@@ -772,7 +853,7 @@ pub fn validate(config: &Config) -> bool {
         .iter()
         .any(|method| method.trim().is_empty())
     {
-        error!("resilience.protocol.early_data_safe_methods must not contain empty values");
+        validation_error!("resilience.protocol.early_data_safe_methods must not contain empty values");
         return false;
     }
 
@@ -783,7 +864,7 @@ pub fn validate(config: &Config) -> bool {
         .iter()
         .any(|method| method.trim().is_empty())
     {
-        error!("resilience.protocol.allowed_methods must not contain empty values");
+        validation_error!("resilience.protocol.allowed_methods must not contain empty values");
         return false;
     }
 
@@ -794,7 +875,7 @@ pub fn validate(config: &Config) -> bool {
         .iter()
         .any(|method| !is_valid_http_token(method))
     {
-        error!("resilience.protocol.allowed_methods must contain valid HTTP method tokens");
+        validation_error!("resilience.protocol.allowed_methods must contain valid HTTP method tokens");
         return false;
     }
 
@@ -805,7 +886,7 @@ pub fn validate(config: &Config) -> bool {
         .iter()
         .any(|prefix| prefix.is_empty() || !prefix.starts_with('/'))
     {
-        error!("resilience.protocol.denied_path_prefixes must contain '/'-prefixed paths");
+        validation_error!("resilience.protocol.denied_path_prefixes must contain '/'-prefixed paths");
         return false;
     }
 
@@ -817,7 +898,7 @@ pub fn validate(config: &Config) -> bool {
                 .connect_allowed_authorities
                 .is_empty())
     {
-        error!(
+        validation_error!(
             "resilience.protocol.connect_allowed_ports/connect_allowed_authorities require allow_connect=true"
         );
         return false;
@@ -829,7 +910,7 @@ pub fn validate(config: &Config) -> bool {
         .connect_allowed_ports
         .contains(&0)
     {
-        error!("resilience.protocol.connect_allowed_ports must contain ports in range 1-65535");
+        validation_error!("resilience.protocol.connect_allowed_ports must contain ports in range 1-65535");
         return false;
     }
 
@@ -840,7 +921,7 @@ pub fn validate(config: &Config) -> bool {
         .iter()
         .any(|authority| !is_valid_connect_authority(authority))
     {
-        error!(
+        validation_error!(
             "resilience.protocol.connect_allowed_authorities must contain authority-form host:port targets"
         );
         return false;
@@ -853,29 +934,29 @@ pub fn validate(config: &Config) -> bool {
             .early_data_safe_methods
             .is_empty()
     {
-        error!(
+        validation_error!(
             "resilience.protocol.early_data_safe_methods must be non-empty when allow_0rtt=true"
         );
         return false;
     }
 
     if config.resilience.circuit_breaker.failure_threshold == 0 {
-        error!("resilience.circuit_breaker.failure_threshold must be greater than 0");
+        validation_error!("resilience.circuit_breaker.failure_threshold must be greater than 0");
         return false;
     }
 
     if config.resilience.circuit_breaker.open_ms == 0 {
-        error!("resilience.circuit_breaker.open_ms must be greater than 0");
+        validation_error!("resilience.circuit_breaker.open_ms must be greater than 0");
         return false;
     }
 
     if config.resilience.circuit_breaker.half_open_max_probes == 0 {
-        error!("resilience.circuit_breaker.half_open_max_probes must be greater than 0");
+        validation_error!("resilience.circuit_breaker.half_open_max_probes must be greater than 0");
         return false;
     }
 
     if config.resilience.retry_budget.ratio_percent > 100 {
-        error!("resilience.retry_budget.ratio_percent must be <= 100");
+        validation_error!("resilience.retry_budget.ratio_percent must be <= 100");
         return false;
     }
 
@@ -886,61 +967,61 @@ pub fn validate(config: &Config) -> bool {
         .values()
         .any(|ratio| *ratio > 100)
     {
-        error!("resilience.retry_budget.per_route_ratio_percent values must be <= 100");
+        validation_error!("resilience.retry_budget.per_route_ratio_percent values must be <= 100");
         return false;
     }
 
     if config.resilience.brownout.trigger_inflight_percent > 100
         || config.resilience.brownout.recover_inflight_percent > 100
     {
-        error!("resilience.brownout inflight percentages must be <= 100");
+        validation_error!("resilience.brownout inflight percentages must be <= 100");
         return false;
     }
 
     if config.resilience.brownout.recover_inflight_percent
         >= config.resilience.brownout.trigger_inflight_percent
     {
-        error!("resilience.brownout.recover_inflight_percent must be < trigger_inflight_percent");
+        validation_error!("resilience.brownout.recover_inflight_percent must be < trigger_inflight_percent");
         return false;
     }
 
     if config.resilience.watchdog.check_interval_ms == 0 {
-        error!("resilience.watchdog.check_interval_ms must be greater than 0");
+        validation_error!("resilience.watchdog.check_interval_ms must be greater than 0");
         return false;
     }
 
     if config.resilience.watchdog.poll_stall_timeout_ms == 0 {
-        error!("resilience.watchdog.poll_stall_timeout_ms must be greater than 0");
+        validation_error!("resilience.watchdog.poll_stall_timeout_ms must be greater than 0");
         return false;
     }
 
     if config.resilience.watchdog.timeout_error_rate_percent > 100 {
-        error!("resilience.watchdog.timeout_error_rate_percent must be <= 100");
+        validation_error!("resilience.watchdog.timeout_error_rate_percent must be <= 100");
         return false;
     }
 
     if config.resilience.watchdog.min_requests_per_window == 0 {
-        error!("resilience.watchdog.min_requests_per_window must be greater than 0");
+        validation_error!("resilience.watchdog.min_requests_per_window must be greater than 0");
         return false;
     }
 
     if config.resilience.watchdog.overload_inflight_percent > 100 {
-        error!("resilience.watchdog.overload_inflight_percent must be <= 100");
+        validation_error!("resilience.watchdog.overload_inflight_percent must be <= 100");
         return false;
     }
 
     if config.resilience.watchdog.unhealthy_consecutive_windows == 0 {
-        error!("resilience.watchdog.unhealthy_consecutive_windows must be greater than 0");
+        validation_error!("resilience.watchdog.unhealthy_consecutive_windows must be greater than 0");
         return false;
     }
 
     if config.resilience.watchdog.drain_grace_ms == 0 {
-        error!("resilience.watchdog.drain_grace_ms must be greater than 0");
+        validation_error!("resilience.watchdog.drain_grace_ms must be greater than 0");
         return false;
     }
 
     if config.resilience.watchdog.restart_cooldown_ms == 0 {
-        error!("resilience.watchdog.restart_cooldown_ms must be greater than 0");
+        validation_error!("resilience.watchdog.restart_cooldown_ms must be greater than 0");
         return false;
     }
 
@@ -949,12 +1030,12 @@ pub fn validate(config: &Config) -> bool {
             .trim()
             .is_empty()
     {
-        error!("resilience.watchdog.restart_command[0] must be a non-empty executable path");
+        validation_error!("resilience.watchdog.restart_command[0] must be a non-empty executable path");
         return false;
     }
 
     if config.resilience.watchdog.restart_hook.is_some() {
-        error!(
+        validation_error!(
             "resilience.watchdog.restart_hook is deprecated and unsupported; use restart_command instead"
         );
         return false;
@@ -963,27 +1044,27 @@ pub fn validate(config: &Config) -> bool {
     // --- Validate observability ---
     if config.observability.metrics.enabled {
         if config.observability.metrics.address.is_empty() {
-            error!("observability.metrics.address cannot be empty when metrics are enabled");
+            validation_error!("observability.metrics.address cannot be empty when metrics are enabled");
             return false;
         }
 
         if config.observability.metrics.port == 0 {
-            error!("observability.metrics.port must be between 1 and 65535");
+            validation_error!("observability.metrics.port must be between 1 and 65535");
             return false;
         }
 
         if !config.observability.metrics.path.starts_with('/') {
-            error!("observability.metrics.path must start with '/'");
+            validation_error!("observability.metrics.path must start with '/'");
             return false;
         }
 
         if config.observability.metrics.max_connections == 0 {
-            error!("observability.metrics.max_connections must be greater than 0");
+            validation_error!("observability.metrics.max_connections must be greater than 0");
             return false;
         }
 
         if config.observability.metrics.connection_timeout_ms == 0 {
-            error!("observability.metrics.connection_timeout_ms must be greater than 0");
+            validation_error!("observability.metrics.connection_timeout_ms must be greater than 0");
             return false;
         }
 
@@ -997,12 +1078,12 @@ pub fn validate(config: &Config) -> bool {
 
     if config.observability.control_api.enabled {
         if config.observability.control_api.address.is_empty() {
-            error!("observability.control_api.address cannot be empty when control_api is enabled");
+            validation_error!("observability.control_api.address cannot be empty when control_api is enabled");
             return false;
         }
 
         if config.observability.control_api.port == 0 {
-            error!("observability.control_api.port must be between 1 and 65535");
+            validation_error!("observability.control_api.port must be between 1 and 65535");
             return false;
         }
 
@@ -1030,30 +1111,30 @@ pub fn validate(config: &Config) -> bool {
         ];
         for (name, path) in paths {
             if !path.starts_with('/') {
-                error!("{} must start with '/'", name);
+                validation_error!("{} must start with '/'", name);
                 return false;
             }
         }
 
         if config.observability.control_api.max_connections == 0 {
-            error!("observability.control_api.max_connections must be greater than 0");
+            validation_error!("observability.control_api.max_connections must be greater than 0");
             return false;
         }
 
         if config.observability.control_api.connection_timeout_ms == 0 {
-            error!("observability.control_api.connection_timeout_ms must be greater than 0");
+            validation_error!("observability.control_api.connection_timeout_ms must be greater than 0");
             return false;
         }
 
         if let Some(token) = config.observability.control_api.auth_token.as_ref()
             && token.trim().is_empty()
         {
-            error!("observability.control_api.auth_token cannot be empty when provided");
+            validation_error!("observability.control_api.auth_token cannot be empty when provided");
             return false;
         }
 
         if config.observability.control_api.auth_token.is_none() {
-            error!(
+            validation_error!(
                 "observability.control_api.auth_token is required when control_api.enabled=true"
             );
             return false;
@@ -1063,35 +1144,35 @@ pub fn validate(config: &Config) -> bool {
     if config.observability.routing.expose_header
         && config.observability.routing.header_name.trim().is_empty()
     {
-        error!("observability.routing.header_name must be non-empty when expose_header=true");
+        validation_error!("observability.routing.header_name must be non-empty when expose_header=true");
         return false;
     }
 
     // --- Validate privilege-drop security controls ---
     if config.security.privileges.enabled {
         if config.security.privileges.user.trim().is_empty() {
-            error!("security.privileges.user must be non-empty when privilege drop is enabled");
+            validation_error!("security.privileges.user must be non-empty when privilege drop is enabled");
             return false;
         }
         if config.security.privileges.group.trim().is_empty() {
-            error!("security.privileges.group must be non-empty when privilege drop is enabled");
+            validation_error!("security.privileges.group must be non-empty when privilege drop is enabled");
             return false;
         }
     }
 
     if config.observability.tracing.enabled {
         if config.observability.tracing.service_name.trim().is_empty() {
-            error!("observability.tracing.service_name cannot be empty when tracing is enabled");
+            validation_error!("observability.tracing.service_name cannot be empty when tracing is enabled");
             return false;
         }
         if !(0.0..=1.0).contains(&config.observability.tracing.sample_ratio) {
-            error!("observability.tracing.sample_ratio must be between 0.0 and 1.0");
+            validation_error!("observability.tracing.sample_ratio must be between 0.0 and 1.0");
             return false;
         }
         if let Some(endpoint) = config.observability.tracing.otlp_endpoint.as_ref()
             && endpoint.trim().is_empty()
         {
-            error!("observability.tracing.otlp_endpoint cannot be empty when provided");
+            validation_error!("observability.tracing.otlp_endpoint cannot be empty when provided");
             return false;
         }
     }
@@ -1114,7 +1195,7 @@ pub fn validate(config: &Config) -> bool {
         let has_path = upstream.route.path_prefix.is_some();
 
         if !has_host && !has_path {
-            error!(
+            validation_error!(
                 "Upstream '{}' must have either 'host' or 'path_prefix' route matcher",
                 upstream_name
             );
@@ -1124,14 +1205,14 @@ pub fn validate(config: &Config) -> bool {
         // Validate path_prefix is not empty if present
         if let Some(ref path) = upstream.route.path_prefix {
             if path.is_empty() {
-                error!(
+                validation_error!(
                     "Route path_prefix cannot be empty for upstream '{}'",
                     upstream_name
                 );
                 return false;
             }
             if !path.starts_with('/') {
-                error!(
+                validation_error!(
                     "Route path_prefix must start with '/' for upstream '{}': {}",
                     upstream_name, path
                 );
@@ -1142,7 +1223,7 @@ pub fn validate(config: &Config) -> bool {
         match upstream.host_policy.mode {
             UpstreamHostPolicyMode::PassThrough | UpstreamHostPolicyMode::Upstream => {
                 if upstream.host_policy.host.is_some() {
-                    error!(
+                    validation_error!(
                         "upstream {}.host_policy.host is invalid unless mode is rewrite",
                         upstream_name
                     );
@@ -1152,7 +1233,7 @@ pub fn validate(config: &Config) -> bool {
             UpstreamHostPolicyMode::Rewrite => match upstream.host_policy.host.as_deref() {
                 Some(host) if valid_static_host_header(host) => {}
                 _ => {
-                    error!(
+                    validation_error!(
                         "upstream {}.host_policy.mode=rewrite requires a valid non-empty host_policy.host",
                         upstream_name
                     );
@@ -1164,7 +1245,7 @@ pub fn validate(config: &Config) -> bool {
 
     // --- Validate upstreams ---
     if config.upstream.is_empty() {
-        error!("No upstreams configured");
+        validation_error!("No upstreams configured");
         return false;
     }
 
@@ -1180,7 +1261,7 @@ pub fn validate(config: &Config) -> bool {
         if let Some(existing_upstream) =
             seen_route_matchers.insert(route_key.clone(), upstream_name.clone())
         {
-            error!(
+            validation_error!(
                 "Ambiguous route matcher detected: upstream '{}' conflicts with upstream '{}' for host={:?} path_prefix={:?} method={:?}",
                 upstream_name, existing_upstream, route_key.0, route_key.1, route_key.2
             );
@@ -1192,7 +1273,7 @@ pub fn validate(config: &Config) -> bool {
 
     for (upstream_name, upstream) in &config.upstream {
         if upstream_name.is_empty() {
-            error!("Upstream name is empty");
+            validation_error!("Upstream name is empty");
             return false;
         }
 
@@ -1201,7 +1282,7 @@ pub fn validate(config: &Config) -> bool {
             .iter()
             .any(|lb_type| lb_type.eq_ignore_ascii_case(&upstream.load_balancing.lb_type))
         {
-            error!(
+            validation_error!(
                 "Invalid load balancing type '{}' for upstream '{}'",
                 upstream.load_balancing.lb_type, upstream_name
             );
@@ -1210,20 +1291,20 @@ pub fn validate(config: &Config) -> bool {
 
         // Validate backends
         if upstream.backends.is_empty() {
-            error!("Upstream '{}' has no backends configured", upstream_name);
+            validation_error!("Upstream '{}' has no backends configured", upstream_name);
             return false;
         }
 
         for backend in &upstream.backends {
             // Validate backend ID
             if backend.id.is_empty() {
-                error!("Backend ID is empty in upstream '{}'", upstream_name);
+                validation_error!("Backend ID is empty in upstream '{}'", upstream_name);
                 return false;
             }
 
             // Validate backend address
             if backend.address.is_empty() {
-                error!(
+                validation_error!(
                     "Backend address is empty for backend '{}' in upstream '{}'",
                     backend.id, upstream_name
                 );
@@ -1233,7 +1314,7 @@ pub fn validate(config: &Config) -> bool {
             let endpoint = match BackendEndpoint::parse(&backend.address) {
                 Ok(endpoint) => endpoint,
                 Err(reason) => {
-                    error!(
+                    validation_error!(
                         "Backend address '{}' in upstream '{}' is invalid: {}",
                         backend.address, upstream_name, reason
                     );
@@ -1251,7 +1332,7 @@ pub fn validate(config: &Config) -> bool {
             if let Some((existing_upstream, existing_backend)) = seen_backend_origins
                 .insert(origin.clone(), (upstream_name.clone(), backend.id.clone()))
             {
-                error!(
+                validation_error!(
                     "Duplicate backend address '{}' detected: upstream '{}' backend '{}' conflicts with upstream '{}' backend '{}'",
                     origin, upstream_name, backend.id, existing_upstream, existing_backend
                 );
@@ -1260,7 +1341,7 @@ pub fn validate(config: &Config) -> bool {
 
             // Validate weight
             if backend.weight == 0 || backend.weight > 1000 {
-                error!(
+                validation_error!(
                     "Backend '{}' in upstream '{}' has invalid weight {} (must be 1–1000)",
                     backend.id, upstream_name, backend.weight
                 );
@@ -1270,7 +1351,7 @@ pub fn validate(config: &Config) -> bool {
             // Validate health check (optional — omitting it disables active health checks)
             if let Some(hc) = &backend.health_check {
                 if hc.interval == 0 {
-                    error!(
+                    validation_error!(
                         "Health check interval is invalid (0) for backend '{}' in upstream '{}'",
                         backend.id, upstream_name
                     );
@@ -1278,7 +1359,7 @@ pub fn validate(config: &Config) -> bool {
                 }
 
                 if hc.timeout_ms == 0 {
-                    error!(
+                    validation_error!(
                         "Health check timeout is invalid (0) for backend '{}' in upstream '{}'",
                         backend.id, upstream_name
                     );
@@ -1286,7 +1367,7 @@ pub fn validate(config: &Config) -> bool {
                 }
 
                 if hc.failure_threshold == 0 {
-                    error!(
+                    validation_error!(
                         "Health check failure threshold is invalid (0) for backend '{}' in upstream '{}'",
                         backend.id, upstream_name
                     );
@@ -1294,7 +1375,7 @@ pub fn validate(config: &Config) -> bool {
                 }
 
                 if hc.success_threshold == 0 {
-                    error!(
+                    validation_error!(
                         "Health check success threshold is invalid (0) for backend '{}' in upstream '{}'",
                         backend.id, upstream_name
                     );
@@ -1302,7 +1383,7 @@ pub fn validate(config: &Config) -> bool {
                 }
 
                 if hc.cooldown_ms == 0 {
-                    error!(
+                    validation_error!(
                         "Health check cooldown is invalid (0) for backend '{}' in upstream '{}'",
                         backend.id, upstream_name
                     );
@@ -1517,144 +1598,144 @@ upstream:
 
         let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.worker_threads = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.worker_threads = 4;
         cfg.performance.reuseport = false;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.packet_shards_per_worker = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.packet_shard_queue_capacity = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.packet_shard_queue_max_bytes = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.backend_connect_timeout_ms = 2_001;
         cfg.performance.backend_timeout_ms = 2_000;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.backend_total_request_timeout_ms = 5_000;
         cfg.performance.backend_body_total_timeout_ms = 6_000;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.backend_body_total_timeout_ms = 100;
         cfg.performance.backend_body_idle_timeout_ms = 200;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.shutdown_drain_timeout_ms = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.udp_recv_buffer_bytes = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.udp_send_buffer_bytes = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.h2_pool_max_idle_per_backend = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.h2_pool_idle_timeout_ms = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.backend_dns_refresh_interval_ms = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.per_backend_inflight_limit = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.new_connections_per_sec = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.new_connections_burst = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.max_active_connections = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.quic_max_idle_timeout_ms = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.quic_initial_max_data = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.quic_initial_max_stream_data = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         // stream limit exceeds connection limit — cross-field violation
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.quic_initial_max_data = 1_000_000;
         cfg.performance.quic_initial_max_stream_data = 2_000_000;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.quic_initial_max_streams_bidi = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.quic_initial_max_streams_uni = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.max_response_body_bytes = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.max_request_body_bytes = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.request_buffer_global_cap_bytes = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.unknown_length_response_prebuffer_bytes = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.client_body_idle_timeout_ms = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.max_request_body_bytes =
             (cfg.performance.quic_initial_max_stream_data as usize).saturating_add(1);
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.request_buffer_global_cap_bytes =
             cfg.performance.max_request_body_bytes.saturating_sub(1);
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.unknown_length_response_prebuffer_bytes =
             cfg.performance.max_response_body_bytes.saturating_add(1);
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.adaptive_admission.max_limit = Some(0);
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.adaptive_admission.max_limit = Some(
@@ -1663,115 +1744,115 @@ upstream:
                 .min_limit
                 .saturating_sub(1),
         );
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.adaptive_admission.max_limit =
             Some(cfg.performance.global_inflight_limit.saturating_add(1));
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.route_queue.default_cap = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.route_queue.global_cap = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.route_queue.shed_retry_after_seconds = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.protocol.max_headers_count = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.protocol.max_headers_bytes = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.protocol.allow_0rtt = true;
         cfg.resilience.protocol.early_data_safe_methods.clear();
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.protocol.denied_path_prefixes = vec!["admin".to_string()];
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.protocol.connect_allowed_ports = vec![443];
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.protocol.allow_connect = true;
         cfg.resilience.protocol.connect_allowed_ports = vec![0];
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.protocol.allow_connect = true;
         cfg.resilience.protocol.connect_allowed_authorities = vec!["example.com".to_string()];
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.protocol.allow_connect = true;
         cfg.resilience.protocol.connect_allowed_authorities = vec!["example.com:443".to_string()];
         cfg.resilience.protocol.connect_allowed_ports = vec![443];
-        assert!(validate(&cfg));
+        assert!(validate(&cfg).is_ok());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.protocol.allowed_methods = vec!["".to_string()];
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.protocol.allowed_methods = vec!["GE T".to_string()];
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.protocol.allowed_methods = vec!["GET/".to_string()];
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.protocol.allowed_methods = vec!["GE\nT".to_string()];
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.retry_budget.ratio_percent = 101;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.brownout.trigger_inflight_percent = 50;
         cfg.resilience.brownout.recover_inflight_percent = 50;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.watchdog.timeout_error_rate_percent = 101;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.watchdog.unhealthy_consecutive_windows = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.listen.tls.client_auth.require_client_cert = true;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.listen.tls.client_auth.enabled = true;
         cfg.listen.tls.client_auth.ca_file = None;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.upstream_tls.verify_certificates = false;
-        assert!(validate(&cfg));
+        assert!(validate(&cfg).is_ok());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.upstream_tls.ca_file = Some("/path/does/not/exist.pem".to_string());
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.upstream_tls.ca_dir = Some("/path/does/not/exist".to_string());
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.observability = Observability {
@@ -1788,34 +1869,34 @@ upstream:
             tracing: Tracing::default(),
             routing: crate::config::RoutingTransparency::default(),
         };
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.observability.metrics.enabled = true;
         cfg.observability.metrics.max_connections = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.observability.metrics.enabled = true;
         cfg.observability.metrics.connection_timeout_ms = 0;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.observability.control_api.enabled = true;
         cfg.observability.control_api.max_connections = 0;
         cfg.observability.control_api.auth_token = Some("token".to_string());
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.observability.control_api.enabled = true;
         cfg.observability.control_api.connection_timeout_ms = 0;
         cfg.observability.control_api.auth_token = Some("token".to_string());
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.observability.routing.expose_header = true;
         cfg.observability.routing.header_name = "   ".to_string();
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
     }
 
     #[test]
@@ -1827,7 +1908,7 @@ upstream:
         std::fs::write(&key, "not-a-pem-key").expect("write key");
 
         let cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
     }
 
     #[test]
@@ -1844,7 +1925,7 @@ upstream:
             key: key.to_string_lossy().to_string(),
         }];
 
-        assert!(validate(&cfg));
+        assert!(validate(&cfg).is_ok());
     }
 
     #[test]
@@ -1866,7 +1947,7 @@ upstream:
             },
         ];
 
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
     }
 
     #[test]
@@ -1881,7 +1962,7 @@ upstream:
             key: key.to_string_lossy().to_string(),
         }];
 
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
     }
 
     #[test]
@@ -1948,7 +2029,7 @@ upstream:
             routing: crate::config::RoutingTransparency::default(),
         };
 
-        assert!(validate(&cfg));
+        assert!(validate(&cfg).is_ok());
     }
 
     #[test]
@@ -1963,7 +2044,7 @@ upstream:
             .expect("upstream")
             .backends[0]
             .address = "api.example.internal:443".to_string();
-        assert!(validate(&cfg));
+        assert!(validate(&cfg).is_ok());
 
         // Explicit HTTP remains allowed as an opt-out.
         cfg.upstream
@@ -1971,7 +2052,7 @@ upstream:
             .expect("upstream")
             .backends[0]
             .address = "http://127.0.0.1:8080".to_string();
-        assert!(validate(&cfg));
+        assert!(validate(&cfg).is_ok());
     }
 
     #[test]
@@ -1985,14 +2066,14 @@ upstream:
             .expect("upstream")
             .backends[0]
             .address = "https://127.0.0.1:8443/path".to_string();
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg.upstream
             .get_mut("test_upstream")
             .expect("upstream")
             .backends[0]
             .address = "ftp://127.0.0.1:21".to_string();
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
     }
 
     #[test]
@@ -2007,7 +2088,7 @@ upstream:
         cfg.upstream
             .insert("test_upstream_2".to_string(), duplicate);
 
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
     }
 
     #[test]
@@ -2018,7 +2099,7 @@ upstream:
         cfg.observability.control_api.enabled = true;
         cfg.observability.control_api.address = "0.0.0.0".to_string();
         cfg.observability.control_api.auth_token = None;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
     }
 
     #[test]
@@ -2029,7 +2110,7 @@ upstream:
         cfg.observability.control_api.enabled = true;
         cfg.observability.control_api.address = "127.0.0.1".to_string();
         cfg.observability.control_api.auth_token = None;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
     }
 
     #[test]
@@ -2038,7 +2119,7 @@ upstream:
         let (cert, key) = write_test_certs(dir.path());
         let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.watchdog.restart_hook = Some("echo legacy".to_string());
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
     }
 
     #[test]
@@ -2048,15 +2129,15 @@ upstream:
 
         let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.watchdog.restart_hook = None;
-        assert!(validate(&cfg));
+        assert!(validate(&cfg).is_ok());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.watchdog.restart_hook = Some(String::new());
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.watchdog.restart_hook = Some("   ".to_string());
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
     }
 
     #[test]
@@ -2066,12 +2147,12 @@ upstream:
         let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.security.privileges.enabled = true;
         cfg.security.privileges.user = " ".to_string();
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.security.privileges.enabled = true;
         cfg.security.privileges.group = " ".to_string();
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
     }
 
     #[test]
@@ -2111,7 +2192,7 @@ upstream:
         cfg.upstream
             .insert("test_upstream_2".to_string(), duplicate);
 
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
     }
 
     #[test]
@@ -2151,7 +2232,7 @@ upstream:
         cfg.upstream
             .insert("test_upstream_2".to_string(), post_route);
 
-        assert!(validate(&cfg));
+        assert!(validate(&cfg).is_ok());
     }
 
     #[test]
@@ -2178,7 +2259,18 @@ upstream:
             },
         }];
 
-        assert!(validate(&cfg));
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_returns_actionable_error_message() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.log.level = "debug-verbose".to_string();
+
+        let err = validate(&cfg).expect_err("invalid config should return structured error");
+        assert_eq!(err.message, "Invalid log level: debug-verbose");
     }
 
     #[test]
@@ -2193,6 +2285,6 @@ upstream:
             .host_policy
             .host = Some("ignored.example.com".to_string());
 
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg).is_err());
     }
 }

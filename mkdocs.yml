@@ -50,6 +50,7 @@ nav:
       - Limitations: reference/limitations.md
       - Terminology: reference/terminology.md
       - Configuration Reference: configuration/reference.md
+      - Configuration Defaults: configuration/defaults.md
       - Configuration Examples: configuration/examples.md
       - TLS Setup: configuration/tls.md
       - API Overview: api/overview.md

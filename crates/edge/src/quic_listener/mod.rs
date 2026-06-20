@@ -85,8 +85,8 @@ use crate::{
     types::{
         ListenerTlsInventory, ListenerTlsReloadState, ListenerTlsReloadStore,
         QuicConnectionErrorSnapshot, RuntimeBackendResolution, RuntimeBackendResolutionStore,
-        RuntimeBundle, RuntimeBundleHandle, RuntimeTaskRegistration, RuntimeTaskRegistry,
-        RuntimeLoadedClientAuthCa, RuntimeLoadedTlsIdentity, RuntimeTlsCertificateMetadata,
+        RuntimeBundle, RuntimeBundleHandle, RuntimeLoadedClientAuthCa, RuntimeLoadedTlsIdentity,
+        RuntimeTaskRegistration, RuntimeTaskRegistry, RuntimeTlsCertificateMetadata,
     },
     watchdog::{WatchdogCoordinator, WatchdogRuntimeConfig, now_millis},
 };
@@ -786,7 +786,11 @@ impl QUICListener {
             .watchdog
             .set_expected_workers(worker_count.max(1));
         Self::spawn_generation_background_tasks(config, shared_state);
-        Self::spawn_metrics_endpoint(config, Arc::clone(&shared_state.metrics), Some(Arc::clone(&runtime_bundle)))?;
+        Self::spawn_metrics_endpoint(
+            config,
+            Arc::clone(&shared_state.metrics),
+            Some(Arc::clone(&runtime_bundle)),
+        )?;
         Self::spawn_control_api_endpoint(config, shared_state, Some(runtime_bundle), worker_count)?;
         Ok(())
     }
@@ -967,10 +971,7 @@ impl QUICListener {
         })
     }
 
-    pub fn with_runtime_bundle(
-        mut self,
-        runtime_bundle: Arc<RuntimeBundleHandle>,
-    ) -> Self {
+    pub fn with_runtime_bundle(mut self, runtime_bundle: Arc<RuntimeBundleHandle>) -> Self {
         self.runtime_generation = runtime_bundle.generation();
         self.runtime_bundle = Some(runtime_bundle);
         self
@@ -1385,8 +1386,10 @@ impl QUICListener {
         self.max_response_body_bytes = self.config.performance.max_response_body_bytes;
         self.request_buffer_global_cap_bytes =
             self.config.performance.request_buffer_global_cap_bytes;
-        self.unknown_length_response_prebuffer_bytes =
-            self.config.performance.unknown_length_response_prebuffer_bytes;
+        self.unknown_length_response_prebuffer_bytes = self
+            .config
+            .performance
+            .unknown_length_response_prebuffer_bytes;
         self.require_client_cert = Self::runtime_listener_tls(&self.config)?
             .client_auth
             .require_client_cert;
@@ -5222,7 +5225,11 @@ impl QUICListener {
                     backend_endpoints
                 };
                 let backend_resolution_store = if let Some(handle) = runtime_bundle.as_ref() {
-                    handle.current().shared_state.backend_resolution_store.clone()
+                    handle
+                        .current()
+                        .shared_state
+                        .backend_resolution_store
+                        .clone()
                 } else {
                     backend_resolution_store
                 };

@@ -17,11 +17,11 @@ use clap::Parser;
 use log::{error, info, warn};
 
 use spooky_config::validator::validate as validate_config;
-use spooky_edge::{
-    QUICListener, SharedRuntimeState, configure_async_runtime,
-    constants::MAX_DATAGRAM_SIZE_BYTES, stable_hash_socket_addr,
-};
 use spooky_edge::types::RuntimeBundleHandle;
+use spooky_edge::{
+    QUICListener, SharedRuntimeState, configure_async_runtime, constants::MAX_DATAGRAM_SIZE_BYTES,
+    stable_hash_socket_addr,
+};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -620,13 +620,10 @@ fn run_single_listener_worker(
 ) -> Result<(), String> {
     maybe_pin_worker(worker_idx, pin_workers);
     worker_shared.bind_metrics_worker_slot(worker_idx);
-    let mut listener = QUICListener::new_with_socket_and_shared_state(
-        worker_config,
-        socket,
-        worker_shared,
-    )
-    .map_err(|err| format!("worker {} listener init failed: {}", worker_idx, err))?
-    .with_runtime_bundle(Arc::clone(&runtime_bundle));
+    let mut listener =
+        QUICListener::new_with_socket_and_shared_state(worker_config, socket, worker_shared)
+            .map_err(|err| format!("worker {} listener init failed: {}", worker_idx, err))?
+            .with_runtime_bundle(Arc::clone(&runtime_bundle));
 
     while !worker_shutdown.load(Ordering::Relaxed) {
         listener.poll();

@@ -1,6 +1,6 @@
 use bytes::Bytes;
-use log::warn;
 use core::net::SocketAddr;
+use log::warn;
 use rustls::ServerConfig as RustlsServerConfig;
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
@@ -162,7 +162,10 @@ impl RuntimeTaskRegistry {
             }
         };
 
-        if tokio::time::timeout(timeout, wait_for_completion).await.is_err() {
+        if tokio::time::timeout(timeout, wait_for_completion)
+            .await
+            .is_err()
+        {
             warn!(
                 "generation background tasks did not stop within {:?}; continuing reload",
                 timeout
@@ -238,7 +241,10 @@ pub struct RuntimeBundle {
 
 impl RuntimeBundle {
     pub fn listener_runtime_config(&self, label: &str) -> Option<ListenerRuntimeConfig> {
-        self.shared_state.listener_runtime_configs.get(label).cloned()
+        self.shared_state
+            .listener_runtime_configs
+            .get(label)
+            .cloned()
     }
 }
 

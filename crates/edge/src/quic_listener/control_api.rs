@@ -1,7 +1,7 @@
 use super::*;
-use std::ffi::OsString;
 use spooky_config::loader::read_config;
 use spooky_config::runtime::RuntimeConfig;
+use std::ffi::OsString;
 use subtle::ConstantTimeEq;
 
 #[derive(Clone)]
@@ -717,10 +717,9 @@ impl QUICListener {
                 runtime_config,
                 shared_state: Arc::clone(&next_shared_state),
             };
-            if let Some((missing, existing)) = Self::validate_runtime_reload_compatibility(
-                &runtime,
-                &next_runtime,
-            ) {
+            if let Some((missing, existing)) =
+                Self::validate_runtime_reload_compatibility(&runtime, &next_runtime)
+            {
                 return Self::json_response(
                     StatusCode::CONFLICT,
                     json!({
@@ -799,12 +798,15 @@ impl QUICListener {
 
         match Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Full::new(Bytes::from_static(b"not found
-")))
-        {
+            .body(Full::new(Bytes::from_static(
+                b"not found
+",
+            ))) {
             Ok(resp) => resp,
-            Err(_) => Response::new(Full::new(Bytes::from_static(b"not found
-"))),
+            Err(_) => Response::new(Full::new(Bytes::from_static(
+                b"not found
+",
+            ))),
         }
     }
 
@@ -827,28 +829,50 @@ impl QUICListener {
         if current_labels.len() != next_labels.len() {
             let missing = current_labels
                 .iter()
-                .filter(|label| !next.shared_state.listener_runtime_configs.contains_key(*label))
+                .filter(|label| {
+                    !next
+                        .shared_state
+                        .listener_runtime_configs
+                        .contains_key(*label)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             let extra = next_labels
                 .iter()
-                .filter(|label| !current.shared_state.listener_runtime_configs.contains_key(*label))
+                .filter(|label| {
+                    !current
+                        .shared_state
+                        .listener_runtime_configs
+                        .contains_key(*label)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             return Some((missing, extra));
         }
-        if current_labels
-            .iter()
-            .any(|label| !next.shared_state.listener_runtime_configs.contains_key(label))
-        {
+        if current_labels.iter().any(|label| {
+            !next
+                .shared_state
+                .listener_runtime_configs
+                .contains_key(label)
+        }) {
             let missing = current_labels
                 .iter()
-                .filter(|label| !next.shared_state.listener_runtime_configs.contains_key(*label))
+                .filter(|label| {
+                    !next
+                        .shared_state
+                        .listener_runtime_configs
+                        .contains_key(*label)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             let extra = next_labels
                 .iter()
-                .filter(|label| !current.shared_state.listener_runtime_configs.contains_key(*label))
+                .filter(|label| {
+                    !current
+                        .shared_state
+                        .listener_runtime_configs
+                        .contains_key(*label)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             return Some((missing, extra));

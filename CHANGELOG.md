@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1-beta] - 2026-06-20
+
+### Fixed
+
+- `ProxyError::Pool` displayed as `"transport error: ..."` — disambiguated to `"pool error: ..."` so pool and transport errors have distinct display text in logs.
+- Watchdog mutex poison is now logged and recovered instead of silently causing the coordinator to skip state updates — watchdog restart logic remains operational after a worker panic.
+- OTLP tracing endpoint is now configurable via `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` environment variables, with the resolved source logged at startup alongside the endpoint.
+- `validate()` now returns a structured `ValidationError` instead of `bool`, making the first validation failure available to callers as a typed error value.
+- `take_validation_error` clears the slot on read, preventing stale validation errors from leaking across test cases.
+- Logger fallback error messages now include both the file path and directory path when log directory creation fails.
+
+### Changed
+
+- `validate_config` call site updated to handle the new `Result` return type from the validator.
+
 ## [0.2.0-beta] - 2026-06-18
 
 ### Added

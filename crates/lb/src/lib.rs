@@ -936,6 +936,8 @@ mod tests {
         pool.mark_failure(0);
 
         let mut rr = RoundRobin::new();
+        // Safe in this test: backend 0 has been driven unhealthy, backend 1 remains healthy,
+        // and `pick()` only returns `None` when there are no healthy backends left.
         let pick = rr.pick(&pool).unwrap();
         assert_eq!(pick, 1);
     }
@@ -1061,6 +1063,8 @@ mod tests {
             ],
         };
 
+        // Safe in this test: the fixture uses a supported load-balancing mode and two valid
+        // backend definitions, so `from_upstream()` should succeed for the exact shape under test.
         let upstream_pool = UpstreamPool::from_upstream(&upstream).unwrap();
         assert!(matches!(
             upstream_pool.load_balancer,

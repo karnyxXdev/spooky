@@ -1,9 +1,10 @@
 use std::sync::{
-    Mutex,
+    Mutex, MutexGuard,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use log::warn;
 use spooky_config::config::Watchdog as WatchdogConfig;
 
 #[derive(Debug, Clone)]
@@ -102,8 +103,8 @@ impl WatchdogCoordinator {
             return false;
         }
         let now_instant = Instant::now();
-        if let Ok(last_restart) = self.last_restart_at_instant.lock()
-            && let Some(last_restart_instant) = *last_restart
+        if let Some(last_restart_instant) =
+            *lock_or_recover(&self.last_restart_at_instant, "last_restart_at_instant")
             && now_instant.duration_since(last_restart_instant).as_millis()
                 < self.restart_cooldown_ms as u128
         {
@@ -119,13 +120,12 @@ impl WatchdogCoordinator {
 
         self.restart_requested_at_ms
             .store(now_millis(), Ordering::Relaxed);
-        if let Ok(mut restart_requested_at) = self.restart_requested_at_instant.lock() {
-            *restart_requested_at = Some(now_instant);
-        }
+        *lock_or_recover(
+            &self.restart_requested_at_instant,
+            "restart_requested_at_instant",
+        ) = Some(now_instant);
         self.drained_workers.store(0, Ordering::Relaxed);
-        if let Ok(mut current) = self.restart_reason.lock() {
-            *current = reason.to_string();
-        }
+        *lock_or_recover(&self.restart_reason, "restart_reason") = reason.to_string();
         true
     }
 
@@ -134,10 +134,7 @@ impl WatchdogCoordinator {
     }
 
     pub fn restart_reason(&self) -> String {
-        self.restart_reason
-            .lock()
-            .map(|reason| reason.clone())
-            .unwrap_or_else(|_| String::from("watchdog restart requested"))
+        lock_or_recover(&self.restart_reason, "restart_reason").clone()
     }
 
     pub fn restart_requested_at_ms(&self) -> u64 {
@@ -148,7 +145,10 @@ impl WatchdogCoordinator {
         if !self.restart_requested() {
             return None;
         }
-        let guard = self.restart_requested_at_instant.lock().ok()?;
+        let guard = lock_or_recover(
+            &self.restart_requested_at_instant,
+            "restart_requested_at_instant",
+        );
         let started_at = (*guard)?;
         Some(Instant::now().duration_since(started_at).as_millis() as u64)
     }
@@ -166,16 +166,29 @@ impl WatchdogCoordinator {
     }
 
     pub fn complete_restart_cycle(&self) {
-        if let Ok(mut last_restart_at) = self.last_restart_at_instant.lock() {
-            *last_restart_at = Some(Instant::now());
-        }
-        if let Ok(mut restart_requested_at) = self.restart_requested_at_instant.lock() {
-            *restart_requested_at = None;
-        }
+        *lock_or_recover(&self.last_restart_at_instant, "last_restart_at_instant") =
+            Some(Instant::now());
+        *lock_or_recover(
+            &self.restart_requested_at_instant,
+            "restart_requested_at_instant",
+        ) = None;
         self.restart_requested.store(false, Ordering::Relaxed);
         self.restart_requested_at_ms.store(0, Ordering::Relaxed);
         self.drained_workers.store(0, Ordering::Relaxed);
         self.degraded.store(false, Ordering::Relaxed);
+    }
+}
+
+fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, field: &str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!(
+                "WatchdogCoordinator {} mutex poisoned; continuing with recovered inner state",
+                field
+            );
+            poisoned.into_inner()
+        }
     }
 }
 
@@ -189,6 +202,7 @@ pub fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     #[test]
     fn restart_request_respects_single_pending_cycle() {
@@ -253,5 +267,31 @@ mod tests {
         assert!(watchdog.request_restart("overload"));
         watchdog.complete_restart_cycle();
         assert!(!watchdog.request_restart("stall"));
+    }
+
+    #[test]
+    fn poisoned_restart_reason_mutex_preserves_reason_text() {
+        let cfg = WatchdogConfig {
+            enabled: true,
+            check_interval_ms: 1000,
+            poll_stall_timeout_ms: 5000,
+            timeout_error_rate_percent: 60,
+            min_requests_per_window: 20,
+            overload_inflight_percent: 90,
+            unhealthy_consecutive_windows: 3,
+            drain_grace_ms: 5_000,
+            restart_cooldown_ms: 60_000,
+            restart_command: Vec::new(),
+            restart_hook: None,
+        };
+        let watchdog = WatchdogCoordinator::new(&cfg);
+
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let mut reason = watchdog.restart_reason.lock().expect("lock");
+            *reason = "poisoned_reason".to_string();
+            panic!("poison restart reason mutex");
+        }));
+
+        assert_eq!(watchdog.restart_reason(), "poisoned_reason");
     }
 }

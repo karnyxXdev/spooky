@@ -715,7 +715,7 @@ impl QUICListener {
                 generation: runtime.generation.saturating_add(1),
                 config_path,
                 runtime_config,
-                shared_state: next_shared_state,
+                shared_state: Arc::clone(&next_shared_state),
             };
             if let Some((missing, existing)) = Self::validate_runtime_reload_compatibility(
                 &runtime,
@@ -731,8 +731,12 @@ impl QUICListener {
                     }),
                 );
             }
-            let generation = match runtime_bundle_handle.replace(next_runtime) {
-                Ok(generation) => generation,
+            QUICListener::spawn_generation_background_tasks(
+                &next_runtime.runtime_config,
+                next_runtime.shared_state.as_ref(),
+            );
+            let (generation, retired_tasks) = match runtime_bundle_handle.replace(next_runtime) {
+                Ok(result) => result,
                 Err(err) => {
                     return Self::json_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -743,6 +747,11 @@ impl QUICListener {
                     );
                 }
             };
+            tokio::spawn(async move {
+                retired_tasks
+                    .retire_with_timeout(Duration::from_secs(5))
+                    .await;
+            });
             return Self::json_response(
                 StatusCode::ACCEPTED,
                 json!({
@@ -871,6 +880,7 @@ impl QUICListener {
         metrics: Arc<Metrics>,
         resilience: Arc<RuntimeResilience>,
         watchdog: Arc<WatchdogCoordinator>,
+        task_registry: Arc<RuntimeTaskRegistry>,
     ) {
         let watchdog_config = WatchdogRuntimeConfig::from(&config.resilience.watchdog);
         if !watchdog_config.enabled || !watchdog.enabled() {
@@ -885,7 +895,7 @@ impl QUICListener {
             }
         };
 
-        spawn_supervised_async_task(
+        let registration = spawn_supervised_async_task(
             &handle,
             "watchdog",
             Some(Arc::clone(&metrics)),
@@ -1043,6 +1053,7 @@ impl QUICListener {
                 }
             },
         );
+        task_registry.register(registration);
     }
 }
 

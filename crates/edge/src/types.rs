@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use log::warn;
 use core::net::SocketAddr;
 use rustls::ServerConfig as RustlsServerConfig;
 use spooky_config::{
@@ -14,10 +15,13 @@ use spooky_transport::{h2_client::SharedDnsResolver, transport_pool::UpstreamTra
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::UdpSocket,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant, SystemTime},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
+    task::AbortHandle,
+};
 use tracing::Span;
 
 use crate::Metrics;
@@ -43,6 +47,7 @@ pub struct SharedRuntimeState {
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) resilience: Arc<RuntimeResilience>,
     pub(crate) watchdog: Arc<WatchdogCoordinator>,
+    pub(crate) generation_tasks: Arc<RuntimeTaskRegistry>,
 }
 
 impl SharedRuntimeState {
@@ -77,6 +82,98 @@ impl SharedRuntimeState {
         }
 
         (healthy, total)
+    }
+}
+
+pub(crate) struct RuntimeTaskRegistration {
+    abort: AbortHandle,
+    completion: oneshot::Receiver<()>,
+}
+
+impl RuntimeTaskRegistration {
+    pub(crate) fn new(abort: AbortHandle, completion: oneshot::Receiver<()>) -> Self {
+        Self { abort, completion }
+    }
+}
+
+pub struct RuntimeTaskRegistry {
+    state: Mutex<RuntimeTaskRegistryState>,
+}
+
+struct RuntimeTaskRegistryState {
+    retired: bool,
+    tasks: Vec<RuntimeTaskRegistration>,
+}
+
+impl RuntimeTaskRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(RuntimeTaskRegistryState {
+                retired: false,
+                tasks: Vec::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn register(&self, task: RuntimeTaskRegistration) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.retired {
+            task.abort.abort();
+        } else {
+            state.tasks.push(task);
+        }
+    }
+
+    fn retire_now(&self) -> Vec<oneshot::Receiver<()>> {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.retired {
+            return Vec::new();
+        }
+        state.retired = true;
+        state
+            .tasks
+            .drain(..)
+            .map(|task| {
+                task.abort.abort();
+                task.completion
+            })
+            .collect()
+    }
+
+    pub(crate) fn abort_all(&self) {
+        let _ = self.retire_now();
+    }
+
+    pub(crate) async fn retire_with_timeout(&self, timeout: Duration) {
+        let completions = self.retire_now();
+        if completions.is_empty() {
+            return;
+        }
+
+        let wait_for_completion = async {
+            for completion in completions {
+                let _ = completion.await;
+            }
+        };
+
+        if tokio::time::timeout(timeout, wait_for_completion).await.is_err() {
+            warn!(
+                "generation background tasks did not stop within {:?}; continuing reload",
+                timeout
+            );
+        }
+    }
+}
+
+impl Drop for RuntimeTaskRegistry {
+    fn drop(&mut self) {
+        self.abort_all();
     }
 }
 
@@ -168,13 +265,26 @@ impl RuntimeBundleHandle {
         self.current().generation
     }
 
-    pub fn replace(&self, bundle: RuntimeBundle) -> Result<u64, ProxyError> {
+    pub fn replace(
+        &self,
+        bundle: RuntimeBundle,
+    ) -> Result<(u64, Arc<RuntimeTaskRegistry>), ProxyError> {
         let generation = bundle.generation;
-        let mut guard = self.inner.write().map_err(|_| {
-            ProxyError::Transport("runtime bundle lock poisoned".to_string())
-        })?;
-        *guard = Arc::new(bundle);
-        Ok(generation)
+        let next_tasks = Arc::clone(&bundle.shared_state.generation_tasks);
+        let previous = {
+            let mut guard = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    next_tasks.abort_all();
+                    return Err(ProxyError::Transport(
+                        "runtime bundle lock poisoned".to_string(),
+                    ));
+                }
+            };
+            std::mem::replace(&mut *guard, Arc::new(bundle))
+        };
+        let retired_tasks = Arc::clone(&previous.shared_state.generation_tasks);
+        Ok((generation, retired_tasks))
     }
 }
 

@@ -43,6 +43,7 @@ impl QUICListener {
         backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
         backend_dns_resolver: SharedDnsResolver,
         metrics: Arc<Metrics>,
+        task_registry: Arc<RuntimeTaskRegistry>,
     ) {
         if !config.performance.backend_dns_refresh_enabled {
             return;
@@ -63,7 +64,7 @@ impl QUICListener {
         };
 
         let task_metrics = Arc::clone(&metrics);
-        spawn_supervised_async_task(&handle, "backend-dns-refresh", Some(metrics), async move {
+        let registration = spawn_supervised_async_task(&handle, "backend-dns-refresh", Some(metrics), async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -157,6 +158,7 @@ impl QUICListener {
                 }
             }
         });
+        task_registry.register(registration);
     }
 }
 

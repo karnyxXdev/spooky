@@ -85,7 +85,7 @@ use crate::{
     types::{
         ListenerTlsInventory, ListenerTlsReloadState, ListenerTlsReloadStore,
         QuicConnectionErrorSnapshot, RuntimeBackendResolution, RuntimeBackendResolutionStore,
-        RuntimeBundle, RuntimeBundleHandle,
+        RuntimeBundle, RuntimeBundleHandle, RuntimeTaskRegistration, RuntimeTaskRegistry,
         RuntimeLoadedClientAuthCa, RuntimeLoadedTlsIdentity, RuntimeTlsCertificateMetadata,
     },
     watchdog::{WatchdogCoordinator, WatchdogRuntimeConfig, now_millis},
@@ -745,6 +745,7 @@ impl QUICListener {
             metrics,
             resilience,
             watchdog,
+            generation_tasks: Arc::new(RuntimeTaskRegistry::new()),
         })
     }
 
@@ -769,28 +770,9 @@ impl QUICListener {
         shared_state
             .watchdog
             .set_expected_workers(worker_count.max(1));
-        Self::spawn_backend_dns_refresh(
-            config,
-            Arc::clone(&shared_state.transport_pool),
-            Arc::clone(&shared_state.backend_resolution_store),
-            shared_state.backend_dns_resolver.clone(),
-            Arc::clone(&shared_state.metrics),
-        );
-        Self::spawn_health_checks(
-            shared_state.upstream_pools.clone(),
-            Arc::clone(&shared_state.transport_pool),
-            Arc::clone(&shared_state.backend_endpoints),
-            Arc::clone(&shared_state.backend_resolution_store),
-            Arc::clone(&shared_state.metrics),
-        );
+        Self::spawn_generation_background_tasks(config, shared_state);
         Self::spawn_metrics_endpoint(config, Arc::clone(&shared_state.metrics), None)?;
         Self::spawn_control_api_endpoint(config, shared_state, None, worker_count)?;
-        Self::spawn_watchdog(
-            config,
-            Arc::clone(&shared_state.metrics),
-            Arc::clone(&shared_state.resilience),
-            Arc::clone(&shared_state.watchdog),
-        );
         Ok(())
     }
 
@@ -803,12 +785,32 @@ impl QUICListener {
         shared_state
             .watchdog
             .set_expected_workers(worker_count.max(1));
+        Self::spawn_generation_background_tasks(config, shared_state);
+        Self::spawn_metrics_endpoint(config, Arc::clone(&shared_state.metrics), Some(Arc::clone(&runtime_bundle)))?;
+        Self::spawn_control_api_endpoint(config, shared_state, Some(runtime_bundle), worker_count)?;
+        Ok(())
+    }
+
+    pub(super) fn spawn_generation_background_tasks(
+        config: &RuntimeConfig,
+        shared_state: &SharedRuntimeState,
+    ) {
+        shared_state.watchdog.set_expected_workers(
+            config
+                .performance
+                .worker_threads
+                .max(1)
+                .saturating_mul(config.performance.packet_shards_per_worker.max(1))
+                .max(1),
+        );
+        let task_registry = Arc::clone(&shared_state.generation_tasks);
         Self::spawn_backend_dns_refresh(
             config,
             Arc::clone(&shared_state.transport_pool),
             Arc::clone(&shared_state.backend_resolution_store),
             shared_state.backend_dns_resolver.clone(),
             Arc::clone(&shared_state.metrics),
+            Arc::clone(&task_registry),
         );
         Self::spawn_health_checks(
             shared_state.upstream_pools.clone(),
@@ -816,16 +818,15 @@ impl QUICListener {
             Arc::clone(&shared_state.backend_endpoints),
             Arc::clone(&shared_state.backend_resolution_store),
             Arc::clone(&shared_state.metrics),
+            Arc::clone(&task_registry),
         );
-        Self::spawn_metrics_endpoint(config, Arc::clone(&shared_state.metrics), Some(Arc::clone(&runtime_bundle)))?;
-        Self::spawn_control_api_endpoint(config, shared_state, Some(runtime_bundle), worker_count)?;
         Self::spawn_watchdog(
             config,
             Arc::clone(&shared_state.metrics),
             Arc::clone(&shared_state.resilience),
             Arc::clone(&shared_state.watchdog),
+            task_registry,
         );
-        Ok(())
     }
 
     pub fn bind_reuseport_sockets(
@@ -6117,11 +6118,14 @@ fn spawn_supervised_async_task<F>(
     task_name: &'static str,
     metrics: Option<Arc<Metrics>>,
     fut: F,
-) where
+) -> RuntimeTaskRegistration
+where
     F: Future<Output = ()> + Send + 'static,
 {
     let task_name = task_name.to_string();
+    let (completion_tx, completion_rx) = oneshot::channel();
     let join = handle.spawn(fut);
+    let abort = join.abort_handle();
     let monitor_handle = handle.clone();
     monitor_handle.spawn(async move {
         match join.await {
@@ -6137,7 +6141,9 @@ fn spawn_supervised_async_task<F>(
                 }
             }
         }
+        let _ = completion_tx.send(());
     });
+    RuntimeTaskRegistration::new(abort, completion_rx)
 }
 
 fn fallback_runtime() -> Option<&'static tokio::runtime::Runtime> {

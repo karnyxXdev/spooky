@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0-beta] - 2026-06-20
+
+### Added
+
+- HTTP/1.1 upstream transport — `http://` backends are now forwarded over a pooled HTTP/1.1 connection via new `H1Client` and `H1Pool` primitives.
+- Scheme-aware dispatch in the data plane — backend scheme determines transport: `https://` uses HTTP/2, `http://` uses HTTP/1.1.
+- Mixed HTTP/1.1 and HTTP/2 backend deployments supported within the same upstream pool.
+- DNS refresh client rotation wired through `UpstreamTransportPool` for H1 backends, matching existing H2 behavior.
+- Health checks routed through the scheme-aware transport pool — `http://` backends are now probed over HTTP/1.1.
+- `TE: trailers` header added to H1 upstream requests to preserve trailer forwarding semantics.
+
+### Fixed
+
+- Config validator no longer applies TLS trust-store checks to `http://` upstreams — HTTP-only configs boot without requiring CA paths or TLS material.
+
+### Changed
+
+- Upstream transport layer unified under `UpstreamTransportPool`, which dispatches by `BackendTransportKind` (`Http1` or `H2`).
+
 ## [0.2.1-beta] - 2026-06-20
 
 ### Fixed

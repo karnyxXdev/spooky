@@ -408,6 +408,13 @@ struct BootstrapConnectionState {
     routing_index: Arc<RouteIndex>,
 }
 
+struct MetricsEndpointState {
+    metrics_path: String,
+    max_connections: usize,
+    connection_timeout: Duration,
+    metrics: Arc<Metrics>,
+}
+
 struct RuntimeConnectionSlotGuard {
     active_connections: Arc<AtomicUsize>,
 }
@@ -4528,7 +4535,7 @@ impl QUICListener {
                     max_connections,
                     connection_timeout.as_millis()
                 );
-                let connection_limiter = Arc::new(Semaphore::new(max_connections));
+                let active_connections = Arc::new(AtomicUsize::new(0));
 
                 loop {
                     let (stream, _peer) = match listener.accept().await {
@@ -4538,31 +4545,32 @@ impl QUICListener {
                             continue;
                         }
                     };
-                    let permit = match Arc::clone(&connection_limiter).try_acquire_owned() {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            // Drop excess connections immediately under load.
-                            continue;
-                        }
-                    };
+                    let runtime_state = Self::metrics_endpoint_state(
+                        runtime_bundle.as_ref(),
+                        metrics_path.clone(),
+                        max_connections,
+                        connection_timeout,
+                        Arc::clone(&metrics),
+                    );
+                    let active_connections = Arc::clone(&active_connections);
+                    if !Self::try_claim_runtime_connection_slot(
+                        &active_connections,
+                        runtime_state.max_connections,
+                    ) {
+                        continue;
+                    }
 
                     let io = TokioIo::new(stream);
-                    let runtime_bundle = runtime_bundle.clone();
-                    let metrics = Arc::clone(&metrics);
-                    let metrics_path = metrics_path.clone();
-                    let timeout = connection_timeout;
+                    let metrics = Arc::clone(&runtime_state.metrics);
+                    let metrics_path = runtime_state.metrics_path.clone();
+                    let timeout = runtime_state.connection_timeout;
 
                     tokio::spawn(async move {
-                        let _permit = permit;
+                        let _connection_guard = RuntimeConnectionSlotGuard::new(active_connections);
                         let service = service_fn(move |req: Request<Incoming>| {
                             let metrics = Arc::clone(&metrics);
                             let metrics_path = metrics_path.clone();
-                            let runtime_bundle = runtime_bundle.clone();
                             async move {
-                                let metrics = runtime_bundle
-                                    .as_ref()
-                                    .map(|handle| handle.current().shared_state.metrics.clone())
-                                    .unwrap_or(metrics);
                                 Ok::<_, hyper::Error>(Self::handle_metrics_request(
                                     req,
                                     &metrics_path,
@@ -4586,6 +4594,32 @@ impl QUICListener {
             },
         );
         Ok(())
+    }
+
+    fn metrics_endpoint_state(
+        runtime_bundle: Option<&Arc<RuntimeBundleHandle>>,
+        startup_metrics_path: String,
+        startup_max_connections: usize,
+        startup_connection_timeout: Duration,
+        startup_metrics: Arc<Metrics>,
+    ) -> MetricsEndpointState {
+        if let Some(handle) = runtime_bundle {
+            let runtime = handle.current();
+            let endpoint = &runtime.runtime_config.observability.metrics;
+            return MetricsEndpointState {
+                metrics_path: endpoint.path.clone(),
+                max_connections: endpoint.max_connections.max(1),
+                connection_timeout: Duration::from_millis(endpoint.connection_timeout_ms.max(1)),
+                metrics: runtime.shared_state.metrics.clone(),
+            };
+        }
+
+        MetricsEndpointState {
+            metrics_path: startup_metrics_path,
+            max_connections: startup_max_connections,
+            connection_timeout: startup_connection_timeout,
+            metrics: startup_metrics,
+        }
     }
 
     fn load_tls_cert_chain_from_pem_file(

@@ -792,6 +792,16 @@ impl QUICListener {
                     }),
                 );
             }
+            if let Some(err) = Self::validate_metrics_reload_compatibility(&runtime, &next_runtime)
+            {
+                return Self::json_response(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "reloaded": false,
+                        "error": err,
+                    }),
+                );
+            }
             QUICListener::spawn_generation_background_tasks(
                 &next_runtime.runtime_config,
                 next_runtime.shared_state.as_ref(),
@@ -969,6 +979,38 @@ impl QUICListener {
                 current_control_api.port,
                 next_control_api.address,
                 next_control_api.port
+            ));
+        }
+        None
+    }
+
+    fn validate_metrics_reload_compatibility(
+        current: &RuntimeBundle,
+        next: &RuntimeBundle,
+    ) -> Option<String> {
+        let current_metrics = &current.runtime_config.observability.metrics;
+        let next_metrics = &next.runtime_config.observability.metrics;
+        if current_metrics.enabled != next_metrics.enabled {
+            return Some(format!(
+                "runtime reload rejected: observability.metrics.enabled changed from {} to {}; restart required",
+                current_metrics.enabled, next_metrics.enabled
+            ));
+        }
+        if current_metrics.required != next_metrics.required {
+            return Some(format!(
+                "runtime reload rejected: observability.metrics.required changed from {} to {}; restart required",
+                current_metrics.required, next_metrics.required
+            ));
+        }
+        if current_metrics.address != next_metrics.address
+            || current_metrics.port != next_metrics.port
+        {
+            return Some(format!(
+                "runtime reload rejected: observability.metrics bind changed from {}:{} to {}:{}; restart required",
+                current_metrics.address,
+                current_metrics.port,
+                next_metrics.address,
+                next_metrics.port
             ));
         }
         None

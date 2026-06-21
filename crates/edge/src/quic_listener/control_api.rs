@@ -1,4 +1,5 @@
 use super::*;
+use spooky_config::config::ControlApi as ControlApiConfig;
 use spooky_config::loader::read_config;
 use spooky_config::runtime::RuntimeConfig;
 use std::ffi::OsString;
@@ -14,8 +15,22 @@ pub(super) struct ControlApiPaths {
     pub(super) reload_certs_path: String,
 }
 
+impl ControlApiPaths {
+    fn from_endpoint(endpoint: &ControlApiConfig) -> Self {
+        Self {
+            health_path: endpoint.health_path.clone(),
+            ready_path: endpoint.ready_path.clone(),
+            runtime_path: endpoint.runtime_path.clone(),
+            restart_path: endpoint.restart_path.clone(),
+            reload_path: endpoint.reload_path.clone(),
+            reload_certs_path: endpoint.reload_certs_path.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct ControlApiState {
+    pub(super) control_api: ControlApiConfig,
     pub(super) metrics: Arc<Metrics>,
     pub(super) resilience: Arc<RuntimeResilience>,
     pub(super) watchdog: Arc<WatchdogCoordinator>,
@@ -25,13 +40,34 @@ pub(super) struct ControlApiState {
     pub(super) primary_listener_label: String,
     pub(super) expected_workers: usize,
     pub(super) started_at: Instant,
-    pub(super) auth_token: Option<String>,
     pub(super) runtime_bundle: Option<Arc<RuntimeBundleHandle>>,
 }
 
 impl ControlApiState {
     fn current_runtime(&self) -> Option<Arc<RuntimeBundle>> {
         self.runtime_bundle.as_ref().map(|handle| handle.current())
+    }
+
+    fn current_control_api(&self) -> ControlApiConfig {
+        self.current_runtime()
+            .map(|runtime| runtime.runtime_config.observability.control_api.clone())
+            .unwrap_or_else(|| self.control_api.clone())
+    }
+
+    fn current_paths(&self) -> ControlApiPaths {
+        ControlApiPaths::from_endpoint(&self.current_control_api())
+    }
+
+    fn current_listener_tls_store(&self) -> Arc<ListenerTlsReloadStore> {
+        self.current_runtime()
+            .map(|runtime| runtime.shared_state.listener_tls_store.clone())
+            .unwrap_or_else(|| Arc::clone(&self.listener_tls_store))
+    }
+
+    fn current_metrics(&self) -> Arc<Metrics> {
+        self.current_runtime()
+            .map(|runtime| runtime.shared_state.metrics.clone())
+            .unwrap_or_else(|| Arc::clone(&self.metrics))
     }
 
     pub(super) fn snapshot_backend_health(&self) -> (usize, usize) {
@@ -129,15 +165,8 @@ impl QUICListener {
             error!("{}", msg);
             return Ok(());
         }
-        let paths = ControlApiPaths {
-            health_path: endpoint.health_path.clone(),
-            ready_path: endpoint.ready_path.clone(),
-            runtime_path: endpoint.runtime_path.clone(),
-            restart_path: endpoint.restart_path.clone(),
-            reload_path: endpoint.reload_path.clone(),
-            reload_certs_path: endpoint.reload_certs_path.clone(),
-        };
         let state = ControlApiState {
+            control_api: endpoint.clone(),
             metrics: Arc::clone(&shared_state.metrics),
             resilience: Arc::clone(&shared_state.resilience),
             watchdog: Arc::clone(&shared_state.watchdog),
@@ -147,7 +176,6 @@ impl QUICListener {
             primary_listener_label,
             expected_workers: worker_count.max(1),
             started_at: Instant::now(),
-            auth_token: endpoint.auth_token.clone(),
             runtime_bundle,
         };
 
@@ -209,6 +237,7 @@ impl QUICListener {
             "control-api-endpoint",
             Some(Arc::clone(&shared_state.metrics)),
             async move {
+                let paths = state.current_paths();
                 info!(
                     "Control API endpoint listening on https://{}{} (ready={}, runtime={}, reload_certs={}, max_connections={}, connection_timeout_ms={})",
                     bind,
@@ -219,7 +248,7 @@ impl QUICListener {
                     max_connections,
                     connection_timeout.as_millis()
                 );
-                let connection_limiter = Arc::new(Semaphore::new(max_connections));
+                let active_connections = Arc::new(AtomicUsize::new(0));
 
                 loop {
                     let (stream, peer) = match listener.accept().await {
@@ -229,26 +258,28 @@ impl QUICListener {
                             continue;
                         }
                     };
-                    let permit = match Arc::clone(&connection_limiter).try_acquire_owned() {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            state.metrics.inc_control_api_connection_limit_drop();
-                            warn!(
-                                "Control API endpoint dropped connection from {} due to max connection limit ({})",
-                                peer, max_connections
-                            );
-                            continue;
-                        }
-                    };
-
-                    let paths = paths.clone();
                     let state = state.clone();
-                    let timeout = connection_timeout;
+                    let active_connections = Arc::clone(&active_connections);
+                    let endpoint = state.current_control_api();
+                    let max_connections = endpoint.max_connections.max(1);
+                    if !Self::try_claim_connection_slot(&active_connections, max_connections) {
+                        state
+                            .current_metrics()
+                            .inc_control_api_connection_limit_drop();
+                        warn!(
+                            "Control API endpoint dropped connection from {} due to max connection limit ({})",
+                            peer, max_connections
+                        );
+                        continue;
+                    }
 
                     tokio::spawn(async move {
-                        let _permit = permit;
-                        let Some(server_config) = state
-                            .listener_tls_store
+                        let _connection_guard = ConnectionSlotGuard::new(active_connections);
+                        let timeout = Duration::from_millis(
+                            state.current_control_api().connection_timeout_ms.max(1),
+                        );
+                        let listener_tls_store = state.current_listener_tls_store();
+                        let Some(server_config) = listener_tls_store
                             .bootstrap_server_config(&state.primary_listener_label)
                         else {
                             error!(
@@ -270,12 +301,9 @@ impl QUICListener {
                         };
                         let io = TokioIo::new(tls_stream);
                         let service = service_fn(move |req: Request<Incoming>| {
-                            let paths = paths.clone();
                             let state = state.clone();
                             async move {
-                                Ok::<_, hyper::Error>(Self::handle_control_api_request(
-                                    req, &paths, &state,
-                                ))
+                                Ok::<_, hyper::Error>(Self::handle_control_api_request(req, &state))
                             }
                         });
 
@@ -296,6 +324,29 @@ impl QUICListener {
         Ok(())
     }
 
+    fn try_claim_connection_slot(
+        active_connections: &Arc<AtomicUsize>,
+        max_connections: usize,
+    ) -> bool {
+        loop {
+            let current = active_connections.load(Ordering::Relaxed);
+            if current >= max_connections {
+                return false;
+            }
+            if active_connections
+                .compare_exchange(
+                    current,
+                    current.saturating_add(1),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
     pub(super) fn json_response(
         status: StatusCode,
         value: serde_json::Value,
@@ -312,15 +363,15 @@ impl QUICListener {
 
     pub(super) fn handle_control_api_request(
         req: Request<Incoming>,
-        paths: &ControlApiPaths,
         state: &ControlApiState,
     ) -> Response<Full<Bytes>> {
         if state.runtime_bundle.is_some() {
-            return Self::handle_runtime_control_api_request(req, paths, state);
+            return Self::handle_runtime_control_api_request(req, state);
         }
+        let paths = state.current_paths();
         let path = req.uri().path();
 
-        if req.method() == http::Method::GET && path == paths.health_path {
+        if req.method() == http::Method::GET && path == paths.health_path.as_str() {
             let response = json!({
                 "status": "ok",
                 "uptime_ms": state.started_at.elapsed().as_millis() as u64,
@@ -333,7 +384,7 @@ impl QUICListener {
             return Self::json_response(StatusCode::OK, response);
         }
 
-        if req.method() == http::Method::GET && path == paths.ready_path {
+        if req.method() == http::Method::GET && path == paths.ready_path.as_str() {
             let (healthy_backends, total_backends) = state.snapshot_backend_health();
             let restart_requested = state.watchdog.restart_requested();
             let ready = !restart_requested && (total_backends == 0 || healthy_backends > 0);
@@ -353,7 +404,7 @@ impl QUICListener {
             );
         }
 
-        if req.method() == http::Method::GET && path == paths.runtime_path {
+        if req.method() == http::Method::GET && path == paths.runtime_path.as_str() {
             if !Self::control_api_is_authorized(&req, state) {
                 return Self::json_response(
                     StatusCode::UNAUTHORIZED,
@@ -422,7 +473,7 @@ impl QUICListener {
             return Self::json_response(StatusCode::OK, response);
         }
 
-        if req.method() == http::Method::POST && path == paths.reload_certs_path {
+        if req.method() == http::Method::POST && path == paths.reload_certs_path.as_str() {
             if !Self::control_api_is_authorized(&req, state) {
                 return Self::json_response(
                     StatusCode::UNAUTHORIZED,
@@ -485,7 +536,7 @@ impl QUICListener {
             );
         }
 
-        if req.method() == http::Method::POST && path == paths.restart_path {
+        if req.method() == http::Method::POST && path == paths.restart_path.as_str() {
             if !Self::control_api_is_authorized(&req, state) {
                 return Self::json_response(
                     StatusCode::UNAUTHORIZED,
@@ -531,9 +582,9 @@ impl QUICListener {
 
     fn handle_runtime_control_api_request(
         req: Request<Incoming>,
-        paths: &ControlApiPaths,
         state: &ControlApiState,
     ) -> Response<Full<Bytes>> {
+        let paths = state.current_paths();
         let path = req.uri().path();
         let Some(runtime_bundle_handle) = state.runtime_bundle.as_ref() else {
             return Self::json_response(
@@ -546,7 +597,7 @@ impl QUICListener {
         let runtime = runtime_bundle_handle.current();
         let shared_state = &runtime.shared_state;
 
-        if req.method() == http::Method::GET && path == paths.health_path {
+        if req.method() == http::Method::GET && path == paths.health_path.as_str() {
             let response = json!({
                 "status": "ok",
                 "uptime_ms": state.started_at.elapsed().as_millis() as u64,
@@ -559,7 +610,7 @@ impl QUICListener {
             return Self::json_response(StatusCode::OK, response);
         }
 
-        if req.method() == http::Method::GET && path == paths.ready_path {
+        if req.method() == http::Method::GET && path == paths.ready_path.as_str() {
             let (healthy_backends, total_backends) = state.snapshot_backend_health();
             let restart_requested = shared_state.watchdog.restart_requested();
             let ready = !restart_requested && (total_backends == 0 || healthy_backends > 0);
@@ -579,7 +630,7 @@ impl QUICListener {
             );
         }
 
-        if req.method() == http::Method::GET && path == paths.runtime_path {
+        if req.method() == http::Method::GET && path == paths.runtime_path.as_str() {
             if !Self::control_api_is_authorized(&req, state) {
                 return Self::json_response(
                     StatusCode::UNAUTHORIZED,
@@ -653,7 +704,7 @@ impl QUICListener {
         }
 
         if req.method() == http::Method::POST
-            && (path == paths.reload_certs_path || path == paths.reload_path)
+            && (path == paths.reload_certs_path.as_str() || path == paths.reload_path.as_str())
         {
             if !Self::control_api_is_authorized(&req, state) {
                 return Self::json_response(
@@ -730,6 +781,17 @@ impl QUICListener {
                     }),
                 );
             }
+            if let Some(err) =
+                Self::validate_control_api_reload_compatibility(&runtime, &next_runtime)
+            {
+                return Self::json_response(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "reloaded": false,
+                        "error": err,
+                    }),
+                );
+            }
             QUICListener::spawn_generation_background_tasks(
                 &next_runtime.runtime_config,
                 next_runtime.shared_state.as_ref(),
@@ -761,7 +823,7 @@ impl QUICListener {
             );
         }
 
-        if req.method() == http::Method::POST && path == paths.restart_path {
+        if req.method() == http::Method::POST && path == paths.restart_path.as_str() {
             if !Self::control_api_is_authorized(&req, state) {
                 return Self::json_response(
                     StatusCode::UNAUTHORIZED,
@@ -880,11 +942,44 @@ impl QUICListener {
         None
     }
 
+    fn validate_control_api_reload_compatibility(
+        current: &RuntimeBundle,
+        next: &RuntimeBundle,
+    ) -> Option<String> {
+        let current_control_api = &current.runtime_config.observability.control_api;
+        let next_control_api = &next.runtime_config.observability.control_api;
+        if current_control_api.enabled != next_control_api.enabled {
+            return Some(format!(
+                "runtime reload rejected: observability.control_api.enabled changed from {} to {}; restart required",
+                current_control_api.enabled, next_control_api.enabled
+            ));
+        }
+        if current_control_api.required != next_control_api.required {
+            return Some(format!(
+                "runtime reload rejected: observability.control_api.required changed from {} to {}; restart required",
+                current_control_api.required, next_control_api.required
+            ));
+        }
+        if current_control_api.address != next_control_api.address
+            || current_control_api.port != next_control_api.port
+        {
+            return Some(format!(
+                "runtime reload rejected: observability.control_api bind changed from {}:{} to {}:{}; restart required",
+                current_control_api.address,
+                current_control_api.port,
+                next_control_api.address,
+                next_control_api.port
+            ));
+        }
+        None
+    }
+
     pub(super) fn control_api_is_authorized(
         req: &Request<Incoming>,
         state: &ControlApiState,
     ) -> bool {
-        let Some(token) = state.auth_token.as_ref() else {
+        let endpoint = state.current_control_api();
+        let Some(token) = endpoint.auth_token.as_ref() else {
             return false;
         };
         let Some(header) = req.headers().get(http::header::AUTHORIZATION) else {
@@ -1078,6 +1173,22 @@ impl QUICListener {
             },
         );
         task_registry.register(registration);
+    }
+}
+
+struct ConnectionSlotGuard {
+    active_connections: Arc<AtomicUsize>,
+}
+
+impl ConnectionSlotGuard {
+    fn new(active_connections: Arc<AtomicUsize>) -> Self {
+        Self { active_connections }
+    }
+}
+
+impl Drop for ConnectionSlotGuard {
+    fn drop(&mut self) {
+        self.active_connections.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

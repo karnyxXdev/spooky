@@ -7995,7 +7995,7 @@ mod tests {
 
     use crate::resilience::{AdaptiveAdmission, RouteQueueLimiter};
     use crate::{RequestEnvelope, StreamPhase};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     use tokio::sync::{Semaphore, mpsc, oneshot};
 
     fn make_envelope(phase: StreamPhase) -> RequestEnvelope {

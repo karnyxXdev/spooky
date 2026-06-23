@@ -50,6 +50,7 @@ use spooky_errors::{PoolError, ProxyError, is_retryable};
 use spooky_lb::{HealthFailureReason, HealthTransition, UpstreamPool};
 use spooky_transport::h2_client::{SharedDnsResolver, TlsClientConfig};
 use spooky_transport::transport_pool::{BackendTransportKind, UpstreamTransportPool};
+use std::sync::atomic::AtomicBool;
 use tokio::runtime::Handle;
 use tokio::sync::{
     Semaphore, mpsc,
@@ -5272,6 +5273,7 @@ impl QUICListener {
         config: &ListenerRuntimeConfig,
         shared_state: &SharedRuntimeState,
         runtime_bundle: Option<Arc<RuntimeBundleHandle>>,
+        shutdown_signal: Option<Arc<AtomicBool>>,
     ) -> Result<(), ProxyError> {
         let bind = format!(
             "{}:{}",
@@ -5356,7 +5358,28 @@ impl QUICListener {
             );
             let active_connections = Arc::new(AtomicUsize::new(0));
             loop {
-                let (stream, peer) = match listener.accept().await {
+                let accept_result = if let Some(shutdown_signal) = shutdown_signal.as_ref() {
+                    tokio::select! {
+                        accept = listener.accept() => Some(accept),
+                        _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                            if shutdown_signal.load(Ordering::Relaxed) {
+                                None
+                            } else {
+                                continue;
+                            }
+                        }
+                    }
+                } else {
+                    Some(listener.accept().await)
+                };
+                let Some(accept_result) = accept_result else {
+                    info!(
+                        "Bootstrap TLS listener on {} stopping due to runtime group shutdown",
+                        bind
+                    );
+                    break;
+                };
+                let (stream, peer) = match accept_result {
                     Ok(v) => v,
                     Err(err) => {
                         error!("Bootstrap TLS listener accept failed: {}", err);

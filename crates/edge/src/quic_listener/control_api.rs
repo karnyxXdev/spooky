@@ -799,16 +799,13 @@ impl QUICListener {
                 runtime_config,
                 shared_state: Arc::clone(&next_shared_state),
             };
-            if let Some((missing, existing)) =
-                Self::validate_runtime_reload_compatibility(&runtime, &next_runtime)
+            if let Some(err) = Self::validate_runtime_reload_compatibility(&runtime, &next_runtime)
             {
                 return Self::json_response(
                     StatusCode::CONFLICT,
                     json!({
                         "reloaded": false,
-                        "error": format!(
-                            "runtime reload rejected: listener set changed (missing={missing:?}, extra={existing:?})"
-                        ),
+                        "error": err,
                     }),
                 );
             }
@@ -927,69 +924,40 @@ impl QUICListener {
     fn validate_runtime_reload_compatibility(
         current: &RuntimeBundle,
         next: &RuntimeBundle,
-    ) -> Option<(Vec<String>, Vec<String>)> {
-        let current_labels = current
-            .shared_state
-            .listener_runtime_configs
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        let next_labels = next
-            .shared_state
-            .listener_runtime_configs
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        if current_labels.len() != next_labels.len() {
-            let missing = current_labels
-                .iter()
-                .filter(|label| {
-                    !next
-                        .shared_state
-                        .listener_runtime_configs
-                        .contains_key(*label)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let extra = next_labels
-                .iter()
-                .filter(|label| {
-                    !current
-                        .shared_state
-                        .listener_runtime_configs
-                        .contains_key(*label)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            return Some((missing, extra));
-        }
-        if current_labels.iter().any(|label| {
-            !next
+    ) -> Option<String> {
+        let worker_count = next.runtime_config.performance.worker_threads.max(1);
+        for (label, listener_config) in next.shared_state.listener_runtime_configs.iter() {
+            if current
                 .shared_state
                 .listener_runtime_configs
                 .contains_key(label)
-        }) {
-            let missing = current_labels
-                .iter()
-                .filter(|label| {
-                    !next
-                        .shared_state
-                        .listener_runtime_configs
-                        .contains_key(*label)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let extra = next_labels
-                .iter()
-                .filter(|label| {
-                    !current
-                        .shared_state
-                        .listener_runtime_configs
-                        .contains_key(*label)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            return Some((missing, extra));
+            {
+                continue;
+            }
+            if worker_count > 1 {
+                if let Err(err) = Self::bind_reuseport_sockets(listener_config, worker_count) {
+                    return Some(format!(
+                        "runtime reload rejected: failed to preflight QUIC listener {}: {}",
+                        label, err
+                    ));
+                }
+            } else if let Err(err) = Self::bind_socket(listener_config, false) {
+                return Some(format!(
+                    "runtime reload rejected: failed to preflight QUIC listener {}: {}",
+                    label, err
+                ));
+            }
+
+            let bind = format!(
+                "{}:{}",
+                listener_config.listen.listen.address, listener_config.listen.listen.port
+            );
+            if let Err(err) = Self::probe_tcp_bind(&bind, "bootstrap TLS listener") {
+                return Some(format!(
+                    "runtime reload rejected: failed to preflight bootstrap listener {}: {}",
+                    label, err
+                ));
+            }
         }
         None
     }
@@ -1133,54 +1101,6 @@ impl QUICListener {
             "performance.control_plane_threads",
             &current_perf.control_plane_threads,
             &next_perf.control_plane_threads,
-        );
-        Self::note_restart_required_change(
-            &mut issues,
-            "performance.worker_threads",
-            &current_perf.worker_threads,
-            &next_perf.worker_threads,
-        );
-        Self::note_restart_required_change(
-            &mut issues,
-            "performance.packet_shards_per_worker",
-            &current_perf.packet_shards_per_worker,
-            &next_perf.packet_shards_per_worker,
-        );
-        Self::note_restart_required_change(
-            &mut issues,
-            "performance.packet_shard_queue_capacity",
-            &current_perf.packet_shard_queue_capacity,
-            &next_perf.packet_shard_queue_capacity,
-        );
-        Self::note_restart_required_change(
-            &mut issues,
-            "performance.packet_shard_queue_max_bytes",
-            &current_perf.packet_shard_queue_max_bytes,
-            &next_perf.packet_shard_queue_max_bytes,
-        );
-        Self::note_restart_required_change(
-            &mut issues,
-            "performance.reuseport",
-            &current_perf.reuseport,
-            &next_perf.reuseport,
-        );
-        Self::note_restart_required_change(
-            &mut issues,
-            "performance.pin_workers",
-            &current_perf.pin_workers,
-            &next_perf.pin_workers,
-        );
-        Self::note_restart_required_change(
-            &mut issues,
-            "performance.udp_recv_buffer_bytes",
-            &current_perf.udp_recv_buffer_bytes,
-            &next_perf.udp_recv_buffer_bytes,
-        );
-        Self::note_restart_required_change(
-            &mut issues,
-            "performance.udp_send_buffer_bytes",
-            &current_perf.udp_send_buffer_bytes,
-            &next_perf.udp_send_buffer_bytes,
         );
 
         issues
@@ -1684,7 +1604,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_startup_owned_reload_compatibility_rejects_worker_topology_change() {
+    fn validate_startup_owned_reload_compatibility_allows_worker_topology_change() {
         let dir = tempdir().expect("tempdir");
         let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
         let current = test_config(cert.clone(), key.clone());
@@ -1700,15 +1620,49 @@ mod tests {
             &next_bundle,
         );
 
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn validate_runtime_reload_compatibility_allows_listener_addition_when_binds_are_free() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let current = test_config(cert.clone(), key.clone());
+
+        let mut next = current.clone();
+        let mut extra_listener = next.listen.clone();
+        extra_listener.port = 9891;
+        next.listeners = vec![next.listen.clone(), extra_listener];
+
+        let current_bundle = runtime_bundle_from_config("current.yaml", &current);
+        let next_bundle = runtime_bundle_from_config("next.yaml", &next);
+
         assert!(
-            issues
-                .iter()
-                .any(|issue| issue.contains("performance.worker_threads"))
+            QUICListener::validate_runtime_reload_compatibility(&current_bundle, &next_bundle)
+                .is_none()
         );
+    }
+
+    #[test]
+    fn validate_startup_owned_reload_compatibility_rejects_control_plane_thread_change() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let current = test_config(cert.clone(), key.clone());
+
+        let mut next = current.clone();
+        next.performance.control_plane_threads = 7;
+
+        let current_bundle = runtime_bundle_from_config("current.yaml", &current);
+        let next_bundle = runtime_bundle_from_config("next.yaml", &next);
+        let issues = QUICListener::validate_startup_owned_reload_compatibility(
+            &current_bundle,
+            &next_bundle,
+        );
+
         assert!(
             issues
                 .iter()
-                .any(|issue| issue.contains("performance.packet_shards_per_worker"))
+                .any(|issue| issue.contains("performance.control_plane_threads"))
         );
     }
 }

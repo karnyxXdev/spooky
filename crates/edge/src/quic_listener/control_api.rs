@@ -43,6 +43,12 @@ pub(super) struct ControlApiState {
     pub(super) runtime_bundle: Option<Arc<RuntimeBundleHandle>>,
 }
 
+struct ControlApiListenerBinding {
+    bind: String,
+    listener: tokio::net::TcpListener,
+    active_connections: Arc<AtomicUsize>,
+}
+
 impl ControlApiState {
     fn current_runtime(&self) -> Option<Arc<RuntimeBundle>> {
         self.runtime_bundle.as_ref().map(|handle| handle.current())
@@ -138,22 +144,20 @@ impl QUICListener {
         worker_count: usize,
     ) -> Result<(), ProxyError> {
         let endpoint = &config.observability.control_api;
-        if !endpoint.enabled {
+        if runtime_bundle.is_none() && !endpoint.enabled {
             return Ok(());
         }
         let required = endpoint.required;
-
-        let bind = format!("{}:{}", endpoint.address, endpoint.port);
-        let max_connections = endpoint.max_connections.max(1);
-        let connection_timeout = Duration::from_millis(endpoint.connection_timeout_ms.max(1));
+        let startup_endpoint = endpoint.clone();
         let listener_config = config.primary_listener_runtime_config().ok_or_else(|| {
             ProxyError::Transport("no effective listeners configured".to_string())
         })?;
         let primary_listener_label = Self::listener_label(&listener_config);
-        if shared_state
-            .listener_tls_store
-            .bootstrap_server_config(&primary_listener_label)
-            .is_none()
+        if startup_endpoint.enabled
+            && shared_state
+                .listener_tls_store
+                .bootstrap_server_config(&primary_listener_label)
+                .is_none()
         {
             let msg = format!(
                 "failed to initialize control API TLS config: missing reload state for listener '{}'",
@@ -191,45 +195,24 @@ impl QUICListener {
             }
         };
 
-        let std_listener = match std::net::TcpListener::bind(&bind) {
-            Ok(listener) => listener,
-            Err(err) => {
-                let msg = format!("failed to bind control API endpoint {bind}: {err}");
-                if required {
-                    return Err(ProxyError::Transport(msg));
+        let initial_binding = if startup_endpoint.enabled {
+            let bind = format!("{}:{}", startup_endpoint.address, startup_endpoint.port);
+            match Self::bind_tcp_listener(&bind, Some(&handle), "control API endpoint") {
+                Ok(listener) => Some(ControlApiListenerBinding {
+                    bind,
+                    listener,
+                    active_connections: Arc::new(AtomicUsize::new(0)),
+                }),
+                Err(msg) => {
+                    if required {
+                        return Err(ProxyError::Transport(msg));
+                    }
+                    error!("{}", msg);
+                    None
                 }
-                error!("{}", msg);
-                return Ok(());
             }
-        };
-        if let Err(err) = std_listener.set_nonblocking(true) {
-            let msg = format!(
-                "failed to set control API endpoint listener nonblocking ({}): {}",
-                bind, err
-            );
-            if required {
-                return Err(ProxyError::Transport(msg));
-            }
-            error!("{}", msg);
-            return Ok(());
-        }
-        let from_std_result = {
-            let _guard = handle.enter();
-            tokio::net::TcpListener::from_std(std_listener)
-        };
-        let listener = match from_std_result {
-            Ok(listener) => listener,
-            Err(err) => {
-                let msg = format!(
-                    "failed to register control API endpoint listener {}: {}",
-                    bind, err
-                );
-                if required {
-                    return Err(ProxyError::Transport(msg));
-                }
-                error!("{}", msg);
-                return Ok(());
-            }
+        } else {
+            None
         };
 
         spawn_supervised_async_task(
@@ -237,21 +220,68 @@ impl QUICListener {
             "control-api-endpoint",
             Some(Arc::clone(&shared_state.metrics)),
             async move {
-                let paths = state.current_paths();
-                info!(
-                    "Control API endpoint listening on https://{}{} (ready={}, runtime={}, reload_certs={}, max_connections={}, connection_timeout_ms={})",
-                    bind,
-                    paths.health_path,
-                    paths.ready_path,
-                    paths.runtime_path,
-                    paths.reload_certs_path,
-                    max_connections,
-                    connection_timeout.as_millis()
-                );
-                let active_connections = Arc::new(AtomicUsize::new(0));
+                let mut listener_binding = initial_binding;
 
                 loop {
-                    let (stream, peer) = match listener.accept().await {
+                    let endpoint = state.current_control_api();
+                    let desired_bind = format!("{}:{}", endpoint.address, endpoint.port);
+
+                    if !endpoint.enabled {
+                        if let Some(binding) = listener_binding.take() {
+                            info!(
+                                "Control API endpoint disabled via runtime reload on {}",
+                                binding.bind
+                            );
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+
+                    let needs_rebind = match listener_binding.as_ref() {
+                        Some(binding) => binding.bind != desired_bind,
+                        None => true,
+                    };
+                    if needs_rebind {
+                        match Self::bind_tcp_listener(&desired_bind, None, "control API endpoint") {
+                            Ok(listener) => {
+                                let paths = ControlApiPaths::from_endpoint(&endpoint);
+                                info!(
+                                    "Control API endpoint listening on https://{}{} (ready={}, runtime={}, reload_certs={}, max_connections={}, connection_timeout_ms={})",
+                                    desired_bind,
+                                    paths.health_path,
+                                    paths.ready_path,
+                                    paths.runtime_path,
+                                    paths.reload_certs_path,
+                                    endpoint.max_connections.max(1),
+                                    endpoint.connection_timeout_ms.max(1)
+                                );
+                                listener_binding = Some(ControlApiListenerBinding {
+                                    bind: desired_bind.clone(),
+                                    listener,
+                                    active_connections: Arc::new(AtomicUsize::new(0)),
+                                });
+                            }
+                            Err(err) => {
+                                error!("{}", err);
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                continue;
+                            }
+                        }
+                    }
+
+                    let Some(binding) = listener_binding.as_mut() else {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    };
+
+                    let accept_result = tokio::select! {
+                        accept = binding.listener.accept() => Some(accept),
+                        _ = tokio::time::sleep(Duration::from_millis(200)) => None,
+                    };
+                    let Some(accept_result) = accept_result else {
+                        continue;
+                    };
+                    let (stream, peer) = match accept_result {
                         Ok(v) => v,
                         Err(err) => {
                             error!("Control API endpoint accept failed: {}", err);
@@ -259,7 +289,7 @@ impl QUICListener {
                         }
                     };
                     let state = state.clone();
-                    let active_connections = Arc::clone(&active_connections);
+                    let active_connections = Arc::clone(&binding.active_connections);
                     let endpoint = state.current_control_api();
                     let max_connections = endpoint.max_connections.max(1);
                     if !Self::try_claim_connection_slot(&active_connections, max_connections) {
@@ -968,30 +998,39 @@ impl QUICListener {
         current: &RuntimeBundle,
         next: &RuntimeBundle,
     ) -> Option<String> {
-        let current_control_api = &current.runtime_config.observability.control_api;
         let next_control_api = &next.runtime_config.observability.control_api;
-        if current_control_api.enabled != next_control_api.enabled {
-            return Some(format!(
-                "runtime reload rejected: observability.control_api.enabled changed from {} to {}; restart required",
-                current_control_api.enabled, next_control_api.enabled
-            ));
+        if !next_control_api.enabled {
+            return None;
         }
-        if current_control_api.required != next_control_api.required {
-            return Some(format!(
-                "runtime reload rejected: observability.control_api.required changed from {} to {}; restart required",
-                current_control_api.required, next_control_api.required
-            ));
-        }
-        if current_control_api.address != next_control_api.address
-            || current_control_api.port != next_control_api.port
+
+        let Some(listener_config) = next.runtime_config.primary_listener_runtime_config() else {
+            return Some(
+                "runtime reload rejected: no effective listeners configured for control API TLS"
+                    .to_string(),
+            );
+        };
+        let primary_listener_label = Self::listener_label(&listener_config);
+        if next
+            .shared_state
+            .listener_tls_store
+            .bootstrap_server_config(&primary_listener_label)
+            .is_none()
         {
             return Some(format!(
-                "runtime reload rejected: observability.control_api bind changed from {}:{} to {}:{}; restart required",
-                current_control_api.address,
-                current_control_api.port,
-                next_control_api.address,
-                next_control_api.port
+                "runtime reload rejected: control API TLS config missing for listener '{}'",
+                primary_listener_label
             ));
+        }
+
+        let current_control_api = &current.runtime_config.observability.control_api;
+        let bind_changed = !current_control_api.enabled
+            || current_control_api.address != next_control_api.address
+            || current_control_api.port != next_control_api.port;
+        if bind_changed {
+            let bind = format!("{}:{}", next_control_api.address, next_control_api.port);
+            if let Err(err) = Self::probe_tcp_bind(&bind, "control API endpoint") {
+                return Some(err);
+            }
         }
         None
     }
@@ -1000,30 +1039,20 @@ impl QUICListener {
         current: &RuntimeBundle,
         next: &RuntimeBundle,
     ) -> Option<String> {
-        let current_metrics = &current.runtime_config.observability.metrics;
         let next_metrics = &next.runtime_config.observability.metrics;
-        if current_metrics.enabled != next_metrics.enabled {
-            return Some(format!(
-                "runtime reload rejected: observability.metrics.enabled changed from {} to {}; restart required",
-                current_metrics.enabled, next_metrics.enabled
-            ));
+        if !next_metrics.enabled {
+            return None;
         }
-        if current_metrics.required != next_metrics.required {
-            return Some(format!(
-                "runtime reload rejected: observability.metrics.required changed from {} to {}; restart required",
-                current_metrics.required, next_metrics.required
-            ));
-        }
-        if current_metrics.address != next_metrics.address
-            || current_metrics.port != next_metrics.port
-        {
-            return Some(format!(
-                "runtime reload rejected: observability.metrics bind changed from {}:{} to {}:{}; restart required",
-                current_metrics.address,
-                current_metrics.port,
-                next_metrics.address,
-                next_metrics.port
-            ));
+
+        let current_metrics = &current.runtime_config.observability.metrics;
+        let bind_changed = !current_metrics.enabled
+            || current_metrics.address != next_metrics.address
+            || current_metrics.port != next_metrics.port;
+        if bind_changed {
+            let bind = format!("{}:{}", next_metrics.address, next_metrics.port);
+            if let Err(err) = Self::probe_tcp_bind(&bind, "metrics endpoint") {
+                return Some(err);
+            }
         }
         None
     }
@@ -1592,7 +1621,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_control_api_reload_compatibility_rejects_bind_change() {
+    fn validate_control_api_reload_compatibility_allows_bind_change_when_socket_is_free() {
         let dir = tempdir().expect("tempdir");
         let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
         let mut current = test_config(cert.clone(), key.clone());
@@ -1605,15 +1634,14 @@ mod tests {
 
         let current_bundle = runtime_bundle_from_config("current.yaml", &current);
         let next_bundle = runtime_bundle_from_config("next.yaml", &next);
-        let err =
+        assert!(
             QUICListener::validate_control_api_reload_compatibility(&current_bundle, &next_bundle)
-                .expect("bind change should be rejected");
-
-        assert!(err.contains("observability.control_api bind changed"));
+                .is_none()
+        );
     }
 
     #[test]
-    fn validate_metrics_reload_compatibility_rejects_bind_change() {
+    fn validate_metrics_reload_compatibility_allows_bind_change_when_socket_is_free() {
         let dir = tempdir().expect("tempdir");
         let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
         let mut current = test_config(cert.clone(), key.clone());
@@ -1626,11 +1654,10 @@ mod tests {
 
         let current_bundle = runtime_bundle_from_config("current.yaml", &current);
         let next_bundle = runtime_bundle_from_config("next.yaml", &next);
-        let err =
+        assert!(
             QUICListener::validate_metrics_reload_compatibility(&current_bundle, &next_bundle)
-                .expect("bind change should be rejected");
-
-        assert!(err.contains("observability.metrics bind changed"));
+                .is_none()
+        );
     }
 
     #[test]

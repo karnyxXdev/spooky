@@ -428,6 +428,12 @@ struct MetricsEndpointState {
     metrics: Arc<Metrics>,
 }
 
+struct MetricsEndpointBinding {
+    bind: String,
+    listener: tokio::net::TcpListener,
+    active_connections: Arc<AtomicUsize>,
+}
+
 struct RuntimeConnectionSlotGuard {
     active_connections: Arc<AtomicUsize>,
 }
@@ -4484,15 +4490,15 @@ impl QUICListener {
         runtime_bundle: Option<Arc<RuntimeBundleHandle>>,
     ) -> Result<(), ProxyError> {
         let endpoint = &config.observability.metrics;
-        if !endpoint.enabled {
+        if runtime_bundle.is_none() && !endpoint.enabled {
             return Ok(());
         }
         let required = endpoint.required;
-
-        let bind = format!("{}:{}", endpoint.address, endpoint.port);
-        let metrics_path = endpoint.path.clone();
-        let max_connections = endpoint.max_connections.max(1);
-        let connection_timeout = Duration::from_millis(endpoint.connection_timeout_ms.max(1));
+        let startup_endpoint = endpoint.clone();
+        let startup_metrics_path = startup_endpoint.path.clone();
+        let startup_max_connections = startup_endpoint.max_connections.max(1);
+        let startup_connection_timeout =
+            Duration::from_millis(startup_endpoint.connection_timeout_ms.max(1));
 
         let handle = match runtime_handle() {
             Some(handle) => handle,
@@ -4506,42 +4512,24 @@ impl QUICListener {
             }
         };
 
-        // Bind synchronously so endpoint readiness does not race with task scheduling.
-        let std_listener = match std::net::TcpListener::bind(&bind) {
-            Ok(listener) => listener,
-            Err(err) => {
-                let msg = format!("failed to bind metrics endpoint {bind}: {err}");
-                if required {
-                    return Err(ProxyError::Transport(msg));
+        let initial_binding = if startup_endpoint.enabled {
+            let bind = format!("{}:{}", startup_endpoint.address, startup_endpoint.port);
+            match Self::bind_tcp_listener(&bind, Some(&handle), "metrics endpoint") {
+                Ok(listener) => Some(MetricsEndpointBinding {
+                    bind,
+                    listener,
+                    active_connections: Arc::new(AtomicUsize::new(0)),
+                }),
+                Err(msg) => {
+                    if required {
+                        return Err(ProxyError::Transport(msg));
+                    }
+                    error!("{}", msg);
+                    None
                 }
-                error!("{}", msg);
-                return Ok(());
             }
-        };
-        if let Err(err) = std_listener.set_nonblocking(true) {
-            let msg = format!(
-                "failed to set metrics endpoint listener nonblocking ({}): {}",
-                bind, err
-            );
-            if required {
-                return Err(ProxyError::Transport(msg));
-            }
-            error!("{}", msg);
-            return Ok(());
-        }
-        let listener = match tokio::net::TcpListener::from_std(std_listener) {
-            Ok(listener) => listener,
-            Err(err) => {
-                let msg = format!(
-                    "failed to register metrics endpoint listener {}: {}",
-                    bind, err
-                );
-                if required {
-                    return Err(ProxyError::Transport(msg));
-                }
-                error!("{}", msg);
-                return Ok(());
-            }
+        } else {
+            None
         };
 
         spawn_supervised_async_task(
@@ -4549,17 +4537,67 @@ impl QUICListener {
             "metrics-endpoint",
             Some(Arc::clone(&metrics)),
             async move {
-                info!(
-                    "Metrics endpoint listening on http://{}{} (max_connections={}, connection_timeout_ms={})",
-                    bind,
-                    metrics_path,
-                    max_connections,
-                    connection_timeout.as_millis()
-                );
-                let active_connections = Arc::new(AtomicUsize::new(0));
+                let mut listener_binding = initial_binding;
 
                 loop {
-                    let (stream, _peer) = match listener.accept().await {
+                    let endpoint = Self::current_metrics_endpoint_config(
+                        runtime_bundle.as_ref(),
+                        &startup_endpoint,
+                    );
+                    let desired_bind = format!("{}:{}", endpoint.address, endpoint.port);
+
+                    if !endpoint.enabled {
+                        if let Some(binding) = listener_binding.take() {
+                            info!(
+                                "Metrics endpoint disabled via runtime reload on {}",
+                                binding.bind
+                            );
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+
+                    let needs_rebind = match listener_binding.as_ref() {
+                        Some(binding) => binding.bind != desired_bind,
+                        None => true,
+                    };
+                    if needs_rebind {
+                        match Self::bind_tcp_listener(&desired_bind, None, "metrics endpoint") {
+                            Ok(listener) => {
+                                info!(
+                                    "Metrics endpoint listening on http://{}{} (max_connections={}, connection_timeout_ms={})",
+                                    desired_bind,
+                                    endpoint.path,
+                                    endpoint.max_connections.max(1),
+                                    endpoint.connection_timeout_ms.max(1)
+                                );
+                                listener_binding = Some(MetricsEndpointBinding {
+                                    bind: desired_bind.clone(),
+                                    listener,
+                                    active_connections: Arc::new(AtomicUsize::new(0)),
+                                });
+                            }
+                            Err(err) => {
+                                error!("{}", err);
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                continue;
+                            }
+                        }
+                    }
+
+                    let Some(binding) = listener_binding.as_mut() else {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    };
+
+                    let accept_result = tokio::select! {
+                        accept = binding.listener.accept() => Some(accept),
+                        _ = tokio::time::sleep(Duration::from_millis(200)) => None,
+                    };
+                    let Some(accept_result) = accept_result else {
+                        continue;
+                    };
+                    let (stream, _peer) = match accept_result {
                         Ok(v) => v,
                         Err(err) => {
                             error!("Metrics endpoint accept failed: {}", err);
@@ -4568,12 +4606,12 @@ impl QUICListener {
                     };
                     let runtime_state = Self::metrics_endpoint_state(
                         runtime_bundle.as_ref(),
-                        metrics_path.clone(),
-                        max_connections,
-                        connection_timeout,
+                        startup_metrics_path.clone(),
+                        startup_max_connections,
+                        startup_connection_timeout,
                         Arc::clone(&metrics),
                     );
-                    let active_connections = Arc::clone(&active_connections);
+                    let active_connections = Arc::clone(&binding.active_connections);
                     if !Self::try_claim_runtime_connection_slot(
                         &active_connections,
                         runtime_state.max_connections,
@@ -4615,6 +4653,51 @@ impl QUICListener {
             },
         );
         Ok(())
+    }
+
+    fn bind_tcp_listener(
+        bind: &str,
+        handle: Option<&Handle>,
+        context: &str,
+    ) -> Result<tokio::net::TcpListener, String> {
+        let std_listener = std::net::TcpListener::bind(bind)
+            .map_err(|err| format!("failed to bind {context} {bind}: {err}"))?;
+        std_listener.set_nonblocking(true).map_err(|err| {
+            format!(
+                "failed to set {context} listener nonblocking ({}): {}",
+                bind, err
+            )
+        })?;
+        let from_std_result = if let Some(handle) = handle {
+            let _guard = handle.enter();
+            tokio::net::TcpListener::from_std(std_listener)
+        } else {
+            tokio::net::TcpListener::from_std(std_listener)
+        };
+        from_std_result
+            .map_err(|err| format!("failed to register {context} listener {}: {}", bind, err))
+    }
+
+    fn probe_tcp_bind(bind: &str, context: &str) -> Result<(), String> {
+        std::net::TcpListener::bind(bind)
+            .map(|_| ())
+            .map_err(|err| format!("failed to bind {context} {bind}: {err}"))
+    }
+
+    fn current_metrics_endpoint_config(
+        runtime_bundle: Option<&Arc<RuntimeBundleHandle>>,
+        startup_endpoint: &spooky_config::config::MetricsEndpoint,
+    ) -> spooky_config::config::MetricsEndpoint {
+        runtime_bundle
+            .map(|handle| {
+                handle
+                    .current()
+                    .runtime_config
+                    .observability
+                    .metrics
+                    .clone()
+            })
+            .unwrap_or_else(|| startup_endpoint.clone())
     }
 
     fn metrics_endpoint_state(

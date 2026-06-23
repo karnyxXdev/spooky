@@ -70,6 +70,12 @@ impl ControlApiState {
             .unwrap_or_else(|| Arc::clone(&self.listener_tls_store))
     }
 
+    fn current_listener_runtime_configs(&self) -> Arc<HashMap<String, ListenerRuntimeConfig>> {
+        self.current_runtime()
+            .map(|runtime| runtime.shared_state.listener_runtime_configs.clone())
+            .unwrap_or_else(|| Arc::clone(&self.listener_runtime_configs))
+    }
+
     fn current_metrics(&self) -> Arc<Metrics> {
         self.current_runtime()
             .map(|runtime| runtime.shared_state.metrics.clone())
@@ -444,8 +450,8 @@ impl QUICListener {
                 );
             }
             let (healthy_backends, total_backends) = state.snapshot_backend_health();
-            let tls_listeners = state
-                .listener_tls_store
+            let live_tls_store = state.current_listener_tls_store();
+            let tls_listeners = live_tls_store
                 .snapshot()
                 .into_iter()
                 .map(|(listener, inventory)| {
@@ -458,7 +464,7 @@ impl QUICListener {
                             "sni_names": inventory.sni_identities.keys().cloned().collect::<Vec<_>>(),
                             "client_auth_enabled": inventory.listener_tls.client_auth.enabled,
                             "require_client_cert": inventory.listener_tls.client_auth.require_client_cert,
-                            "generation": state.listener_tls_store.generation(&listener).unwrap_or(0),
+                            "generation": live_tls_store.generation(&listener).unwrap_or(0),
                         }),
                     )
                 })
@@ -514,8 +520,11 @@ impl QUICListener {
                 );
             }
 
+            let live_tls_store = state.current_listener_tls_store();
+            let live_listener_configs = state.current_listener_runtime_configs();
+            let live_metrics = state.current_metrics();
             let mut reloaded = Vec::new();
-            for (listener_label, listener_config) in state.listener_runtime_configs.iter() {
+            for (listener_label, listener_config) in live_listener_configs.iter() {
                 let reloaded_state = match Self::build_listener_tls_reload_state(listener_config) {
                     Ok(state) => state,
                     Err(err) => {
@@ -529,7 +538,7 @@ impl QUICListener {
                         );
                     }
                 };
-                let generation = match state.listener_tls_store.replace_listener(
+                let generation = match live_tls_store.replace_listener(
                     listener_label,
                     reloaded_state.inventory.clone(),
                     reloaded_state.bootstrap_server_config,
@@ -547,7 +556,7 @@ impl QUICListener {
                     }
                 };
                 Self::update_listener_tls_expiry_metrics(
-                    &state.metrics,
+                    &live_metrics,
                     listener_label,
                     &reloaded_state.inventory,
                 );

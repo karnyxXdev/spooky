@@ -939,7 +939,11 @@ impl QUICListener {
         // The live QUIC socket looks itself up by label; if the label is gone it
         // falls out of sync with the active runtime, so we must reject early.
         for label in current.shared_state.listener_runtime_configs.keys() {
-            if !next.shared_state.listener_runtime_configs.contains_key(label) {
+            if !next
+                .shared_state
+                .listener_runtime_configs
+                .contains_key(label)
+            {
                 return Some(format!(
                     "runtime reload rejected: listener '{}' was removed or its bind address changed; restart required",
                     label
@@ -1683,7 +1687,8 @@ mod tests {
         let current_bundle = runtime_bundle_from_config("current.yaml", &current);
         let next_bundle = runtime_bundle_from_config("next.yaml", &next);
 
-        let err = QUICListener::validate_runtime_reload_compatibility(&current_bundle, &next_bundle);
+        let err =
+            QUICListener::validate_runtime_reload_compatibility(&current_bundle, &next_bundle);
         assert!(
             err.as_deref()
                 .is_some_and(|e| e.contains("restart required")),
@@ -1706,7 +1711,8 @@ mod tests {
         let current_bundle = runtime_bundle_from_config("current.yaml", &current);
         let next_bundle = runtime_bundle_from_config("next.yaml", &next);
 
-        let err = QUICListener::validate_runtime_reload_compatibility(&current_bundle, &next_bundle);
+        let err =
+            QUICListener::validate_runtime_reload_compatibility(&current_bundle, &next_bundle);
         assert!(
             err.as_deref()
                 .is_some_and(|e| e.contains("restart required")),

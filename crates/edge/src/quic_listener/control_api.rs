@@ -934,6 +934,19 @@ impl QUICListener {
         current: &RuntimeBundle,
         next: &RuntimeBundle,
     ) -> Option<String> {
+        // Reject any listener that the running workers know about but that the
+        // next bundle has dropped (or renamed via a bind address/port change).
+        // The live QUIC socket looks itself up by label; if the label is gone it
+        // falls out of sync with the active runtime, so we must reject early.
+        for label in current.shared_state.listener_runtime_configs.keys() {
+            if !next.shared_state.listener_runtime_configs.contains_key(label) {
+                return Some(format!(
+                    "runtime reload rejected: listener '{}' was removed or its bind address changed; restart required",
+                    label
+                ));
+            }
+        }
+
         let worker_count = next.runtime_config.performance.worker_threads.max(1);
         for (label, listener_config) in next.shared_state.listener_runtime_configs.iter() {
             if current
@@ -1649,6 +1662,56 @@ mod tests {
         assert!(
             QUICListener::validate_runtime_reload_compatibility(&current_bundle, &next_bundle)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn validate_runtime_reload_compatibility_rejects_listener_removal() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let current = test_config(cert.clone(), key.clone());
+
+        // next removes the primary listener entirely by switching to an explicit
+        // listeners list that omits the original bind address
+        let mut next = current.clone();
+        next.listeners = vec![{
+            let mut l = next.listen.clone();
+            l.port = 9892;
+            l
+        }];
+
+        let current_bundle = runtime_bundle_from_config("current.yaml", &current);
+        let next_bundle = runtime_bundle_from_config("next.yaml", &next);
+
+        let err = QUICListener::validate_runtime_reload_compatibility(&current_bundle, &next_bundle);
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("restart required")),
+            "expected rejection, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_runtime_reload_compatibility_rejects_listener_bind_change() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let current = test_config(cert.clone(), key.clone());
+
+        // next keeps one listener but moves it to a different port — the label
+        // changes, so the old label disappears from the next bundle
+        let mut next = current.clone();
+        next.listen.port = 9893;
+
+        let current_bundle = runtime_bundle_from_config("current.yaml", &current);
+        let next_bundle = runtime_bundle_from_config("next.yaml", &next);
+
+        let err = QUICListener::validate_runtime_reload_compatibility(&current_bundle, &next_bundle);
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("restart required")),
+            "expected rejection, got: {:?}",
+            err
         );
     }
 

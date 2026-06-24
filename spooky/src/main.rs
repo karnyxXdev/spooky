@@ -1,5 +1,6 @@
 //! Spooky HTTP/3 Load Balancer - Main Entry Point
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
@@ -35,6 +36,206 @@ struct IngressPacket {
     peer: SocketAddr,
     local_addr: SocketAddr,
     bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ListenerGroupSignature {
+    label: String,
+    worker_count: usize,
+    shard_count: usize,
+    shard_queue_capacity: usize,
+    shard_queue_max_bytes: usize,
+    pin_workers: bool,
+    reuseport: bool,
+    udp_recv_buffer_bytes: usize,
+    udp_send_buffer_bytes: usize,
+}
+
+struct ListenerGroupRuntime {
+    signature: ListenerGroupSignature,
+    shutdown: Arc<AtomicBool>,
+    worker_handles: Vec<thread::JoinHandle<Result<(), String>>>,
+}
+
+impl ListenerGroupRuntime {
+    fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    fn collect_finished(&mut self, worker_failed: &mut bool) {
+        let mut idx = 0usize;
+        while idx < self.worker_handles.len() {
+            if !self.worker_handles[idx].is_finished() {
+                idx += 1;
+                continue;
+            }
+
+            let handle = self.worker_handles.swap_remove(idx);
+            join_worker_handle(handle, worker_failed);
+        }
+    }
+
+    fn retired(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed) && self.worker_handles.is_empty()
+    }
+
+    fn join_all(mut self, worker_failed: &mut bool) {
+        for handle in self.worker_handles.drain(..) {
+            join_worker_handle(handle, worker_failed);
+        }
+    }
+}
+
+fn listener_label(config: &ListenerRuntimeConfig) -> String {
+    format!(
+        "{}:{}",
+        config.listen.listen.address, config.listen.listen.port
+    )
+}
+
+fn listener_group_signature(config: &ListenerRuntimeConfig) -> ListenerGroupSignature {
+    ListenerGroupSignature {
+        label: listener_label(config),
+        worker_count: config.performance.worker_threads.max(1),
+        shard_count: config.performance.packet_shards_per_worker.max(1),
+        shard_queue_capacity: config.performance.packet_shard_queue_capacity.max(1),
+        shard_queue_max_bytes: config.performance.packet_shard_queue_max_bytes.max(1),
+        pin_workers: config.performance.pin_workers,
+        reuseport: config.performance.reuseport,
+        udp_recv_buffer_bytes: config.performance.udp_recv_buffer_bytes,
+        udp_send_buffer_bytes: config.performance.udp_send_buffer_bytes,
+    }
+}
+
+fn spawn_managed_listener_group(
+    listener_config: ListenerRuntimeConfig,
+    worker_shared: Arc<SharedRuntimeState>,
+    runtime_bundle: Arc<RuntimeBundleHandle>,
+    worker_index_base: usize,
+) -> Result<ListenerGroupRuntime, String> {
+    let signature = listener_group_signature(&listener_config);
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    QUICListener::spawn_bootstrap_tls_listener(
+        &listener_config,
+        worker_shared.as_ref(),
+        Some(Arc::clone(&runtime_bundle)),
+        Some(Arc::clone(&shutdown)),
+    )
+    .map_err(|err| {
+        format!(
+            "Failed to initialize bootstrap TLS listener {} ({}:{}): {}",
+            listener_config.listen.index,
+            listener_config.listen.listen.address,
+            listener_config.listen.listen.port,
+            err
+        )
+    })?;
+
+    let worker_handles = spawn_listener_worker_group(
+        listener_config,
+        signature.worker_count,
+        signature.shard_count,
+        signature.shard_queue_capacity,
+        signature.shard_queue_max_bytes,
+        signature.pin_workers,
+        worker_shared,
+        runtime_bundle,
+        Arc::clone(&shutdown),
+        worker_index_base,
+    )?;
+
+    Ok(ListenerGroupRuntime {
+        signature,
+        shutdown,
+        worker_handles,
+    })
+}
+
+fn reconcile_listener_groups(
+    runtime_bundle: &Arc<RuntimeBundleHandle>,
+    groups: &mut Vec<ListenerGroupRuntime>,
+    next_worker_index_base: &mut usize,
+) {
+    let runtime = runtime_bundle.current();
+    let desired_configs = runtime.runtime_config.listener_runtime_configs();
+    let desired_signatures = desired_configs
+        .iter()
+        .map(|config| (listener_label(config), listener_group_signature(config)))
+        .collect::<HashMap<_, _>>();
+
+    for group in groups.iter_mut() {
+        match desired_signatures.get(&group.signature.label) {
+            Some(signature) if signature == &group.signature => {}
+            Some(signature) => {
+                if !group.shutdown.load(Ordering::Relaxed) {
+                    info!(
+                        "Retiring listener group {} for topology reload",
+                        signature.label
+                    );
+                    group.request_shutdown();
+                }
+            }
+            None => {
+                if !group.shutdown.load(Ordering::Relaxed) {
+                    info!(
+                        "Retiring listener group {} because it is no longer configured",
+                        group.signature.label
+                    );
+                    group.request_shutdown();
+                }
+            }
+        }
+    }
+
+    for listener_config in desired_configs {
+        let signature = listener_group_signature(&listener_config);
+        let active_match = groups.iter().any(|group| {
+            group.signature.label == signature.label && !group.shutdown.load(Ordering::Relaxed)
+        });
+        let pending_retire = groups
+            .iter()
+            .any(|group| group.signature.label == signature.label);
+        if active_match {
+            continue;
+        }
+        if pending_retire {
+            continue;
+        }
+
+        match spawn_managed_listener_group(
+            listener_config,
+            Arc::clone(&runtime.shared_state),
+            Arc::clone(runtime_bundle),
+            *next_worker_index_base,
+        ) {
+            Ok(group) => {
+                info!("Spawned listener group {}", group.signature.label);
+                *next_worker_index_base =
+                    next_worker_index_base.saturating_add(group.signature.worker_count);
+                groups.push(group);
+            }
+            Err(err) => {
+                error!("{}", err);
+            }
+        }
+    }
+}
+
+fn collect_finished_listener_groups(
+    groups: &mut Vec<ListenerGroupRuntime>,
+    worker_failed: &mut bool,
+) {
+    let mut idx = 0usize;
+    while idx < groups.len() {
+        groups[idx].collect_finished(worker_failed);
+        if groups[idx].retired() {
+            info!("Retired listener group {}", groups[idx].signature.label);
+            groups.swap_remove(idx);
+            continue;
+        }
+        idx += 1;
+    }
 }
 
 #[cfg(unix)]
@@ -168,17 +369,28 @@ fn main() {
         }
     };
 
-    runtime.block_on(run(runtime_config, uid, config_path));
+    runtime.block_on(run(
+        runtime_config,
+        config_yaml.log.clone(),
+        uid,
+        config_path,
+    ));
 }
 
-async fn run(runtime_config: RuntimeConfig, uid: libc::uid_t, config_path: String) {
-    let runtime_bundle = match QUICListener::build_runtime_bundle(config_path, &runtime_config) {
-        Ok(bundle) => bundle,
-        Err(e) => {
-            error!("Failed to initialize shared runtime state: {}", e);
-            std::process::exit(1);
-        }
-    };
+async fn run(
+    runtime_config: RuntimeConfig,
+    log_config: spooky_config::config::Log,
+    uid: libc::uid_t,
+    config_path: String,
+) {
+    let runtime_bundle =
+        match QUICListener::build_runtime_bundle(config_path, log_config, &runtime_config) {
+            Ok(bundle) => bundle,
+            Err(e) => {
+                error!("Failed to initialize shared runtime state: {}", e);
+                std::process::exit(1);
+            }
+        };
     let shared_state = Arc::clone(&runtime_bundle.shared_state);
     let runtime_bundle = Arc::new(RuntimeBundleHandle::new(runtime_bundle));
 
@@ -214,54 +426,25 @@ async fn run(runtime_config: RuntimeConfig, uid: libc::uid_t, config_path: Strin
         shutdown_flag.store(true, Ordering::Relaxed);
     });
 
-    let pin_workers = runtime_config.performance.pin_workers;
-    let shard_queue_capacity = runtime_config
-        .performance
-        .packet_shard_queue_capacity
-        .max(1);
-    let shard_queue_max_bytes = runtime_config
-        .performance
-        .packet_shard_queue_max_bytes
-        .max(1);
-    let mut worker_handles: Vec<thread::JoinHandle<Result<(), String>>> = Vec::new();
-    let mut worker_index_base = 0usize;
-
+    let mut listener_groups = Vec::new();
+    let mut next_worker_index_base = 0usize;
     for listener_config in runtime_config.listener_runtime_configs() {
-        if let Err(err) = QUICListener::spawn_bootstrap_tls_listener(
-            &listener_config,
-            &shared_state,
-            Some(Arc::clone(&runtime_bundle)),
-        ) {
-            error!(
-                "Failed to initialize bootstrap TLS listener {} ({}:{}): {}",
-                listener_config.listen.index,
-                listener_config.listen.listen.address,
-                listener_config.listen.listen.port,
-                err
-            );
-            std::process::exit(1);
-        }
-
-        match spawn_listener_worker_group(
+        match spawn_managed_listener_group(
             listener_config,
-            worker_count,
-            shard_count,
-            shard_queue_capacity,
-            shard_queue_max_bytes,
-            pin_workers,
             Arc::clone(&shared_state),
             Arc::clone(&runtime_bundle),
-            Arc::clone(&shutdown),
-            worker_index_base,
+            next_worker_index_base,
         ) {
-            Ok(handles) => worker_handles.extend(handles),
+            Ok(group) => {
+                next_worker_index_base =
+                    next_worker_index_base.saturating_add(group.signature.worker_count);
+                listener_groups.push(group);
+            }
             Err(err) => {
                 error!("{}", err);
                 std::process::exit(1);
             }
         }
-
-        worker_index_base = worker_index_base.saturating_add(worker_count.max(1));
     }
 
     info!("Spooky is starting");
@@ -284,29 +467,23 @@ async fn run(runtime_config: RuntimeConfig, uid: libc::uid_t, config_path: Strin
     }
     info!(
         "Data-plane workers={} packet_shards_per_worker={} reuseport={} pin_workers={}",
-        worker_handles.len(),
+        listener_groups
+            .iter()
+            .map(|group| group.worker_handles.len())
+            .sum::<usize>(),
         shard_count,
         runtime_config.performance.reuseport,
         runtime_config.performance.pin_workers
     );
 
     let mut worker_failed = false;
-    let mut active_worker_handles = worker_handles;
     while !shutdown.load(Ordering::Relaxed) {
-        let mut idx = 0usize;
-        while idx < active_worker_handles.len() {
-            if !active_worker_handles[idx].is_finished() {
-                idx += 1;
-                continue;
-            }
-
-            let handle = active_worker_handles.swap_remove(idx);
-            join_worker_handle(handle, &mut worker_failed);
-            if worker_failed {
-                shutdown.store(true, Ordering::Relaxed);
-                break;
-            }
-        }
+        collect_finished_listener_groups(&mut listener_groups, &mut worker_failed);
+        reconcile_listener_groups(
+            &runtime_bundle,
+            &mut listener_groups,
+            &mut next_worker_index_base,
+        );
 
         if worker_failed {
             break;
@@ -315,8 +492,19 @@ async fn run(runtime_config: RuntimeConfig, uid: libc::uid_t, config_path: Strin
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    for handle in active_worker_handles {
-        join_worker_handle(handle, &mut worker_failed);
+    for group in &listener_groups {
+        group.request_shutdown();
+    }
+    loop {
+        collect_finished_listener_groups(&mut listener_groups, &mut worker_failed);
+        if listener_groups.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    for group in listener_groups.drain(..) {
+        group.join_all(&mut worker_failed);
     }
 
     let panic_count = runtime_guard::panic_count();

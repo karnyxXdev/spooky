@@ -43,6 +43,12 @@ pub(super) struct ControlApiState {
     pub(super) runtime_bundle: Option<Arc<RuntimeBundleHandle>>,
 }
 
+struct ControlApiListenerBinding {
+    bind: String,
+    listener: tokio::net::TcpListener,
+    active_connections: Arc<AtomicUsize>,
+}
+
 impl ControlApiState {
     fn current_runtime(&self) -> Option<Arc<RuntimeBundle>> {
         self.runtime_bundle.as_ref().map(|handle| handle.current())
@@ -62,6 +68,12 @@ impl ControlApiState {
         self.current_runtime()
             .map(|runtime| runtime.shared_state.listener_tls_store.clone())
             .unwrap_or_else(|| Arc::clone(&self.listener_tls_store))
+    }
+
+    fn current_listener_runtime_configs(&self) -> Arc<HashMap<String, ListenerRuntimeConfig>> {
+        self.current_runtime()
+            .map(|runtime| runtime.shared_state.listener_runtime_configs.clone())
+            .unwrap_or_else(|| Arc::clone(&self.listener_runtime_configs))
     }
 
     fn current_metrics(&self) -> Arc<Metrics> {
@@ -138,22 +150,20 @@ impl QUICListener {
         worker_count: usize,
     ) -> Result<(), ProxyError> {
         let endpoint = &config.observability.control_api;
-        if !endpoint.enabled {
+        if runtime_bundle.is_none() && !endpoint.enabled {
             return Ok(());
         }
         let required = endpoint.required;
-
-        let bind = format!("{}:{}", endpoint.address, endpoint.port);
-        let max_connections = endpoint.max_connections.max(1);
-        let connection_timeout = Duration::from_millis(endpoint.connection_timeout_ms.max(1));
+        let startup_endpoint = endpoint.clone();
         let listener_config = config.primary_listener_runtime_config().ok_or_else(|| {
             ProxyError::Transport("no effective listeners configured".to_string())
         })?;
         let primary_listener_label = Self::listener_label(&listener_config);
-        if shared_state
-            .listener_tls_store
-            .bootstrap_server_config(&primary_listener_label)
-            .is_none()
+        if startup_endpoint.enabled
+            && shared_state
+                .listener_tls_store
+                .bootstrap_server_config(&primary_listener_label)
+                .is_none()
         {
             let msg = format!(
                 "failed to initialize control API TLS config: missing reload state for listener '{}'",
@@ -191,45 +201,24 @@ impl QUICListener {
             }
         };
 
-        let std_listener = match std::net::TcpListener::bind(&bind) {
-            Ok(listener) => listener,
-            Err(err) => {
-                let msg = format!("failed to bind control API endpoint {bind}: {err}");
-                if required {
-                    return Err(ProxyError::Transport(msg));
+        let initial_binding = if startup_endpoint.enabled {
+            let bind = format!("{}:{}", startup_endpoint.address, startup_endpoint.port);
+            match Self::bind_tcp_listener(&bind, Some(&handle), "control API endpoint") {
+                Ok(listener) => Some(ControlApiListenerBinding {
+                    bind,
+                    listener,
+                    active_connections: Arc::new(AtomicUsize::new(0)),
+                }),
+                Err(msg) => {
+                    if required {
+                        return Err(ProxyError::Transport(msg));
+                    }
+                    error!("{}", msg);
+                    None
                 }
-                error!("{}", msg);
-                return Ok(());
             }
-        };
-        if let Err(err) = std_listener.set_nonblocking(true) {
-            let msg = format!(
-                "failed to set control API endpoint listener nonblocking ({}): {}",
-                bind, err
-            );
-            if required {
-                return Err(ProxyError::Transport(msg));
-            }
-            error!("{}", msg);
-            return Ok(());
-        }
-        let from_std_result = {
-            let _guard = handle.enter();
-            tokio::net::TcpListener::from_std(std_listener)
-        };
-        let listener = match from_std_result {
-            Ok(listener) => listener,
-            Err(err) => {
-                let msg = format!(
-                    "failed to register control API endpoint listener {}: {}",
-                    bind, err
-                );
-                if required {
-                    return Err(ProxyError::Transport(msg));
-                }
-                error!("{}", msg);
-                return Ok(());
-            }
+        } else {
+            None
         };
 
         spawn_supervised_async_task(
@@ -237,21 +226,68 @@ impl QUICListener {
             "control-api-endpoint",
             Some(Arc::clone(&shared_state.metrics)),
             async move {
-                let paths = state.current_paths();
-                info!(
-                    "Control API endpoint listening on https://{}{} (ready={}, runtime={}, reload_certs={}, max_connections={}, connection_timeout_ms={})",
-                    bind,
-                    paths.health_path,
-                    paths.ready_path,
-                    paths.runtime_path,
-                    paths.reload_certs_path,
-                    max_connections,
-                    connection_timeout.as_millis()
-                );
-                let active_connections = Arc::new(AtomicUsize::new(0));
+                let mut listener_binding = initial_binding;
 
                 loop {
-                    let (stream, peer) = match listener.accept().await {
+                    let endpoint = state.current_control_api();
+                    let desired_bind = format!("{}:{}", endpoint.address, endpoint.port);
+
+                    if !endpoint.enabled {
+                        if let Some(binding) = listener_binding.take() {
+                            info!(
+                                "Control API endpoint disabled via runtime reload on {}",
+                                binding.bind
+                            );
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+
+                    let needs_rebind = match listener_binding.as_ref() {
+                        Some(binding) => binding.bind != desired_bind,
+                        None => true,
+                    };
+                    if needs_rebind {
+                        match Self::bind_tcp_listener(&desired_bind, None, "control API endpoint") {
+                            Ok(listener) => {
+                                let paths = ControlApiPaths::from_endpoint(&endpoint);
+                                info!(
+                                    "Control API endpoint listening on https://{}{} (ready={}, runtime={}, reload_certs={}, max_connections={}, connection_timeout_ms={})",
+                                    desired_bind,
+                                    paths.health_path,
+                                    paths.ready_path,
+                                    paths.runtime_path,
+                                    paths.reload_certs_path,
+                                    endpoint.max_connections.max(1),
+                                    endpoint.connection_timeout_ms.max(1)
+                                );
+                                listener_binding = Some(ControlApiListenerBinding {
+                                    bind: desired_bind.clone(),
+                                    listener,
+                                    active_connections: Arc::new(AtomicUsize::new(0)),
+                                });
+                            }
+                            Err(err) => {
+                                error!("{}", err);
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                continue;
+                            }
+                        }
+                    }
+
+                    let Some(binding) = listener_binding.as_mut() else {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    };
+
+                    let accept_result = tokio::select! {
+                        accept = binding.listener.accept() => Some(accept),
+                        _ = tokio::time::sleep(Duration::from_millis(200)) => None,
+                    };
+                    let Some(accept_result) = accept_result else {
+                        continue;
+                    };
+                    let (stream, peer) = match accept_result {
                         Ok(v) => v,
                         Err(err) => {
                             error!("Control API endpoint accept failed: {}", err);
@@ -259,7 +295,7 @@ impl QUICListener {
                         }
                     };
                     let state = state.clone();
-                    let active_connections = Arc::clone(&active_connections);
+                    let active_connections = Arc::clone(&binding.active_connections);
                     let endpoint = state.current_control_api();
                     let max_connections = endpoint.max_connections.max(1);
                     if !Self::try_claim_connection_slot(&active_connections, max_connections) {
@@ -414,8 +450,8 @@ impl QUICListener {
                 );
             }
             let (healthy_backends, total_backends) = state.snapshot_backend_health();
-            let tls_listeners = state
-                .listener_tls_store
+            let live_tls_store = state.current_listener_tls_store();
+            let tls_listeners = live_tls_store
                 .snapshot()
                 .into_iter()
                 .map(|(listener, inventory)| {
@@ -428,7 +464,7 @@ impl QUICListener {
                             "sni_names": inventory.sni_identities.keys().cloned().collect::<Vec<_>>(),
                             "client_auth_enabled": inventory.listener_tls.client_auth.enabled,
                             "require_client_cert": inventory.listener_tls.client_auth.require_client_cert,
-                            "generation": state.listener_tls_store.generation(&listener).unwrap_or(0),
+                            "generation": live_tls_store.generation(&listener).unwrap_or(0),
                         }),
                     )
                 })
@@ -484,8 +520,11 @@ impl QUICListener {
                 );
             }
 
+            let live_tls_store = state.current_listener_tls_store();
+            let live_listener_configs = state.current_listener_runtime_configs();
+            let live_metrics = state.current_metrics();
             let mut reloaded = Vec::new();
-            for (listener_label, listener_config) in state.listener_runtime_configs.iter() {
+            for (listener_label, listener_config) in live_listener_configs.iter() {
                 let reloaded_state = match Self::build_listener_tls_reload_state(listener_config) {
                     Ok(state) => state,
                     Err(err) => {
@@ -499,7 +538,7 @@ impl QUICListener {
                         );
                     }
                 };
-                let generation = match state.listener_tls_store.replace_listener(
+                let generation = match live_tls_store.replace_listener(
                     listener_label,
                     reloaded_state.inventory.clone(),
                     reloaded_state.bootstrap_server_config,
@@ -517,7 +556,7 @@ impl QUICListener {
                     }
                 };
                 Self::update_listener_tls_expiry_metrics(
-                    &state.metrics,
+                    &live_metrics,
                     listener_label,
                     &reloaded_state.inventory,
                 );
@@ -765,19 +804,17 @@ impl QUICListener {
             let next_runtime = RuntimeBundle {
                 generation: runtime.generation.saturating_add(1),
                 config_path,
+                log_config: config.log.clone(),
                 runtime_config,
                 shared_state: Arc::clone(&next_shared_state),
             };
-            if let Some((missing, existing)) =
-                Self::validate_runtime_reload_compatibility(&runtime, &next_runtime)
+            if let Some(err) = Self::validate_runtime_reload_compatibility(&runtime, &next_runtime)
             {
                 return Self::json_response(
                     StatusCode::CONFLICT,
                     json!({
                         "reloaded": false,
-                        "error": format!(
-                            "runtime reload rejected: listener set changed (missing={missing:?}, extra={existing:?})"
-                        ),
+                        "error": err,
                     }),
                 );
             }
@@ -799,6 +836,17 @@ impl QUICListener {
                     json!({
                         "reloaded": false,
                         "error": err,
+                    }),
+                );
+            }
+            let startup_owned_issues =
+                Self::validate_startup_owned_reload_compatibility(&runtime, &next_runtime);
+            if !startup_owned_issues.is_empty() {
+                return Self::json_response(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "reloaded": false,
+                        "error": startup_owned_issues.join("; "),
                     }),
                 );
             }
@@ -885,69 +933,57 @@ impl QUICListener {
     fn validate_runtime_reload_compatibility(
         current: &RuntimeBundle,
         next: &RuntimeBundle,
-    ) -> Option<(Vec<String>, Vec<String>)> {
-        let current_labels = current
-            .shared_state
-            .listener_runtime_configs
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        let next_labels = next
-            .shared_state
-            .listener_runtime_configs
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        if current_labels.len() != next_labels.len() {
-            let missing = current_labels
-                .iter()
-                .filter(|label| {
-                    !next
-                        .shared_state
-                        .listener_runtime_configs
-                        .contains_key(*label)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let extra = next_labels
-                .iter()
-                .filter(|label| {
-                    !current
-                        .shared_state
-                        .listener_runtime_configs
-                        .contains_key(*label)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            return Some((missing, extra));
-        }
-        if current_labels.iter().any(|label| {
-            !next
+    ) -> Option<String> {
+        // Reject any listener that the running workers know about but that the
+        // next bundle has dropped (or renamed via a bind address/port change).
+        // The live QUIC socket looks itself up by label; if the label is gone it
+        // falls out of sync with the active runtime, so we must reject early.
+        for label in current.shared_state.listener_runtime_configs.keys() {
+            if !next
                 .shared_state
                 .listener_runtime_configs
                 .contains_key(label)
-        }) {
-            let missing = current_labels
-                .iter()
-                .filter(|label| {
-                    !next
-                        .shared_state
-                        .listener_runtime_configs
-                        .contains_key(*label)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let extra = next_labels
-                .iter()
-                .filter(|label| {
-                    !current
-                        .shared_state
-                        .listener_runtime_configs
-                        .contains_key(*label)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            return Some((missing, extra));
+            {
+                return Some(format!(
+                    "runtime reload rejected: listener '{}' was removed or its bind address changed; restart required",
+                    label
+                ));
+            }
+        }
+
+        let worker_count = next.runtime_config.performance.worker_threads.max(1);
+        for (label, listener_config) in next.shared_state.listener_runtime_configs.iter() {
+            if current
+                .shared_state
+                .listener_runtime_configs
+                .contains_key(label)
+            {
+                continue;
+            }
+            if worker_count > 1 {
+                if let Err(err) = Self::bind_reuseport_sockets(listener_config, worker_count) {
+                    return Some(format!(
+                        "runtime reload rejected: failed to preflight QUIC listener {}: {}",
+                        label, err
+                    ));
+                }
+            } else if let Err(err) = Self::bind_socket(listener_config, false) {
+                return Some(format!(
+                    "runtime reload rejected: failed to preflight QUIC listener {}: {}",
+                    label, err
+                ));
+            }
+
+            let bind = format!(
+                "{}:{}",
+                listener_config.listen.listen.address, listener_config.listen.listen.port
+            );
+            if let Err(err) = Self::probe_tcp_bind(&bind, "bootstrap TLS listener") {
+                return Some(format!(
+                    "runtime reload rejected: failed to preflight bootstrap listener {}: {}",
+                    label, err
+                ));
+            }
         }
         None
     }
@@ -956,30 +992,39 @@ impl QUICListener {
         current: &RuntimeBundle,
         next: &RuntimeBundle,
     ) -> Option<String> {
-        let current_control_api = &current.runtime_config.observability.control_api;
         let next_control_api = &next.runtime_config.observability.control_api;
-        if current_control_api.enabled != next_control_api.enabled {
-            return Some(format!(
-                "runtime reload rejected: observability.control_api.enabled changed from {} to {}; restart required",
-                current_control_api.enabled, next_control_api.enabled
-            ));
+        if !next_control_api.enabled {
+            return None;
         }
-        if current_control_api.required != next_control_api.required {
-            return Some(format!(
-                "runtime reload rejected: observability.control_api.required changed from {} to {}; restart required",
-                current_control_api.required, next_control_api.required
-            ));
-        }
-        if current_control_api.address != next_control_api.address
-            || current_control_api.port != next_control_api.port
+
+        let Some(listener_config) = next.runtime_config.primary_listener_runtime_config() else {
+            return Some(
+                "runtime reload rejected: no effective listeners configured for control API TLS"
+                    .to_string(),
+            );
+        };
+        let primary_listener_label = Self::listener_label(&listener_config);
+        if next
+            .shared_state
+            .listener_tls_store
+            .bootstrap_server_config(&primary_listener_label)
+            .is_none()
         {
             return Some(format!(
-                "runtime reload rejected: observability.control_api bind changed from {}:{} to {}:{}; restart required",
-                current_control_api.address,
-                current_control_api.port,
-                next_control_api.address,
-                next_control_api.port
+                "runtime reload rejected: control API TLS config missing for listener '{}'",
+                primary_listener_label
             ));
+        }
+
+        let current_control_api = &current.runtime_config.observability.control_api;
+        let bind_changed = !current_control_api.enabled
+            || current_control_api.address != next_control_api.address
+            || current_control_api.port != next_control_api.port;
+        if bind_changed {
+            let bind = format!("{}:{}", next_control_api.address, next_control_api.port);
+            if let Err(err) = Self::probe_tcp_bind(&bind, "control API endpoint") {
+                return Some(err);
+            }
         }
         None
     }
@@ -988,32 +1033,103 @@ impl QUICListener {
         current: &RuntimeBundle,
         next: &RuntimeBundle,
     ) -> Option<String> {
-        let current_metrics = &current.runtime_config.observability.metrics;
         let next_metrics = &next.runtime_config.observability.metrics;
-        if current_metrics.enabled != next_metrics.enabled {
-            return Some(format!(
-                "runtime reload rejected: observability.metrics.enabled changed from {} to {}; restart required",
-                current_metrics.enabled, next_metrics.enabled
-            ));
+        if !next_metrics.enabled {
+            return None;
         }
-        if current_metrics.required != next_metrics.required {
-            return Some(format!(
-                "runtime reload rejected: observability.metrics.required changed from {} to {}; restart required",
-                current_metrics.required, next_metrics.required
-            ));
-        }
-        if current_metrics.address != next_metrics.address
-            || current_metrics.port != next_metrics.port
-        {
-            return Some(format!(
-                "runtime reload rejected: observability.metrics bind changed from {}:{} to {}:{}; restart required",
-                current_metrics.address,
-                current_metrics.port,
-                next_metrics.address,
-                next_metrics.port
-            ));
+
+        let current_metrics = &current.runtime_config.observability.metrics;
+        let bind_changed = !current_metrics.enabled
+            || current_metrics.address != next_metrics.address
+            || current_metrics.port != next_metrics.port;
+        if bind_changed {
+            let bind = format!("{}:{}", next_metrics.address, next_metrics.port);
+            if let Err(err) = Self::probe_tcp_bind(&bind, "metrics endpoint") {
+                return Some(err);
+            }
         }
         None
+    }
+
+    fn note_restart_required_change<T>(issues: &mut Vec<String>, field: &str, current: &T, next: &T)
+    where
+        T: PartialEq + std::fmt::Debug,
+    {
+        if current != next {
+            issues.push(format!(
+                "runtime reload rejected: {field} changed from {current:?} to {next:?}; restart required"
+            ));
+        }
+    }
+
+    fn validate_startup_owned_reload_compatibility(
+        current: &RuntimeBundle,
+        next: &RuntimeBundle,
+    ) -> Vec<String> {
+        let mut issues = Vec::new();
+
+        Self::note_restart_required_change(
+            &mut issues,
+            "log.level",
+            &current.log_config.level,
+            &next.log_config.level,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "log.file.enabled",
+            &current.log_config.file.enabled,
+            &next.log_config.file.enabled,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "log.file.path",
+            &current.log_config.file.path,
+            &next.log_config.file.path,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "log.format",
+            &current.log_config.format,
+            &next.log_config.format,
+        );
+
+        let current_tracing = &current.runtime_config.observability.tracing;
+        let next_tracing = &next.runtime_config.observability.tracing;
+        Self::note_restart_required_change(
+            &mut issues,
+            "observability.tracing.enabled",
+            &current_tracing.enabled,
+            &next_tracing.enabled,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "observability.tracing.service_name",
+            &current_tracing.service_name,
+            &next_tracing.service_name,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "observability.tracing.otlp_endpoint",
+            &current_tracing.otlp_endpoint,
+            &next_tracing.otlp_endpoint,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "observability.tracing.sample_ratio",
+            &current_tracing.sample_ratio,
+            &next_tracing.sample_ratio,
+        );
+
+        let current_perf = &current.runtime_config.performance;
+        let next_perf = &next.runtime_config.performance;
+        Self::note_restart_required_change(
+            &mut issues,
+            "performance.control_plane_threads",
+            &current_perf.control_plane_threads,
+            &next_perf.control_plane_threads,
+        );
+
+        issues
     }
 
     pub(super) fn control_api_is_authorized(
@@ -1322,8 +1438,12 @@ mod tests {
 
     fn runtime_bundle_from_config(config_path: &str, config: &SpookyConfigConfig) -> RuntimeBundle {
         let runtime_config = RuntimeConfig::from_config(config).expect("runtime config");
-        QUICListener::build_runtime_bundle(config_path.to_string(), &runtime_config)
-            .expect("runtime bundle")
+        QUICListener::build_runtime_bundle(
+            config_path.to_string(),
+            config.log.clone(),
+            &runtime_config,
+        )
+        .expect("runtime bundle")
     }
 
     fn control_api_state_with_runtime_bundle(
@@ -1447,7 +1567,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_control_api_reload_compatibility_rejects_bind_change() {
+    fn validate_control_api_reload_compatibility_allows_bind_change_when_socket_is_free() {
         let dir = tempdir().expect("tempdir");
         let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
         let mut current = test_config(cert.clone(), key.clone());
@@ -1460,15 +1580,14 @@ mod tests {
 
         let current_bundle = runtime_bundle_from_config("current.yaml", &current);
         let next_bundle = runtime_bundle_from_config("next.yaml", &next);
-        let err =
+        assert!(
             QUICListener::validate_control_api_reload_compatibility(&current_bundle, &next_bundle)
-                .expect("bind change should be rejected");
-
-        assert!(err.contains("observability.control_api bind changed"));
+                .is_none()
+        );
     }
 
     #[test]
-    fn validate_metrics_reload_compatibility_rejects_bind_change() {
+    fn validate_metrics_reload_compatibility_allows_bind_change_when_socket_is_free() {
         let dir = tempdir().expect("tempdir");
         let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
         let mut current = test_config(cert.clone(), key.clone());
@@ -1481,10 +1600,147 @@ mod tests {
 
         let current_bundle = runtime_bundle_from_config("current.yaml", &current);
         let next_bundle = runtime_bundle_from_config("next.yaml", &next);
-        let err =
+        assert!(
             QUICListener::validate_metrics_reload_compatibility(&current_bundle, &next_bundle)
-                .expect("bind change should be rejected");
+                .is_none()
+        );
+    }
 
-        assert!(err.contains("observability.metrics bind changed"));
+    #[test]
+    fn validate_startup_owned_reload_compatibility_rejects_log_change() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let current = test_config(cert.clone(), key.clone());
+
+        let mut next = current.clone();
+        next.log.level = "debug".to_string();
+
+        let current_bundle = runtime_bundle_from_config("current.yaml", &current);
+        let next_bundle = runtime_bundle_from_config("next.yaml", &next);
+        let issues = QUICListener::validate_startup_owned_reload_compatibility(
+            &current_bundle,
+            &next_bundle,
+        );
+
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("log.level") && issue.contains("restart required"))
+        );
+    }
+
+    #[test]
+    fn validate_startup_owned_reload_compatibility_allows_worker_topology_change() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let current = test_config(cert.clone(), key.clone());
+
+        let mut next = current.clone();
+        next.performance.worker_threads = 4;
+        next.performance.packet_shards_per_worker = 2;
+
+        let current_bundle = runtime_bundle_from_config("current.yaml", &current);
+        let next_bundle = runtime_bundle_from_config("next.yaml", &next);
+        let issues = QUICListener::validate_startup_owned_reload_compatibility(
+            &current_bundle,
+            &next_bundle,
+        );
+
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn validate_runtime_reload_compatibility_allows_listener_addition_when_binds_are_free() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let current = test_config(cert.clone(), key.clone());
+
+        let mut next = current.clone();
+        let mut extra_listener = next.listen.clone();
+        extra_listener.port = 9891;
+        next.listeners = vec![next.listen.clone(), extra_listener];
+
+        let current_bundle = runtime_bundle_from_config("current.yaml", &current);
+        let next_bundle = runtime_bundle_from_config("next.yaml", &next);
+
+        assert!(
+            QUICListener::validate_runtime_reload_compatibility(&current_bundle, &next_bundle)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn validate_runtime_reload_compatibility_rejects_listener_removal() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let current = test_config(cert.clone(), key.clone());
+
+        // next removes the primary listener entirely by switching to an explicit
+        // listeners list that omits the original bind address
+        let mut next = current.clone();
+        next.listeners = vec![{
+            let mut l = next.listen.clone();
+            l.port = 9892;
+            l
+        }];
+
+        let current_bundle = runtime_bundle_from_config("current.yaml", &current);
+        let next_bundle = runtime_bundle_from_config("next.yaml", &next);
+
+        let err =
+            QUICListener::validate_runtime_reload_compatibility(&current_bundle, &next_bundle);
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("restart required")),
+            "expected rejection, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_runtime_reload_compatibility_rejects_listener_bind_change() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let current = test_config(cert.clone(), key.clone());
+
+        // next keeps one listener but moves it to a different port — the label
+        // changes, so the old label disappears from the next bundle
+        let mut next = current.clone();
+        next.listen.port = 9893;
+
+        let current_bundle = runtime_bundle_from_config("current.yaml", &current);
+        let next_bundle = runtime_bundle_from_config("next.yaml", &next);
+
+        let err =
+            QUICListener::validate_runtime_reload_compatibility(&current_bundle, &next_bundle);
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("restart required")),
+            "expected rejection, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_startup_owned_reload_compatibility_rejects_control_plane_thread_change() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let current = test_config(cert.clone(), key.clone());
+
+        let mut next = current.clone();
+        next.performance.control_plane_threads = 7;
+
+        let current_bundle = runtime_bundle_from_config("current.yaml", &current);
+        let next_bundle = runtime_bundle_from_config("next.yaml", &next);
+        let issues = QUICListener::validate_startup_owned_reload_compatibility(
+            &current_bundle,
+            &next_bundle,
+        );
+
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("performance.control_plane_threads"))
+        );
     }
 }

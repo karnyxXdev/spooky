@@ -5,7 +5,7 @@ use super::*;
 use ::http::{Method, header};
 
 impl QUICListener {
-    fn bearer_token_from_authorization_header(raw: &str) -> Option<&str> {
+    pub(super) fn bearer_token_from_authorization_header(raw: &str) -> Option<&str> {
         let raw = raw.trim();
         let split = raw.find(char::is_whitespace)?;
         let (scheme, rest) = raw.split_at(split);

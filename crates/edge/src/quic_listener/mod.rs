@@ -23,6 +23,9 @@ use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::{Body, Frame, Incoming};
+use hyper::client::conn::http1 as client_http1;
+use hyper::upgrade;
+use hyper_util::rt::TokioIo;
 use log::{debug, error, info, warn};
 use quiche::Config;
 use quiche::h3::NameValue;
@@ -41,6 +44,7 @@ use spooky_errors::{PoolError, ProxyError, is_retryable};
 use spooky_lb::{HealthFailureReason, HealthTransition, UpstreamPool};
 use spooky_transport::h2_client::{SharedDnsResolver, TlsClientConfig};
 use spooky_transport::transport_pool::{BackendTransportKind, UpstreamTransportPool};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::Handle;
 use tokio::sync::{
     Semaphore, mpsc,
@@ -60,6 +64,7 @@ use spooky_config::{
     },
 };
 
+use crate::types::{ForwardSuccess, TunnelMode};
 use crate::{
     ChannelBody, ForwardResult, HealthClassification, Metrics, OverloadShedReason, QUICListener,
     QuicConnection, REQUEST_ID_COUNTER, RequestEnvelope, ResponseChunk, RetryReason, RouteOutcome,
@@ -226,12 +231,21 @@ fn is_bodyless_request_mode(method: &str, content_length: Option<usize>) -> bool
         && (method.eq_ignore_ascii_case("GET") || is_head_method(method))
 }
 
+fn is_tunnel_mode(tunnel_mode: TunnelMode) -> bool {
+    tunnel_mode != TunnelMode::None
+}
+
+fn is_tunnel_response(tunnel_mode: TunnelMode, status: StatusCode) -> bool {
+    is_tunnel_mode(tunnel_mode) && status.is_success()
+}
+
+#[cfg(test)]
 fn is_connect_tunnel_response(method: &str, status: StatusCode) -> bool {
     is_connect_method(method) && status.is_success()
 }
 
 fn can_poll_upstream_result(req: &RequestEnvelope) -> bool {
-    if is_connect_method(&req.method)
+    if is_tunnel_mode(req.tunnel_mode)
         && (req.phase == StreamPhase::ReceivingRequest
             || req.phase == StreamPhase::AwaitingUpstream)
     {
@@ -845,10 +859,13 @@ impl QUICListener {
                     ))
                 })?;
         let quic_config = Self::build_quic_config(&config)?;
-        let h3_config =
-            Arc::new(quiche::h3::Config::new().map_err(|err| {
+        let h3_config = Arc::new({
+            let mut config = quiche::h3::Config::new().map_err(|err| {
                 ProxyError::Transport(format!("failed to create h3 config: {err}"))
-            })?);
+            })?;
+            config.enable_extended_connect(true);
+            config
+        });
         let backend_timeout = Duration::from_millis(config.performance.backend_timeout_ms);
         let backend_body_idle_timeout =
             Duration::from_millis(config.performance.backend_body_idle_timeout_ms);

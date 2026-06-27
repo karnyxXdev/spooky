@@ -5,8 +5,9 @@ use std::{
 };
 
 use bytes::Bytes;
-use http::{HeaderName, HeaderValue, Method, Request, Uri};
+use http::{HeaderName, HeaderValue, Method, Request, Uri, Version};
 use http_body_util::combinators::BoxBody;
+use hyper::ext::Protocol;
 use quiche::h3::NameValue;
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
@@ -100,8 +101,18 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
     forwarded_ctx: ForwardedContext<'_>,
 ) -> Result<Request<BoxBody<Bytes, Infallible>>, BridgeError> {
     let method = Method::from_bytes(method.as_bytes()).map_err(|_| BridgeError::InvalidMethod)?;
-    let is_connect = method == Method::CONNECT;
-    let mut builder = Request::builder().method(method.clone());
+    let websocket_kind = h3_websocket_request_kind(method.as_str(), headers);
+    let websocket_extended_connect =
+        websocket_kind != H3WebsocketRequestKind::None && endpoint.scheme() == BackendScheme::Https;
+    let preserve_legacy_upgrade_headers = websocket_kind == H3WebsocketRequestKind::LegacyUpgrade
+        && endpoint.scheme() == BackendScheme::Http;
+    let upstream_method = if websocket_extended_connect {
+        Method::CONNECT
+    } else {
+        method.clone()
+    };
+    let is_connect = upstream_method == Method::CONNECT;
+    let mut builder = Request::builder().method(upstream_method.clone());
     let connection_tokens = connection_header_tokens(headers);
     let mut host_from_headers: Option<String> = None;
     let mut forwarded_from_headers: Vec<Vec<u8>> = Vec::new();
@@ -132,7 +143,11 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
         }
 
         let header_name = HeaderName::from_bytes(name).map_err(|_| BridgeError::InvalidHeader)?;
-        if should_strip_request_header(&header_name, &connection_tokens) {
+        if should_strip_request_header(
+            &header_name,
+            &connection_tokens,
+            preserve_legacy_upgrade_headers,
+        ) {
             continue;
         }
 
@@ -152,7 +167,11 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
         host_from_headers.as_deref(),
     )?;
 
-    let uri = if is_connect {
+    let uri = if websocket_extended_connect {
+        let request_path = if path.is_empty() { "/" } else { path };
+        let uri = endpoint.uri_for_path(request_path);
+        Uri::try_from(uri).map_err(|_| BridgeError::InvalidUri)?
+    } else if is_connect {
         Uri::try_from(host_value).map_err(|_| BridgeError::InvalidUri)?
     } else {
         let request_path = if path.is_empty() { "/" } else { path };
@@ -160,10 +179,17 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
         Uri::try_from(uri).map_err(|_| BridgeError::InvalidUri)?
     };
     builder = builder.uri(uri);
-    builder = builder.header(http::header::HOST, host_value);
+    if websocket_extended_connect {
+        builder = builder
+            .version(Version::HTTP_2)
+            .extension(Protocol::from_static("websocket"));
+    } else {
+        builder = builder.header(http::header::HOST, host_value);
+    }
 
     if let Some(len) = content_length
         && len > 0
+        && !websocket_extended_connect
     {
         builder = builder.header(http::header::CONTENT_LENGTH, len);
     }
@@ -213,7 +239,7 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
         builder = builder.header(HeaderName::from_static("x-forwarded-host"), value);
     }
 
-    if endpoint.scheme() == BackendScheme::Http && !is_connect {
+    if endpoint.scheme() == BackendScheme::Http && !is_connect && !preserve_legacy_upgrade_headers {
         builder = builder.header(http::header::TE, "trailers");
     }
 
@@ -318,6 +344,56 @@ fn join_header_chain(values: &[Vec<u8>]) -> Result<Option<HeaderValue>, BridgeEr
         .map_err(|_| BridgeError::InvalidHeader)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H3WebsocketRequestKind {
+    None,
+    LegacyUpgrade,
+    ExtendedConnect,
+}
+
+pub fn h3_websocket_request_kind(
+    method: &str,
+    headers: &[quiche::h3::Header],
+) -> H3WebsocketRequestKind {
+    let upgrade_is_websocket = headers.iter().any(|header| {
+        header.name().eq_ignore_ascii_case(b"upgrade")
+            && std::str::from_utf8(header.value())
+                .map(|value| value.eq_ignore_ascii_case("websocket"))
+                .unwrap_or(false)
+    });
+    let connection_mentions_upgrade = headers.iter().any(|header| {
+        header.name().eq_ignore_ascii_case(b"connection")
+            && std::str::from_utf8(header.value())
+                .map(|value| {
+                    value
+                        .split(',')
+                        .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+                })
+                .unwrap_or(false)
+    });
+    let protocol_is_websocket = headers.iter().any(|header| {
+        header.name().eq_ignore_ascii_case(b":protocol")
+            && std::str::from_utf8(header.value())
+                .map(|value| value.eq_ignore_ascii_case("websocket"))
+                .unwrap_or(false)
+    });
+
+    if method.eq_ignore_ascii_case("CONNECT") && protocol_is_websocket {
+        H3WebsocketRequestKind::ExtendedConnect
+    } else if method.eq_ignore_ascii_case("GET")
+        && upgrade_is_websocket
+        && connection_mentions_upgrade
+    {
+        H3WebsocketRequestKind::LegacyUpgrade
+    } else {
+        H3WebsocketRequestKind::None
+    }
+}
+
+pub fn h3_websocket_tunnel_requested(method: &str, headers: &[quiche::h3::Header]) -> bool {
+    h3_websocket_request_kind(method, headers) != H3WebsocketRequestKind::None
+}
+
 fn connection_header_tokens(headers: &[quiche::h3::Header]) -> HashSet<String> {
     let mut tokens = HashSet::new();
     for header in headers {
@@ -337,7 +413,17 @@ fn connection_header_tokens(headers: &[quiche::h3::Header]) -> HashSet<String> {
     tokens
 }
 
-fn should_strip_request_header(name: &HeaderName, connection_tokens: &HashSet<String>) -> bool {
+fn should_strip_request_header(
+    name: &HeaderName,
+    connection_tokens: &HashSet<String>,
+    preserve_websocket_upgrade_headers: bool,
+) -> bool {
+    if preserve_websocket_upgrade_headers
+        && (name == http::header::CONNECTION || name == http::header::UPGRADE)
+    {
+        return false;
+    }
+
     if connection_tokens.contains(name.as_str()) {
         return true;
     }

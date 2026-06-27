@@ -132,6 +132,170 @@ impl QUICListener {
         detail
     }
 
+    fn build_http1_websocket_tunnel_request(
+        endpoint: &BackendEndpoint,
+        host_policy: &UpstreamHostPolicy,
+        forwarded_policy: &ForwardedHeaderPolicy,
+        path: &str,
+        headers: &[quiche::h3::Header],
+        client_addr: SocketAddr,
+        request_authority: Option<&str>,
+        request_id: u64,
+        traceparent: Option<&str>,
+    ) -> Result<Request<BoxBody<Bytes, std::convert::Infallible>>, ProxyError> {
+        let mut request_headers = headers.to_vec();
+        let has_upgrade = request_headers
+            .iter()
+            .any(|header| header.name().eq_ignore_ascii_case(b"upgrade"));
+        if !has_upgrade {
+            request_headers.push(quiche::h3::Header::new(b"upgrade", b"websocket"));
+        }
+        let has_connection = request_headers
+            .iter()
+            .any(|header| header.name().eq_ignore_ascii_case(b"connection"));
+        if !has_connection {
+            request_headers.push(quiche::h3::Header::new(b"connection", b"upgrade"));
+        }
+
+        let mut request = build_h2_request_for_endpoint_with_host_policy(
+            endpoint,
+            host_policy,
+            forwarded_policy,
+            "GET",
+            path,
+            &request_headers,
+            BoxBody::new(Full::new(Bytes::new())),
+            None,
+            ForwardedContext {
+                client_addr,
+                request_authority,
+                request_id,
+                traceparent,
+            },
+        )
+        .map_err(ProxyError::from)?;
+
+        let request_path = if path.is_empty() { "/" } else { path };
+        let path_uri = http::Uri::try_from(request_path)
+            .map_err(|_| ProxyError::Transport("invalid websocket request path".into()))?;
+        *request.uri_mut() = path_uri;
+        Ok(request)
+    }
+
+    async fn forward_http1_websocket_tunnel(
+        endpoint: BackendEndpoint,
+        host_policy: UpstreamHostPolicy,
+        forwarded_policy: ForwardedHeaderPolicy,
+        path: String,
+        headers: Vec<quiche::h3::Header>,
+        client_addr: SocketAddr,
+        request_authority: Option<String>,
+        request_id: u64,
+        traceparent: Option<String>,
+        mut body_rx: mpsc::Receiver<Bytes>,
+        backend_timeout: Duration,
+    ) -> ForwardResult {
+        let request = Self::build_http1_websocket_tunnel_request(
+            &endpoint,
+            &host_policy,
+            &forwarded_policy,
+            &path,
+            &headers,
+            client_addr,
+            request_authority.as_deref(),
+            request_id,
+            traceparent.as_deref(),
+        )?;
+
+        let stream = tokio::time::timeout(
+            backend_timeout,
+            tokio::net::TcpStream::connect(endpoint.authority()),
+        )
+        .await
+        .map_err(|_| ProxyError::Timeout)?
+        .map_err(|err| ProxyError::Transport(err.to_string()))?;
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = client_http1::handshake(io)
+            .await
+            .map_err(|err| ProxyError::Transport(err.to_string()))?;
+        tokio::spawn(async move {
+            let _ = conn.with_upgrades().await;
+        });
+
+        let mut response = tokio::time::timeout(backend_timeout, sender.send_request(request))
+            .await
+            .map_err(|_| ProxyError::Timeout)?
+            .map_err(|err| ProxyError::Transport(err.to_string()))?;
+
+        if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+            let status = response.status();
+            let headers = response.headers().clone();
+            return Ok(ForwardSuccess::Response {
+                status,
+                headers,
+                body: response.into_body(),
+            });
+        }
+
+        let upgraded = upgrade::on(&mut response);
+        let headers = response.headers().clone();
+        let (chunk_tx, chunk_rx) = mpsc::channel(RESPONSE_CHUNK_CHANNEL_CAPACITY);
+        let fut = async move {
+            let upgraded = match upgraded.await {
+                Ok(upgraded) => upgraded,
+                Err(err) => {
+                    let _ = chunk_tx
+                        .send(ResponseChunk::Error(ProxyError::Transport(err.to_string())))
+                        .await;
+                    return;
+                }
+            };
+            let io = TokioIo::new(upgraded);
+            let (mut reader, mut writer) = tokio::io::split(io);
+            let write_fut = async {
+                while let Some(chunk) = body_rx.recv().await {
+                    writer.write_all(&chunk).await?;
+                }
+                writer.shutdown().await
+            };
+            let read_fut = async {
+                let mut buf = [0u8; RESPONSE_CHUNK_BYTES_LIMIT];
+                loop {
+                    match reader.read(&mut buf).await {
+                        Ok(0) => return Ok::<(), std::io::Error>(()),
+                        Ok(read) => {
+                            if chunk_tx
+                                .send(ResponseChunk::Data(Bytes::copy_from_slice(&buf[..read])))
+                                .await
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+            };
+            match tokio::try_join!(write_fut, read_fut) {
+                Ok(((), ())) => {
+                    let _ = chunk_tx.send(ResponseChunk::End).await;
+                }
+                Err(err) => {
+                    let _ = chunk_tx
+                        .send(ResponseChunk::Error(ProxyError::Transport(err.to_string())))
+                        .await;
+                }
+            }
+        };
+        let _ = spawn_async_task(fut, "ws-h1-tunnel");
+
+        Ok(ForwardSuccess::Tunnel {
+            status: StatusCode::OK,
+            headers,
+            response_chunk_rx: chunk_rx,
+        })
+    }
+
     fn is_internal_pool_control_error(error: &PoolError) -> bool {
         matches!(
             error,
@@ -639,6 +803,14 @@ impl QUICListener {
                     let path = request.path;
                     let authority = request.authority;
                     let content_length = request.content_length;
+                    let websocket_tunnel = request.websocket_tunnel;
+                    let tunnel_mode = if websocket_tunnel {
+                        TunnelMode::Websocket
+                    } else if is_connect_method(&method) {
+                        TunnelMode::Connect
+                    } else {
+                        TunnelMode::None
+                    };
 
                     metrics.inc_total();
                     let request_start = Instant::now();
@@ -674,8 +846,9 @@ impl QUICListener {
                             .and_then(|header| std::str::from_utf8(header.value()).ok())
                             .map(str::to_string)
                     };
+                    let route_method = if websocket_tunnel { "GET" } else { &method };
                     let resolved = Self::resolve_backend(
-                        &method,
+                        route_method,
                         &path,
                         authority.as_deref(),
                         Some(sticky_cid_key.as_str()),
@@ -942,16 +1115,6 @@ impl QUICListener {
                                     )
                                 },
                             );
-                            let bodyless_mode = is_bodyless_request_mode(&method, content_length);
-                            let (tx, boxed, request_fin_received) = if bodyless_mode {
-                                (None, BoxBody::new(Full::new(Bytes::new())), true)
-                            } else {
-                                // Create a channel body so quiche Data chunks stream
-                                // directly into the in-flight H2 request.
-                                let (tx, channel_body) =
-                                    ChannelBody::channel(REQUEST_CHUNK_CHANNEL_CAPACITY);
-                                (Some(tx), channel_body.boxed(), false)
-                            };
                             let backend_endpoint = match backend_endpoints.get(&addr).cloned() {
                                 Some(endpoint) => endpoint,
                                 None => {
@@ -977,6 +1140,29 @@ impl QUICListener {
                                     continue;
                                 }
                             };
+                            let websocket_h1_tunnel = websocket_tunnel
+                                && backend_endpoint.scheme() == BackendScheme::Http;
+                            let bodyless_mode = !is_tunnel_mode(tunnel_mode)
+                                && is_bodyless_request_mode(&method, content_length);
+                            let (tx, websocket_tunnel_body_rx, boxed, request_fin_received) =
+                                if bodyless_mode {
+                                    (None, None, BoxBody::new(Full::new(Bytes::new())), true)
+                                } else if websocket_h1_tunnel {
+                                    let (tx, rx) =
+                                        mpsc::channel::<Bytes>(REQUEST_CHUNK_CHANNEL_CAPACITY);
+                                    (
+                                        Some(tx),
+                                        Some(rx),
+                                        BoxBody::new(Full::new(Bytes::new())),
+                                        false,
+                                    )
+                                } else {
+                                    // Create a channel body so quiche Data chunks stream
+                                    // directly into the in-flight request.
+                                    let (tx, channel_body) =
+                                        ChannelBody::channel(REQUEST_CHUNK_CHANNEL_CAPACITY);
+                                    (Some(tx), None, channel_body.boxed(), false)
+                                };
                             let upstream_policy = upstream_policies
                                 .get(&upstream_name)
                                 .cloned()
@@ -1030,29 +1216,35 @@ impl QUICListener {
                             let backend_endpoints = Arc::clone(&backend_endpoints);
                             let backend_resolutions = Arc::clone(&backend_resolution_store);
                             let send_metrics = Arc::clone(&metrics);
-                            let allow_hedge = bodyless_mode
+                            let allow_hedge = !is_tunnel_mode(tunnel_mode)
+                                && bodyless_mode
                                 && resilience.hedging_allowed_for(&method, &upstream_name, true);
                             let hedge_delay = resilience.hedging_delay;
                             let alternate_backend =
                                 Self::pick_alternate_backend(&upstream_pool, idx);
-                            let forward_meta = bodyless_mode.then(|| {
-                                Arc::new(ForwardRequestMeta {
-                                    method: Arc::<str>::from(method.as_str()),
-                                    path: Arc::<str>::from(path.as_str()),
-                                    authority: authority.as_deref().map(Arc::<str>::from),
-                                    headers: Arc::new(list.clone()),
-                                    client_addr: connection.peer_address,
-                                    request_id,
-                                    traceparent: traceparent.as_deref().map(Arc::<str>::from),
-                                    host_policy: upstream_policy.host.0.clone(),
-                                    forwarded_header_policy: upstream_policy
-                                        .forwarded_headers
-                                        .0
-                                        .clone(),
-                                })
-                            });
+                            let forward_meta = (!is_tunnel_mode(tunnel_mode) && bodyless_mode)
+                                .then(|| {
+                                    Arc::new(ForwardRequestMeta {
+                                        method: Arc::<str>::from(method.as_str()),
+                                        path: Arc::<str>::from(path.as_str()),
+                                        authority: authority.as_deref().map(Arc::<str>::from),
+                                        headers: Arc::new(list.clone()),
+                                        client_addr: connection.peer_address,
+                                        request_id,
+                                        traceparent: traceparent.as_deref().map(Arc::<str>::from),
+                                        host_policy: upstream_policy.host.0.clone(),
+                                        forwarded_header_policy: upstream_policy
+                                            .forwarded_headers
+                                            .0
+                                            .clone(),
+                                    })
+                                });
                             let trace_span_for_upstream = trace_span.clone();
                             let (result_tx, result_rx) = oneshot::channel::<UpstreamResult>();
+                            let client_addr = connection.peer_address;
+                            let path_for_upstream = path.clone();
+                            let authority_for_upstream = authority.clone();
+                            let traceparent_for_upstream = traceparent.clone();
                             let fut = async move {
                                 let mut hedge_telemetry = crate::HedgeTelemetry::default();
                                 let mut retry_count: u8 = 0;
@@ -1093,7 +1285,26 @@ impl QUICListener {
                                             Ok(send_result??)
                                         };
 
-                                    let response: Response<Incoming> = if allow_hedge {
+                                    let forward_success: ForwardSuccess = if websocket_h1_tunnel {
+                                        let body_rx = websocket_tunnel_body_rx.expect(
+                                            "websocket H1 tunnels require a downstream body channel",
+                                        );
+                                        Self::forward_http1_websocket_tunnel(
+                                            backend_endpoint.clone(),
+                                            upstream_policy.host.0.clone(),
+                                            upstream_policy.forwarded_headers.0.clone(),
+                                            path_for_upstream.clone(),
+                                            list.clone(),
+                                            client_addr,
+                                            authority_for_upstream.clone(),
+                                            request_id,
+                                            traceparent_for_upstream.clone(),
+                                            body_rx,
+                                            backend_timeout,
+                                        )
+                                        .await?
+                                    } else {
+                                        let response: Response<Incoming> = if allow_hedge {
                                         let hedge_candidate = alternate_backend
                                             .clone()
                                             .and_then(|(backend, _idx)| {
@@ -1224,8 +1435,14 @@ impl QUICListener {
                                         }
                                     };
 
-                                    let (parts, body) = response.into_parts();
-                                    Ok((parts.status, parts.headers, body))
+                                        let (parts, body) = response.into_parts();
+                                        ForwardSuccess::Response {
+                                            status: parts.status,
+                                            headers: parts.headers,
+                                            body,
+                                        }
+                                    };
+                                    Ok(forward_success)
                                 }
                                 .await;
                                 // Ignore send error: receiver dropped means the stream was reset.
@@ -1365,6 +1582,7 @@ impl QUICListener {
                             start: request_start,
                             total_request_deadline: request_start + backend_total_request_timeout,
                             bodyless_mode,
+                            tunnel_mode,
                             retry_count: 0,
                             error_kind: None,
                             phase: StreamPhase::ReceivingRequest,
@@ -1766,20 +1984,33 @@ impl QUICListener {
                     };
                 }
                 match forward_result.forward {
-                    Ok((status, resp_headers, body)) => {
+                    Ok(success) => {
+                        let (status, resp_headers, response_body, prebuilt_response_chunk_rx) =
+                            match success {
+                                ForwardSuccess::Response {
+                                    status,
+                                    headers,
+                                    body,
+                                } => (status, headers, Some(body), None),
+                                ForwardSuccess::Tunnel {
+                                    status,
+                                    headers,
+                                    response_chunk_rx,
+                                } => (status, headers, None, Some(response_chunk_rx)),
+                            };
                         let suppress_downstream_body = streams
                             .get(&stream_id)
                             .is_some_and(|req| is_head_method(&req.method));
-                        let connect_tunnel = streams
+                        let tunnel_response = streams
                             .get(&stream_id)
-                            .is_some_and(|req| is_connect_tunnel_response(&req.method, status));
+                            .is_some_and(|req| is_tunnel_response(req.tunnel_mode, status));
                         // If upstream advertised a response length beyond our hard cap,
                         // fail fast with 503 before sending any downstream headers/body.
                         let upstream_content_length = resp_headers
                             .get(http::header::CONTENT_LENGTH)
                             .and_then(|v| v.to_str().ok())
                             .and_then(|v| v.parse::<usize>().ok());
-                        if !connect_tunnel
+                        if !tunnel_response
                             && !suppress_downstream_body
                             && upstream_content_length
                                 .is_some_and(|len| len > max_response_body_bytes)
@@ -1838,10 +2069,10 @@ impl QUICListener {
                         ));
 
                         let defer_headers_until_body_validated = upstream_content_length.is_none()
-                            && !connect_tunnel
+                            && !tunnel_response
                             && !suppress_downstream_body;
                         let immediate_end = suppress_downstream_body
-                            || (!connect_tunnel
+                            || (!tunnel_response
                                 && (upstream_content_length == Some(0)
                                     || status == http::StatusCode::NO_CONTENT
                                     || status == http::StatusCode::NOT_MODIFIED));
@@ -1951,63 +2182,74 @@ impl QUICListener {
                             // Enforces body deadlines and a hard running body-size cap. For
                             // unknown-length responses it additionally prebuffers until size
                             // validation completes before emitting headers.
-                            let (chunk_tx, chunk_rx) =
-                                mpsc::channel::<ResponseChunk>(RESPONSE_CHUNK_CHANNEL_CAPACITY);
-                            let fail_tx = chunk_tx.clone();
-                            // `backend_body_total_timeout` is used as a pre-first-byte guard:
-                            // once the upstream starts making body progress, the idle timeout
-                            // governs pacing and the stream may continue until request deadline.
-                            let first_byte_deadline =
-                                tokio::time::Instant::now() + backend_body_total_timeout;
-                            let deferred_status = status;
-                            let deferred_headers = owned_h3_headers.clone();
-                            let tunnel_mode = connect_tunnel;
-                            let fut = async move {
-                                use http_body_util::BodyExt;
-                                let mut body: hyper::body::Incoming = body;
-                                let mut response_bytes_received: usize = 0;
-                                let mut buffered_chunks: Vec<Bytes> = Vec::new();
-                                let mut buffered_trailers: Option<Vec<(Vec<u8>, Vec<u8>)>> = None;
-                                let mut saw_body_progress = false;
-                                loop {
-                                    let frame_fut = BodyExt::frame(&mut body);
-                                    let now = tokio::time::Instant::now();
-                                    if !saw_body_progress && now >= first_byte_deadline {
-                                        let _ = chunk_tx
-                                            .send(ResponseChunk::Error(ProxyError::Timeout))
-                                            .await;
-                                        return;
-                                    }
-                                    let wait_timeout = if saw_body_progress {
-                                        backend_body_idle_timeout
-                                    } else {
-                                        first_byte_deadline
-                                            .saturating_duration_since(now)
-                                            .min(backend_body_idle_timeout)
-                                    };
-                                    let result =
-                                        tokio::time::timeout(wait_timeout, frame_fut).await;
-                                    match result {
-                                        Err(_elapsed) => {
-                                            // Body read idle timeout — signal timeout to flush loop.
+                            if let Some(chunk_rx) = prebuilt_response_chunk_rx {
+                                if let Some(req) = streams.get_mut(&stream_id) {
+                                    req.response_chunk_rx = Some(chunk_rx);
+                                    req.response_headers_sent = true;
+                                    req.phase = StreamPhase::SendingResponse;
+                                    req.response_status = Some(status.as_u16());
+                                }
+                            } else {
+                                let (chunk_tx, chunk_rx) =
+                                    mpsc::channel::<ResponseChunk>(RESPONSE_CHUNK_CHANNEL_CAPACITY);
+                                let fail_tx = chunk_tx.clone();
+                                // `backend_body_total_timeout` is used as a pre-first-byte guard:
+                                // once the upstream starts making body progress, the idle timeout
+                                // governs pacing and the stream may continue until request deadline.
+                                let first_byte_deadline =
+                                    tokio::time::Instant::now() + backend_body_total_timeout;
+                                let deferred_status = status;
+                                let deferred_headers = owned_h3_headers.clone();
+                                let tunnel_mode = tunnel_response;
+                                let fut = async move {
+                                    use http_body_util::BodyExt;
+                                    let mut body: hyper::body::Incoming = response_body.expect(
+                                        "non-tunnel responses must carry an HTTP body stream",
+                                    );
+                                    let mut response_bytes_received: usize = 0;
+                                    let mut buffered_chunks: Vec<Bytes> = Vec::new();
+                                    let mut buffered_trailers: Option<Vec<(Vec<u8>, Vec<u8>)>> =
+                                        None;
+                                    let mut saw_body_progress = false;
+                                    loop {
+                                        let frame_fut = BodyExt::frame(&mut body);
+                                        let now = tokio::time::Instant::now();
+                                        if !saw_body_progress && now >= first_byte_deadline {
                                             let _ = chunk_tx
                                                 .send(ResponseChunk::Error(ProxyError::Timeout))
                                                 .await;
                                             return;
                                         }
-                                        Ok(Some(Ok(f))) => match f.into_data() {
-                                            Ok(data) => {
-                                                if !data.is_empty() {
-                                                    saw_body_progress = true;
-                                                }
-                                                if !tunnel_mode
-                                                    && response_size_exceeded_after_chunk(
-                                                        &mut response_bytes_received,
-                                                        data.len(),
-                                                        max_response_body_bytes,
-                                                    )
-                                                {
-                                                    let _ = chunk_tx
+                                        let wait_timeout = if saw_body_progress {
+                                            backend_body_idle_timeout
+                                        } else {
+                                            first_byte_deadline
+                                                .saturating_duration_since(now)
+                                                .min(backend_body_idle_timeout)
+                                        };
+                                        let result =
+                                            tokio::time::timeout(wait_timeout, frame_fut).await;
+                                        match result {
+                                            Err(_elapsed) => {
+                                                // Body read idle timeout — signal timeout to flush loop.
+                                                let _ = chunk_tx
+                                                    .send(ResponseChunk::Error(ProxyError::Timeout))
+                                                    .await;
+                                                return;
+                                            }
+                                            Ok(Some(Ok(f))) => match f.into_data() {
+                                                Ok(data) => {
+                                                    if !data.is_empty() {
+                                                        saw_body_progress = true;
+                                                    }
+                                                    if !tunnel_mode
+                                                        && response_size_exceeded_after_chunk(
+                                                            &mut response_bytes_received,
+                                                            data.len(),
+                                                            max_response_body_bytes,
+                                                        )
+                                                    {
+                                                        let _ = chunk_tx
                                                         .send(ResponseChunk::Error(ProxyError::Pool(
                                                             PoolError::BackendOverloaded(
                                                                 "upstream response body too large"
@@ -2015,10 +2257,10 @@ impl QUICListener {
                                                             ),
                                                         )))
                                                         .await;
-                                                    return;
-                                                }
-                                                if defer_headers_until_body_validated {
-                                                    if response_bytes_received
+                                                        return;
+                                                    }
+                                                    if defer_headers_until_body_validated {
+                                                        if response_bytes_received
                                                         > unknown_length_response_prebuffer_bytes
                                                     {
                                                         let _ = chunk_tx
@@ -2031,117 +2273,122 @@ impl QUICListener {
                                                             .await;
                                                         return;
                                                     }
-                                                    for start in (0..data.len())
-                                                        .step_by(RESPONSE_CHUNK_BYTES_LIMIT)
-                                                    {
-                                                        let end = (start
-                                                            + RESPONSE_CHUNK_BYTES_LIMIT)
-                                                            .min(data.len());
-                                                        buffered_chunks
-                                                            .push(data.slice(start..end));
-                                                    }
-                                                } else {
-                                                    for start in (0..data.len())
-                                                        .step_by(RESPONSE_CHUNK_BYTES_LIMIT)
-                                                    {
-                                                        let end = (start
-                                                            + RESPONSE_CHUNK_BYTES_LIMIT)
-                                                            .min(data.len());
-                                                        if chunk_tx
-                                                            .send(ResponseChunk::Data(
-                                                                data.slice(start..end),
-                                                            ))
-                                                            .await
-                                                            .is_err()
+                                                        for start in (0..data.len())
+                                                            .step_by(RESPONSE_CHUNK_BYTES_LIMIT)
                                                         {
-                                                            return;
+                                                            let end = (start
+                                                                + RESPONSE_CHUNK_BYTES_LIMIT)
+                                                                .min(data.len());
+                                                            buffered_chunks
+                                                                .push(data.slice(start..end));
+                                                        }
+                                                    } else {
+                                                        for start in (0..data.len())
+                                                            .step_by(RESPONSE_CHUNK_BYTES_LIMIT)
+                                                        {
+                                                            let end = (start
+                                                                + RESPONSE_CHUNK_BYTES_LIMIT)
+                                                                .min(data.len());
+                                                            if chunk_tx
+                                                                .send(ResponseChunk::Data(
+                                                                    data.slice(start..end),
+                                                                ))
+                                                                .await
+                                                                .is_err()
+                                                            {
+                                                                return;
+                                                            }
                                                         }
                                                     }
                                                 }
-                                            }
-                                            Err(frame) => {
-                                                if let Ok(trailers) = frame.into_trailers() {
-                                                    let trailer_headers =
-                                                        collect_h3_trailers(&trailers);
-                                                    if !trailer_headers.is_empty() {
-                                                        if defer_headers_until_body_validated {
-                                                            buffered_trailers =
-                                                                Some(trailer_headers);
-                                                        } else if chunk_tx
-                                                            .send(ResponseChunk::Trailers {
-                                                                headers: trailer_headers,
-                                                            })
-                                                            .await
-                                                            .is_err()
-                                                        {
-                                                            return;
+                                                Err(frame) => {
+                                                    if let Ok(trailers) = frame.into_trailers() {
+                                                        let trailer_headers =
+                                                            collect_h3_trailers(&trailers);
+                                                        if !trailer_headers.is_empty() {
+                                                            if defer_headers_until_body_validated {
+                                                                buffered_trailers =
+                                                                    Some(trailer_headers);
+                                                            } else if chunk_tx
+                                                                .send(ResponseChunk::Trailers {
+                                                                    headers: trailer_headers,
+                                                                })
+                                                                .await
+                                                                .is_err()
+                                                            {
+                                                                return;
+                                                            }
                                                         }
                                                     }
                                                 }
+                                            },
+                                            Ok(Some(Err(_))) => {
+                                                let _ = chunk_tx
+                                                    .send(ResponseChunk::Error(
+                                                        ProxyError::Transport(
+                                                            "upstream body error".into(),
+                                                        ),
+                                                    ))
+                                                    .await;
+                                                return;
                                             }
-                                        },
-                                        Ok(Some(Err(_))) => {
-                                            let _ = chunk_tx
-                                                .send(ResponseChunk::Error(ProxyError::Transport(
-                                                    "upstream body error".into(),
-                                                )))
-                                                .await;
-                                            return;
-                                        }
-                                        Ok(None) => {
-                                            if defer_headers_until_body_validated {
-                                                if chunk_tx
-                                                    .send(ResponseChunk::Start {
-                                                        status: deferred_status,
-                                                        headers: deferred_headers,
-                                                    })
-                                                    .await
-                                                    .is_err()
-                                                {
-                                                    return;
-                                                }
-                                                for chunk in buffered_chunks {
+                                            Ok(None) => {
+                                                if defer_headers_until_body_validated {
                                                     if chunk_tx
-                                                        .send(ResponseChunk::Data(chunk))
+                                                        .send(ResponseChunk::Start {
+                                                            status: deferred_status,
+                                                            headers: deferred_headers,
+                                                        })
                                                         .await
                                                         .is_err()
                                                     {
                                                         return;
                                                     }
+                                                    for chunk in buffered_chunks {
+                                                        if chunk_tx
+                                                            .send(ResponseChunk::Data(chunk))
+                                                            .await
+                                                            .is_err()
+                                                        {
+                                                            return;
+                                                        }
+                                                    }
                                                 }
-                                            }
-                                            if let Some(headers) = buffered_trailers
-                                                && chunk_tx
-                                                    .send(ResponseChunk::Trailers { headers })
-                                                    .await
-                                                    .is_err()
-                                            {
+                                                if let Some(headers) = buffered_trailers
+                                                    && chunk_tx
+                                                        .send(ResponseChunk::Trailers { headers })
+                                                        .await
+                                                        .is_err()
+                                                {
+                                                    return;
+                                                }
+                                                let _ = chunk_tx.send(ResponseChunk::End).await;
                                                 return;
                                             }
-                                            let _ = chunk_tx.send(ResponseChunk::End).await;
-                                            return;
                                         }
                                     }
+                                };
+                                let request_span = streams
+                                    .get(&stream_id)
+                                    .and_then(|req| req.trace_span.clone());
+                                let spawned = match request_span {
+                                    Some(span) => {
+                                        spawn_async_task(fut.instrument(span), "body-pump")
+                                    }
+                                    None => spawn_async_task(fut, "body-pump"),
+                                };
+                                if !spawned {
+                                    let _ = fail_tx.try_send(ResponseChunk::Error(
+                                        ProxyError::Transport("runtime unavailable".into()),
+                                    ));
                                 }
-                            };
-                            let request_span = streams
-                                .get(&stream_id)
-                                .and_then(|req| req.trace_span.clone());
-                            let spawned = match request_span {
-                                Some(span) => spawn_async_task(fut.instrument(span), "body-pump"),
-                                None => spawn_async_task(fut, "body-pump"),
-                            };
-                            if !spawned {
-                                let _ = fail_tx.try_send(ResponseChunk::Error(
-                                    ProxyError::Transport("runtime unavailable".into()),
-                                ));
-                            }
 
-                            if let Some(req) = streams.get_mut(&stream_id) {
-                                req.response_chunk_rx = Some(chunk_rx);
-                                req.response_headers_sent = !defer_headers_until_body_validated;
-                                req.phase = StreamPhase::SendingResponse;
-                                req.response_status = Some(status.as_u16());
+                                if let Some(req) = streams.get_mut(&stream_id) {
+                                    req.response_chunk_rx = Some(chunk_rx);
+                                    req.response_headers_sent = !defer_headers_until_body_validated;
+                                    req.phase = StreamPhase::SendingResponse;
+                                    req.response_status = Some(status.as_u16());
+                                }
                             }
                         }
 

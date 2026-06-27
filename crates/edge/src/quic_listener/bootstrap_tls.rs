@@ -849,11 +849,17 @@ impl QUICListener {
                                 let mut resp_builder = Response::builder().status(status);
                                 let response_connection_tokens =
                                     connection_header_tokens(upstream_resp.headers());
+                                let preserve_upgrade_response_headers = is_websocket_upgrade
+                                    && status == StatusCode::SWITCHING_PROTOCOLS;
                                 for (name, value) in upstream_resp.headers() {
+                                    let preserve_upgrade_header = preserve_upgrade_response_headers
+                                        && (*name == http::header::CONNECTION
+                                            || *name == http::header::UPGRADE);
                                     if should_strip_bootstrap_response_header(
                                         name,
                                         &response_connection_tokens,
-                                    ) {
+                                    ) && !preserve_upgrade_header
+                                    {
                                         continue;
                                     }
                                     resp_builder = resp_builder.header(name, value);

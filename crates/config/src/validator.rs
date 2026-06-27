@@ -5,11 +5,11 @@ use crate::config::{
 };
 use log::{info, warn};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::net::IpAddr;
-use std::cell::RefCell;
 
 #[path = "validator/helpers.rs"]
 mod helpers;

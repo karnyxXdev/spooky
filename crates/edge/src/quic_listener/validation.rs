@@ -6,6 +6,7 @@ pub(super) struct RequestValidationResult {
     pub(super) path: String,
     pub(super) authority: Option<String>,
     pub(super) content_length: Option<usize>,
+    pub(super) websocket_tunnel: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,7 +22,8 @@ pub(super) fn validate_request_headers(
     if list.len() > resilience.max_headers_count {
         return Err((
             http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
-            b"too many request headers\n",
+            b"too many request headers
+",
             false,
         ));
     }
@@ -32,6 +34,7 @@ pub(super) fn validate_request_headers(
     let mut authority = None::<String>;
     let mut host = None::<String>;
     let mut scheme_seen = false;
+    let mut protocol = None::<String>;
     let mut h3_upgrade_requested = false;
 
     for header in list {
@@ -39,7 +42,8 @@ pub(super) fn validate_request_headers(
         if header_bytes > resilience.max_headers_bytes {
             return Err((
                 http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
-                b"request headers exceed size limit\n",
+                b"request headers exceed size limit
+",
                 false,
             ));
         }
@@ -49,56 +53,68 @@ pub(super) fn validate_request_headers(
                 if method.is_some() {
                     return Err((
                         http::StatusCode::BAD_REQUEST,
-                        b"duplicate :method header\n",
+                        b"duplicate :method header
+",
                         false,
                     ));
                 }
                 method = Some(strict_header_value(
                     header.value(),
-                    b"invalid :method header\n",
+                    b"invalid :method header
+",
                 )?);
             }
             b":path" => {
                 if path.is_some() {
                     return Err((
                         http::StatusCode::BAD_REQUEST,
-                        b"duplicate :path header\n",
+                        b"duplicate :path header
+",
                         false,
                     ));
                 }
                 path = Some(strict_header_value(
                     header.value(),
-                    b"invalid :path header\n",
+                    b"invalid :path header
+",
                 )?);
             }
             b":authority" => {
                 if authority.is_some() {
                     return Err((
                         http::StatusCode::BAD_REQUEST,
-                        b"duplicate :authority header\n",
+                        b"duplicate :authority header
+",
                         false,
                     ));
                 }
                 authority = Some(strict_header_value(
                     header.value(),
-                    b"invalid :authority header\n",
+                    b"invalid :authority header
+",
                 )?);
             }
             b"host" => {
                 if host.is_some() {
                     return Err((
                         http::StatusCode::BAD_REQUEST,
-                        b"duplicate host header\n",
+                        b"duplicate host header
+",
                         false,
                     ));
                 }
                 host = Some(strict_header_value(
                     header.value(),
-                    b"invalid host header\n",
+                    b"invalid host header
+",
                 )?);
             }
             b"connection" => {
-                let value = strict_header_value(header.value(), b"invalid connection header\n")?;
+                let value = strict_header_value(
+                    header.value(),
+                    b"invalid connection header
+",
+                )?;
                 if value
                     .split(',')
                     .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
@@ -107,36 +123,49 @@ pub(super) fn validate_request_headers(
                 }
             }
             b"upgrade" => {
-                let _ = strict_header_value(header.value(), b"invalid upgrade header\n")?;
+                let _ = strict_header_value(
+                    header.value(),
+                    b"invalid upgrade header
+",
+                )?;
                 h3_upgrade_requested = true;
             }
             b":scheme" => {
                 if scheme_seen {
                     return Err((
                         http::StatusCode::BAD_REQUEST,
-                        b"duplicate :scheme header\n",
+                        b"duplicate :scheme header
+",
                         false,
                     ));
                 }
                 scheme_seen = true;
             }
+            b":protocol" => {
+                if protocol.is_some() {
+                    return Err((
+                        http::StatusCode::BAD_REQUEST,
+                        b"duplicate :protocol header
+",
+                        false,
+                    ));
+                }
+                protocol = Some(strict_header_value(
+                    header.value(),
+                    b"invalid :protocol header
+",
+                )?);
+            }
             name if name.starts_with(b":") => {
                 return Err((
                     http::StatusCode::BAD_REQUEST,
-                    b"unsupported pseudo-header\n",
+                    b"unsupported pseudo-header
+",
                     false,
                 ));
             }
             _ => {}
         }
-    }
-
-    if h3_upgrade_requested {
-        return Err((
-            http::StatusCode::BAD_REQUEST,
-            b"HTTP/3 does not support Upgrade requests\n",
-            false,
-        ));
     }
 
     let content_length = parse_h3_content_length(list)?;
@@ -146,33 +175,65 @@ pub(super) fn validate_request_headers(
         None => {
             return Err((
                 http::StatusCode::BAD_REQUEST,
-                b"missing :method header\n",
+                b"missing :method header
+",
                 false,
             ));
         }
     };
+
+    let websocket_tunnel = spooky_bridge::h3_to_h2::h3_websocket_tunnel_requested(&method, list);
+    if protocol.is_some() && !websocket_tunnel {
+        return Err((
+            http::StatusCode::BAD_REQUEST,
+            b"unsupported pseudo-header
+",
+            false,
+        ));
+    }
+    if h3_upgrade_requested && !websocket_tunnel {
+        return Err((
+            http::StatusCode::BAD_REQUEST,
+            b"HTTP/3 does not support Upgrade requests
+",
+            false,
+        ));
+    }
+
     let is_connect = method.eq_ignore_ascii_case("CONNECT");
-    let path = match (is_connect, path) {
-        (true, Some(path)) if path.is_empty() => {
+    let path = match (is_connect, websocket_tunnel, path) {
+        (true, true, Some(path)) => path,
+        (true, true, None) => {
             return Err((
                 http::StatusCode::BAD_REQUEST,
-                b"invalid CONNECT :path header\n",
+                b"missing :path header
+",
                 false,
             ));
         }
-        (true, Some(_)) => {
+        (true, false, Some(path)) if path.is_empty() => {
             return Err((
                 http::StatusCode::BAD_REQUEST,
-                b"invalid CONNECT :path header\n",
+                b"invalid CONNECT :path header
+",
                 false,
             ));
         }
-        (true, None) => "/".to_string(),
-        (false, Some(path)) => path,
-        (false, None) => {
+        (true, false, Some(_)) => {
             return Err((
                 http::StatusCode::BAD_REQUEST,
-                b"missing :path header\n",
+                b"invalid CONNECT :path header
+",
+                false,
+            ));
+        }
+        (true, false, None) => "/".to_string(),
+        (false, _, Some(path)) => path,
+        (false, _, None) => {
+            return Err((
+                http::StatusCode::BAD_REQUEST,
+                b"missing :path header
+",
                 false,
             ));
         }
@@ -184,15 +245,23 @@ pub(super) fn validate_request_headers(
         authority,
         host,
         content_length,
+        websocket_tunnel,
         resilience,
         RequestPartErrors {
-            invalid_method: b"invalid :method header\n",
-            invalid_path: b"invalid :path header\n",
-            invalid_authority: b"invalid :authority header\n",
-            invalid_host: b"invalid host header\n",
-            authority_mismatch: b":authority and host headers must match\n",
-            connect_path_not_allowed: b"invalid CONNECT :path header\n",
-            connect_authority_required: b"CONNECT requires authority host:port\n",
+            invalid_method: b"invalid :method header
+",
+            invalid_path: b"invalid :path header
+",
+            invalid_authority: b"invalid :authority header
+",
+            invalid_host: b"invalid host header
+",
+            authority_mismatch: b":authority and host headers must match
+",
+            connect_path_not_allowed: b"invalid CONNECT :path header
+",
+            connect_authority_required: b"CONNECT requires authority host:port
+",
         },
     )
 }
@@ -258,6 +327,7 @@ pub(super) fn validate_http_request(
         authority,
         host,
         content_length,
+        false,
         resilience,
         RequestPartErrors {
             invalid_method: b"invalid method header\n",
@@ -328,12 +398,14 @@ struct NormalizedAuthority {
     port: Option<u16>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_request_parts(
     method: String,
     path: String,
     authority: Option<String>,
     host: Option<String>,
     content_length: Option<usize>,
+    websocket_tunnel: bool,
     resilience: &RuntimeResilience,
     errors: RequestPartErrors,
 ) -> Result<RequestValidationResult, (http::StatusCode, &'static [u8], bool)> {
@@ -343,7 +415,11 @@ fn validate_request_parts(
     }
 
     if is_connect {
-        if !path.is_empty() && path != "/" {
+        if websocket_tunnel {
+            if path.is_empty() || !path.starts_with('/') {
+                return Err((http::StatusCode::BAD_REQUEST, errors.invalid_path, false));
+            }
+        } else if !path.is_empty() && path != "/" {
             return Err((
                 http::StatusCode::BAD_REQUEST,
                 errors.connect_path_not_allowed,
@@ -424,6 +500,7 @@ fn validate_request_parts(
         path,
         authority: authority.or(host),
         content_length,
+        websocket_tunnel,
     })
 }
 
@@ -656,21 +733,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_http3_connection_upgrade_requests() {
+    fn rejects_http3_upgrade_for_non_websocket_protocols() {
         let resilience = runtime_resilience();
         let headers = vec![
             h3_header(b":method", b"GET"),
             h3_header(b":path", b"/"),
             h3_header(b":authority", b"example.com"),
+            h3_header(b"connection", b"Upgrade"),
+            h3_header(b"upgrade", b"h2c"),
+        ];
+
+        let err = validate_request_headers(&headers, &resilience)
+            .expect_err("HTTP/3 Upgrade requests for non-websocket protocols must be rejected");
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"HTTP/3 does not support Upgrade requests\n");
+        assert!(!err.2);
+    }
+
+    #[test]
+    fn accepts_http3_websocket_legacy_upgrade_as_tunnel() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"GET"),
+            h3_header(b":path", b"/ws"),
+            h3_header(b":authority", b"example.com"),
             h3_header(b"connection", b"keep-alive, Upgrade"),
             h3_header(b"upgrade", b"websocket"),
         ];
 
-        let err = validate_request_headers(&headers, &resilience)
-            .expect_err("HTTP/3 Upgrade requests must be rejected");
-        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
-        assert_eq!(err.1, b"HTTP/3 does not support Upgrade requests\n");
-        assert!(!err.2);
+        let result = validate_request_headers(&headers, &resilience)
+            .expect("HTTP/3 WebSocket legacy upgrade should be accepted as a tunnel");
+        assert!(result.websocket_tunnel, "websocket_tunnel flag must be set");
+        assert_eq!(result.method, "GET");
     }
 
     #[test]

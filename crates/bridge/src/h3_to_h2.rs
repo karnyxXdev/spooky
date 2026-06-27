@@ -1,45 +1,22 @@
-use std::{
-    collections::HashSet,
-    convert::Infallible,
-    net::{IpAddr, SocketAddr},
-};
+use std::convert::Infallible;
 
 use bytes::Bytes;
-use http::{HeaderName, HeaderValue, Method, Request, Uri};
+use http::{HeaderName, HeaderValue, Method, Request, Uri, Version};
 use http_body_util::combinators::BoxBody;
+use hyper::ext::Protocol;
 use quiche::h3::NameValue;
 use spooky_config::{
-    backend_endpoint::{BackendEndpoint, BackendScheme},
-    config::{
-        ForwardedHeaderPolicy, ForwardedHeaderPolicyMode, UpstreamHostPolicy,
-        UpstreamHostPolicyMode,
-    },
+    backend_endpoint::BackendEndpoint,
+    config::{ForwardedHeaderPolicy, UpstreamHostPolicy},
 };
 
-pub use spooky_errors::BridgeError;
-
-pub struct ForwardedContext<'a> {
-    pub client_addr: SocketAddr,
-    pub request_authority: Option<&'a str>,
-    pub request_id: u64,
-    pub traceparent: Option<&'a str>,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ForwardedHeaderChains<'a> {
-    pub forwarded: &'a [Vec<u8>],
-    pub x_forwarded_for: &'a [Vec<u8>],
-    pub x_forwarded_proto: &'a [Vec<u8>],
-    pub x_forwarded_host: &'a [Vec<u8>],
-}
-
-#[derive(Debug, Default)]
-pub struct ForwardedHeaderValues {
-    pub forwarded: Option<HeaderValue>,
-    pub x_forwarded_for: Option<HeaderValue>,
-    pub x_forwarded_proto: Option<HeaderValue>,
-    pub x_forwarded_host: Option<HeaderValue>,
-}
+// Re-export shared types so existing `spooky_bridge::h3_to_h2::*` imports keep working.
+pub use crate::{
+    BridgeError, ForwardedContext, ForwardedHeaderChains, ForwardedHeaderValues,
+    H3WebsocketRequestKind, build_forwarded_header_values, h3_websocket_request_kind,
+    h3_websocket_tunnel_requested, resolve_upstream_host_value,
+};
+use crate::{connection_header_tokens, should_strip_request_header};
 
 /// Build an HTTP/2 request with a pre-boxed streaming body.
 /// `content_length` is `Some(n)` only when the full length is known upfront
@@ -100,8 +77,17 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
     forwarded_ctx: ForwardedContext<'_>,
 ) -> Result<Request<BoxBody<Bytes, Infallible>>, BridgeError> {
     let method = Method::from_bytes(method.as_bytes()).map_err(|_| BridgeError::InvalidMethod)?;
-    let is_connect = method == Method::CONNECT;
-    let mut builder = Request::builder().method(method.clone());
+    let websocket_kind = h3_websocket_request_kind(method.as_str(), headers);
+    // Extended CONNECT is the H2 websocket path (RFC 8441).
+    let websocket_extended_connect = websocket_kind == H3WebsocketRequestKind::ExtendedConnect
+        || websocket_kind == H3WebsocketRequestKind::LegacyUpgrade;
+    let upstream_method = if websocket_extended_connect {
+        Method::CONNECT
+    } else {
+        method.clone()
+    };
+    let is_connect = upstream_method == Method::CONNECT;
+    let mut builder = Request::builder().method(upstream_method.clone());
     let connection_tokens = connection_header_tokens(headers);
     let mut host_from_headers: Option<String> = None;
     let mut forwarded_from_headers: Vec<Vec<u8>> = Vec::new();
@@ -132,7 +118,8 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
         }
 
         let header_name = HeaderName::from_bytes(name).map_err(|_| BridgeError::InvalidHeader)?;
-        if should_strip_request_header(&header_name, &connection_tokens) {
+        // H2 never preserves upgrade headers — extended CONNECT uses :protocol instead.
+        if should_strip_request_header(&header_name, &connection_tokens, false) {
             continue;
         }
 
@@ -152,7 +139,11 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
         host_from_headers.as_deref(),
     )?;
 
-    let uri = if is_connect {
+    let uri = if websocket_extended_connect {
+        let request_path = if path.is_empty() { "/" } else { path };
+        let uri = endpoint.uri_for_path(request_path);
+        Uri::try_from(uri).map_err(|_| BridgeError::InvalidUri)?
+    } else if is_connect {
         Uri::try_from(host_value).map_err(|_| BridgeError::InvalidUri)?
     } else {
         let request_path = if path.is_empty() { "/" } else { path };
@@ -160,10 +151,17 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
         Uri::try_from(uri).map_err(|_| BridgeError::InvalidUri)?
     };
     builder = builder.uri(uri);
-    builder = builder.header(http::header::HOST, host_value);
+    if websocket_extended_connect {
+        builder = builder
+            .version(Version::HTTP_2)
+            .extension(Protocol::from_static("websocket"));
+    } else {
+        builder = builder.header(http::header::HOST, host_value);
+    }
 
     if let Some(len) = content_length
         && len > 0
+        && !websocket_extended_connect
     {
         builder = builder.header(http::header::CONTENT_LENGTH, len);
     }
@@ -213,168 +211,7 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
         builder = builder.header(HeaderName::from_static("x-forwarded-host"), value);
     }
 
-    if endpoint.scheme() == BackendScheme::Http && !is_connect {
-        builder = builder.header(http::header::TE, "trailers");
-    }
-
     builder.body(body).map_err(BridgeError::Build)
-}
-
-pub fn resolve_upstream_host_value<'a>(
-    endpoint: &'a BackendEndpoint,
-    host_policy: &'a UpstreamHostPolicy,
-    request_authority: Option<&'a str>,
-    host_header: Option<&'a str>,
-) -> Result<&'a str, BridgeError> {
-    match host_policy.mode {
-        UpstreamHostPolicyMode::PassThrough => Ok(request_authority
-            .or(host_header)
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or(endpoint.authority())),
-        UpstreamHostPolicyMode::Rewrite => host_policy
-            .host
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(BridgeError::InvalidHeader),
-        UpstreamHostPolicyMode::Upstream => Ok(endpoint.authority()),
-    }
-}
-
-pub fn build_forwarded_header_values(
-    policy: &ForwardedHeaderPolicy,
-    inbound: ForwardedHeaderChains<'_>,
-    client_ip: IpAddr,
-    host_value: &str,
-) -> Result<ForwardedHeaderValues, BridgeError> {
-    let forwarded_current = format!(
-        "for={};proto=https;host=\"{}\"",
-        forwarded_for_value(client_ip),
-        escape_forwarded_host(host_value),
-    );
-    let x_forwarded_for_current = client_ip.to_string();
-    let x_forwarded_proto_current = "https";
-    let x_forwarded_host_current = host_value;
-
-    Ok(ForwardedHeaderValues {
-        forwarded: merge_forwarded_chain(
-            policy.mode,
-            inbound.forwarded,
-            Some(forwarded_current.as_bytes()),
-        )?,
-        x_forwarded_for: merge_forwarded_chain(
-            policy.mode,
-            inbound.x_forwarded_for,
-            Some(x_forwarded_for_current.as_bytes()),
-        )?,
-        x_forwarded_proto: merge_forwarded_chain(
-            policy.mode,
-            inbound.x_forwarded_proto,
-            Some(x_forwarded_proto_current.as_bytes()),
-        )?,
-        x_forwarded_host: merge_forwarded_chain(
-            policy.mode,
-            inbound.x_forwarded_host,
-            Some(x_forwarded_host_current.as_bytes()),
-        )?,
-    })
-}
-
-fn merge_forwarded_chain(
-    mode: ForwardedHeaderPolicyMode,
-    inbound: &[Vec<u8>],
-    current: Option<&[u8]>,
-) -> Result<Option<HeaderValue>, BridgeError> {
-    match mode {
-        ForwardedHeaderPolicyMode::Preserve => join_header_chain(inbound),
-        ForwardedHeaderPolicyMode::Append => {
-            let mut values = inbound.to_vec();
-            if let Some(current) = current {
-                values.push(current.to_vec());
-            }
-            join_header_chain(&values)
-        }
-        ForwardedHeaderPolicyMode::Overwrite => current
-            .map(HeaderValue::from_bytes)
-            .transpose()
-            .map_err(|_| BridgeError::InvalidHeader),
-    }
-}
-
-fn join_header_chain(values: &[Vec<u8>]) -> Result<Option<HeaderValue>, BridgeError> {
-    if values.is_empty() {
-        return Ok(None);
-    }
-
-    let mut joined = Vec::new();
-    for (index, value) in values.iter().enumerate() {
-        if index > 0 {
-            joined.extend_from_slice(b", ");
-        }
-        joined.extend_from_slice(value);
-    }
-
-    HeaderValue::from_bytes(&joined)
-        .map(Some)
-        .map_err(|_| BridgeError::InvalidHeader)
-}
-
-fn connection_header_tokens(headers: &[quiche::h3::Header]) -> HashSet<String> {
-    let mut tokens = HashSet::new();
-    for header in headers {
-        if !header.name().eq_ignore_ascii_case(b"connection") {
-            continue;
-        }
-        let Ok(value) = std::str::from_utf8(header.value()) else {
-            continue;
-        };
-        for token in value.split(',') {
-            let normalized = token.trim().to_ascii_lowercase();
-            if !normalized.is_empty() {
-                tokens.insert(normalized);
-            }
-        }
-    }
-    tokens
-}
-
-fn should_strip_request_header(name: &HeaderName, connection_tokens: &HashSet<String>) -> bool {
-    if connection_tokens.contains(name.as_str()) {
-        return true;
-    }
-
-    if name == http::header::CONTENT_LENGTH {
-        return true;
-    }
-
-    if name == http::header::CONNECTION
-        || name == http::header::PROXY_AUTHENTICATE
-        || name == http::header::PROXY_AUTHORIZATION
-        || name == http::header::TE
-        || name == http::header::TRAILER
-        || name == http::header::TRANSFER_ENCODING
-        || name == http::header::UPGRADE
-        || name.as_str().eq_ignore_ascii_case("keep-alive")
-        || name.as_str().eq_ignore_ascii_case("proxy-connection")
-        || name.as_str().eq_ignore_ascii_case("forwarded")
-        || name.as_str().eq_ignore_ascii_case("x-forwarded-for")
-        || name.as_str().eq_ignore_ascii_case("x-forwarded-proto")
-        || name.as_str().eq_ignore_ascii_case("x-forwarded-host")
-    {
-        return true;
-    }
-
-    false
-}
-
-fn forwarded_for_value(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(v4) => v4.to_string(),
-        IpAddr::V6(v6) => format!("\"[{}]\"", v6),
-    }
-}
-
-fn escape_forwarded_host(host: &str) -> String {
-    host.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(test)]
@@ -392,7 +229,8 @@ mod tests {
     };
 
     use super::{
-        ForwardedContext, build_h2_request, build_h2_request_for_endpoint_with_host_policy,
+        BridgeError, ForwardedContext, build_h2_request,
+        build_h2_request_for_endpoint_with_host_policy,
     };
 
     #[test]
@@ -469,7 +307,7 @@ mod tests {
         )
         .expect_err("invalid backend endpoint should fail");
 
-        assert!(matches!(err, crate::h3_to_h2::BridgeError::InvalidUri));
+        assert!(matches!(err, BridgeError::InvalidUri));
     }
 
     #[test]

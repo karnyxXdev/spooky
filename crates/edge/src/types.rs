@@ -672,9 +672,21 @@ pub struct QuicConnection {
     pub(crate) last_local_error_snapshot: Option<QuicConnectionErrorSnapshot>,
 }
 
-/// Result type returned by the in-flight H2 forwarding task.
-pub type ForwardResult =
-    Result<(http::StatusCode, http::HeaderMap, hyper::body::Incoming), ProxyError>;
+pub enum ForwardSuccess {
+    Response {
+        status: http::StatusCode,
+        headers: http::HeaderMap,
+        body: hyper::body::Incoming,
+    },
+    Tunnel {
+        status: http::StatusCode,
+        headers: http::HeaderMap,
+        response_chunk_rx: mpsc::Receiver<ResponseChunk>,
+    },
+}
+
+/// Result type returned by the in-flight upstream forwarding task.
+pub type ForwardResult = Result<ForwardSuccess, ProxyError>;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HedgeTelemetry {
@@ -700,7 +712,7 @@ pub struct UpstreamResult {
 pub enum StreamPhase {
     /// Still receiving request headers/body from the QUIC client.
     ReceivingRequest,
-    /// Request fully received; waiting for the upstream H2 response.
+    /// Request fully received; waiting for the upstream response.
     AwaitingUpstream,
     /// Upstream responded; streaming response back to the QUIC client.
     SendingResponse,
@@ -708,6 +720,13 @@ pub enum StreamPhase {
     Completed,
     /// Stream terminated with an error.
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelMode {
+    None,
+    Connect,
+    Websocket,
 }
 
 /// A chunk of the upstream response being streamed back to the client.
@@ -767,6 +786,7 @@ pub struct RequestEnvelope {
     pub start: Instant,
     pub total_request_deadline: Instant,
     pub bodyless_mode: bool,
+    pub tunnel_mode: TunnelMode,
 
     pub retry_count: u8,
     pub error_kind: Option<&'static str>,

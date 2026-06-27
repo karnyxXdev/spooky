@@ -55,6 +55,57 @@ fn http3_to_http2_preserves_response_trailers() {
 }
 
 #[test]
+fn bootstrap_http1_websocket_upgrade_preserves_switching_protocols_headers() {
+    if !local_listener_bind_available() {
+        return;
+    }
+    let dir = tempdir().expect("failed to create temp dir");
+    let (cert, key) = write_test_certs(&dir);
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let backend_addr = rt.block_on(start_h1_backend_with_websocket_upgrade());
+    let listen_port = find_free_tcp_port();
+    let config = make_config(
+        u32::from(listen_port),
+        format!("http://{backend_addr}"),
+        cert.clone(),
+        key,
+    );
+    let listener = make_listener_with_bootstrap(config);
+    let listen_addr = listener.socket.local_addr().unwrap();
+    let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
+
+    let bootstrap_addr = SocketAddr::new(listen_addr.ip(), listen_port);
+    let (status, headers) = rt
+        .block_on(run_bootstrap_h1_websocket_handshake(
+            bootstrap_addr,
+            &cert,
+            "/ws",
+        ))
+        .expect("bootstrap websocket handshake failed");
+
+    assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(
+        headers
+            .get(http::header::CONNECTION)
+            .and_then(|value| value.to_str().ok()),
+        Some("upgrade")
+    );
+    assert_eq!(
+        headers
+            .get(http::header::UPGRADE)
+            .and_then(|value| value.to_str().ok()),
+        Some("websocket")
+    );
+    assert_eq!(
+        headers
+            .get("sec-websocket-accept")
+            .and_then(|value| value.to_str().ok()),
+        Some("test-accept")
+    );
+}
+
+#[test]
 fn bootstrap_h2_preserves_response_trailers() {
     if !local_listener_bind_available() {
         return;
@@ -510,7 +561,7 @@ fn bootstrap_h2_head_suppresses_response_body() {
 }
 
 #[test]
-fn http3_rejects_upgrade_style_requests() {
+fn http3_websocket_upgrade_tunnels_to_http1_upstream() {
     if !local_listener_bind_available() {
         return;
     }
@@ -518,8 +569,8 @@ fn http3_rejects_upgrade_style_requests() {
     let (cert, key) = write_test_certs(&dir);
 
     let rt = tokio::runtime::Runtime::new().expect("runtime");
-    let backend_addr = rt.block_on(start_h2_backend());
-    let config = make_config(0, backend_addr.to_string(), cert, key);
+    let backend_addr = rt.block_on(start_h1_backend_with_websocket_upgrade());
+    let config = make_config(0, format!("http://{backend_addr}"), cert, key);
     let listener = QUICListener::new(config).expect("failed to create listener");
     let listen_addr = listener.socket.local_addr().unwrap();
     let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
@@ -530,25 +581,29 @@ fn http3_rejects_upgrade_style_requests() {
             quiche::h3::Header::new(b":method", b"GET"),
             quiche::h3::Header::new(b":scheme", b"https"),
             quiche::h3::Header::new(b":authority", b"localhost"),
-            quiche::h3::Header::new(b":path", b"/"),
+            quiche::h3::Header::new(b":path", b"/ws"),
             quiche::h3::Header::new(b"connection", b"Upgrade"),
             quiche::h3::Header::new(b"upgrade", b"websocket"),
+            quiche::h3::Header::new(b"sec-websocket-version", b"13"),
         ],
         true,
         Duration::from_secs(REQUEST_TIMEOUT_SECS),
     )
-    .expect("upgrade-style request failed");
+    .expect("websocket request failed");
 
-    assert_eq!(response.status, "400");
+    assert_eq!(response.status, "200");
     assert!(
-        String::from_utf8_lossy(&response.body).contains("Upgrade"),
-        "expected explicit Upgrade rejection body, got {:?}",
-        String::from_utf8_lossy(&response.body)
+        response.body.is_empty(),
+        "websocket handshake should not emit an HTTP body"
     );
     assert!(
-        !response.reset,
-        "upgrade rejection should be an HTTP response"
+        response.headers.iter().any(|(name, value)| name
+            .eq_ignore_ascii_case("sec-websocket-accept")
+            && value == "test-accept"),
+        "expected sec-websocket-accept header, got {:?}",
+        response.headers
     );
+    assert!(!response.reset, "websocket tunnel should complete cleanly");
 }
 
 #[test]

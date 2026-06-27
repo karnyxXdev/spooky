@@ -625,7 +625,7 @@ pub(crate) fn log_listener_startup(
         "Data-plane workers={} packet_shards_per_worker={} reuseport={} pin_workers={}",
         listener_groups
             .iter()
-            .map(|group| group_signature_worker_count(group))
+            .map(group_signature_worker_count)
             .sum::<usize>(),
         shard_count,
         runtime_config.performance.reuseport,

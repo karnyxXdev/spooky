@@ -566,6 +566,7 @@ impl QUICListener {
 }
 
 impl QUICListener {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_h3(
         connection: &mut QuicConnection,
         transport_pool: Arc<UpstreamTransportPool>,

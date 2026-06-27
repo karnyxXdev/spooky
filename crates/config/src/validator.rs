@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::net::IpAddr;
-use std::sync::{Mutex, OnceLock};
+use std::cell::RefCell;
 
 #[path = "validator/helpers.rs"]
 mod helpers;
@@ -71,31 +71,25 @@ impl fmt::Display for ValidationError {
 
 impl StdError for ValidationError {}
 
-static LAST_VALIDATION_ERROR: OnceLock<Mutex<Option<ValidationError>>> = OnceLock::new();
-
-fn validation_error_slot() -> &'static Mutex<Option<ValidationError>> {
-    LAST_VALIDATION_ERROR.get_or_init(|| Mutex::new(None))
+thread_local! {
+    static LAST_VALIDATION_ERROR: RefCell<Option<ValidationError>> = RefCell::new(None);
 }
 
 fn clear_validation_error() {
-    if let Ok(mut guard) = validation_error_slot().lock() {
-        *guard = None;
-    }
+    LAST_VALIDATION_ERROR.with(|slot| *slot.borrow_mut() = None);
 }
 
 fn record_validation_error(message: String) {
-    if let Ok(mut guard) = validation_error_slot().lock()
-        && guard.is_none()
-    {
-        *guard = Some(ValidationError::new(message));
-    }
+    LAST_VALIDATION_ERROR.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        if guard.is_none() {
+            *guard = Some(ValidationError::new(message));
+        }
+    });
 }
 
 fn take_validation_error() -> Option<ValidationError> {
-    validation_error_slot()
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.take())
+    LAST_VALIDATION_ERROR.with(|slot| slot.borrow_mut().take())
 }
 
 macro_rules! validation_error {

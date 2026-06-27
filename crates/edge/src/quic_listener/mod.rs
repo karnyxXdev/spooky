@@ -39,6 +39,7 @@ use rustls::{
 use rustls_pki_types::pem::PemObject;
 use serde_json::json;
 use socket2::{Domain, Protocol, Socket, Type};
+use spooky_bridge::h3_to_h1::build_h1_request_for_endpoint_with_host_policy;
 use spooky_bridge::h3_to_h2::{ForwardedContext, build_h2_request_for_endpoint_with_host_policy};
 use spooky_errors::{PoolError, ProxyError, is_retryable};
 use spooky_lb::{HealthFailureReason, HealthTransition, UpstreamPool};

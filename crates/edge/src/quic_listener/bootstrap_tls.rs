@@ -15,6 +15,7 @@ use hyper::service::service_fn;
 use hyper::upgrade;
 use hyper_util::rt::TokioIo;
 use log::{debug, error, info, warn};
+use spooky_bridge::h3_to_h1::build_h1_request_for_endpoint_with_host_policy;
 use spooky_bridge::h3_to_h2::{
     ForwardedContext, ForwardedHeaderChains, build_forwarded_header_values,
     build_h2_request_for_endpoint_with_host_policy, resolve_upstream_host_value,
@@ -617,24 +618,41 @@ impl QUICListener {
                                             )
                                         })
                                         .collect();
-                                    match build_h2_request_for_endpoint_with_host_policy(
-                                        &endpoint,
-                                        &upstream_policy.host.0,
-                                        &upstream_policy.forwarded_headers.0,
-                                        &method,
-                                        &path,
-                                        &bridge_headers,
-                                        BootstrapStreamingBody::new(req.into_body())
-                                            .map_err(|never| match never {})
-                                            .boxed(),
-                                        None,
-                                        ForwardedContext {
-                                            client_addr: peer,
-                                            request_authority: authority.as_deref(),
-                                            request_id,
-                                            traceparent: traceparent.as_deref(),
-                                        },
-                                    ) {
+                                    let bridge_body = BootstrapStreamingBody::new(req.into_body())
+                                        .map_err(|never| match never {})
+                                        .boxed();
+                                    let bridge_ctx = ForwardedContext {
+                                        client_addr: peer,
+                                        request_authority: authority.as_deref(),
+                                        request_id,
+                                        traceparent: traceparent.as_deref(),
+                                    };
+                                    let build_result = if endpoint.scheme() == BackendScheme::Http {
+                                        build_h1_request_for_endpoint_with_host_policy(
+                                            &endpoint,
+                                            &upstream_policy.host.0,
+                                            &upstream_policy.forwarded_headers.0,
+                                            &method,
+                                            &path,
+                                            &bridge_headers,
+                                            bridge_body,
+                                            None,
+                                            bridge_ctx,
+                                        )
+                                    } else {
+                                        build_h2_request_for_endpoint_with_host_policy(
+                                            &endpoint,
+                                            &upstream_policy.host.0,
+                                            &upstream_policy.forwarded_headers.0,
+                                            &method,
+                                            &path,
+                                            &bridge_headers,
+                                            bridge_body,
+                                            None,
+                                            bridge_ctx,
+                                        )
+                                    };
+                                    match build_result {
                                         Ok(request) => request,
                                         Err(err) => {
                                             warn!("Bootstrap request build failed: {}", err);

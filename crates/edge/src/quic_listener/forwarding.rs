@@ -20,23 +20,39 @@ impl ForwardRequestMeta {
         &self,
         endpoint: &BackendEndpoint,
     ) -> Result<Request<BoxBody<Bytes, std::convert::Infallible>>, ProxyError> {
-        build_h2_request_for_endpoint_with_host_policy(
-            endpoint,
-            &self.host_policy,
-            &self.forwarded_header_policy,
-            &self.method,
-            &self.path,
-            self.headers.as_slice(),
-            BoxBody::new(Full::new(Bytes::new())),
-            Some(0),
-            ForwardedContext {
-                client_addr: self.client_addr,
-                request_authority: self.authority.as_deref(),
-                request_id: self.request_id,
-                traceparent: self.traceparent.as_deref(),
-            },
-        )
-        .map_err(ProxyError::from)
+        let ctx = ForwardedContext {
+            client_addr: self.client_addr,
+            request_authority: self.authority.as_deref(),
+            request_id: self.request_id,
+            traceparent: self.traceparent.as_deref(),
+        };
+        if endpoint.scheme() == BackendScheme::Http {
+            build_h1_request_for_endpoint_with_host_policy(
+                endpoint,
+                &self.host_policy,
+                &self.forwarded_header_policy,
+                &self.method,
+                &self.path,
+                self.headers.as_slice(),
+                BoxBody::new(Full::new(Bytes::new())),
+                Some(0),
+                ctx,
+            )
+            .map_err(ProxyError::from)
+        } else {
+            build_h2_request_for_endpoint_with_host_policy(
+                endpoint,
+                &self.host_policy,
+                &self.forwarded_header_policy,
+                &self.method,
+                &self.path,
+                self.headers.as_slice(),
+                BoxBody::new(Full::new(Bytes::new())),
+                Some(0),
+                ctx,
+            )
+            .map_err(ProxyError::from)
+        }
     }
 }
 
@@ -158,7 +174,7 @@ impl QUICListener {
             request_headers.push(quiche::h3::Header::new(b"connection", b"upgrade"));
         }
 
-        let mut request = build_h2_request_for_endpoint_with_host_policy(
+        build_h1_request_for_endpoint_with_host_policy(
             endpoint,
             host_policy,
             forwarded_policy,
@@ -174,13 +190,7 @@ impl QUICListener {
                 traceparent,
             },
         )
-        .map_err(ProxyError::from)?;
-
-        let request_path = if path.is_empty() { "/" } else { path };
-        let path_uri = http::Uri::try_from(request_path)
-            .map_err(|_| ProxyError::Transport("invalid websocket request path".into()))?;
-        *request.uri_mut() = path_uri;
-        Ok(request)
+        .map_err(ProxyError::from)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1169,22 +1179,42 @@ impl QUICListener {
                                 .get(&upstream_name)
                                 .cloned()
                                 .unwrap_or_default();
-                            let request = match build_h2_request_for_endpoint_with_host_policy(
-                                &backend_endpoint,
-                                &upstream_policy.host.0,
-                                &upstream_policy.forwarded_headers.0,
-                                &method,
-                                &path,
-                                &list,
-                                boxed,
-                                None,
-                                ForwardedContext {
-                                    client_addr: connection.peer_address,
-                                    request_authority: authority.as_deref(),
-                                    request_id,
-                                    traceparent: traceparent.as_deref(),
-                                },
-                            ) {
+                            let build_result = if backend_endpoint.scheme() == BackendScheme::Http {
+                                build_h1_request_for_endpoint_with_host_policy(
+                                    &backend_endpoint,
+                                    &upstream_policy.host.0,
+                                    &upstream_policy.forwarded_headers.0,
+                                    &method,
+                                    &path,
+                                    &list,
+                                    boxed,
+                                    None,
+                                    ForwardedContext {
+                                        client_addr: connection.peer_address,
+                                        request_authority: authority.as_deref(),
+                                        request_id,
+                                        traceparent: traceparent.as_deref(),
+                                    },
+                                )
+                            } else {
+                                build_h2_request_for_endpoint_with_host_policy(
+                                    &backend_endpoint,
+                                    &upstream_policy.host.0,
+                                    &upstream_policy.forwarded_headers.0,
+                                    &method,
+                                    &path,
+                                    &list,
+                                    boxed,
+                                    None,
+                                    ForwardedContext {
+                                        client_addr: connection.peer_address,
+                                        request_authority: authority.as_deref(),
+                                        request_id,
+                                        traceparent: traceparent.as_deref(),
+                                    },
+                                )
+                            };
+                            let request = match build_result {
                                 Ok(request) => request,
                                 Err(err) => {
                                     drop(upstream_permit);

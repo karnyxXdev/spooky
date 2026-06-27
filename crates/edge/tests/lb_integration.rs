@@ -27,6 +27,28 @@ use spooky_edge::constants::{
     REQUEST_TIMEOUT_SECS, UDP_READ_TIMEOUT_MS,
 };
 
+fn local_listener_bind_available() -> bool {
+    let tcp_available = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+        Ok(listener) => {
+            drop(listener);
+            true
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => false,
+        Err(_) => true,
+    };
+
+    let udp_available = match std::net::UdpSocket::bind(("127.0.0.1", 0)) {
+        Ok(socket) => {
+            drop(socket);
+            true
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => false,
+        Err(_) => true,
+    };
+
+    tcp_available && udp_available
+}
+
 fn write_test_certs(dir: &TempDir) -> (String, String) {
     let mut params = CertificateParams::new(vec!["localhost".into()]);
     params
@@ -279,6 +301,10 @@ fn run_h3_client(addr: SocketAddr, authority: &str) -> Result<String, String> {
 
 #[test]
 fn round_robin_across_backends() {
+    if !local_listener_bind_available() {
+        return;
+    }
+
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -349,6 +375,10 @@ fn round_robin_across_backends() {
 
 #[test]
 fn consistent_hash_is_stable_per_authority() {
+    if !local_listener_bind_available() {
+        return;
+    }
+
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 

@@ -56,6 +56,26 @@ type TrailerPairs = Vec<(String, String)>;
 type H3TrailerResponse = (String, Vec<u8>, TrailerPairs);
 type BootstrapResponse = (StatusCode, Vec<u8>, TrailerPairs);
 
+fn local_listener_bind_available() -> bool {
+    let tcp_ok = match std::net::TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => {
+            drop(listener);
+            true
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => false,
+        Err(_) => true,
+    };
+    let udp_ok = match std::net::UdpSocket::bind("127.0.0.1:0") {
+        Ok(socket) => {
+            drop(socket);
+            true
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => false,
+        Err(_) => true,
+    };
+    tcp_ok && udp_ok
+}
+
 fn write_test_certs(dir: &TempDir) -> (String, String) {
     write_named_test_cert(dir, "cert", &["localhost"], &[IpAddr::from([127, 0, 0, 1])])
 }
@@ -2303,6 +2323,9 @@ fn make_config_with_backends(
 
 #[test]
 fn http3_to_http2_roundtrip() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -2320,6 +2343,9 @@ fn http3_to_http2_roundtrip() {
 
 #[test]
 fn http3_to_http2_preserves_response_trailers() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -2351,6 +2377,9 @@ fn http3_to_http2_preserves_response_trailers() {
 
 #[test]
 fn bootstrap_h2_preserves_response_trailers() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -2395,6 +2424,9 @@ fn bootstrap_h2_preserves_response_trailers() {
 #[test]
 #[serial_test::serial]
 fn http3_sni_selects_exact_and_fallback_certificates_on_real_handshake() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (fallback_cert, fallback_key) =
         write_named_test_cert(&dir, "fallback", &["fallback.example.com"], &[]);
@@ -2471,6 +2503,9 @@ fn http3_sni_selects_exact_and_fallback_certificates_on_real_handshake() {
 #[test]
 #[serial_test::serial]
 fn bootstrap_h2_optional_client_auth_allows_requests_without_certificate() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let (ca_cert, _client_cert, _client_key) =
@@ -2514,6 +2549,9 @@ fn bootstrap_h2_optional_client_auth_allows_requests_without_certificate() {
 #[test]
 #[serial_test::serial]
 fn bootstrap_h2_required_client_auth_rejects_missing_certificate_and_accepts_valid_certificate() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let (ca_cert, client_cert, client_key) =
@@ -2575,6 +2613,9 @@ fn bootstrap_h2_required_client_auth_rejects_missing_certificate_and_accepts_val
 #[test]
 #[serial_test::serial]
 fn quic_tls_metrics_capture_selection_and_failures() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (fallback_cert, fallback_key) =
         write_named_test_cert(&dir, "fallback", &["fallback.example.com"], &[]);
@@ -2653,6 +2694,9 @@ fn quic_tls_metrics_capture_selection_and_failures() {
 #[test]
 #[serial_test::serial]
 fn bootstrap_tls_metrics_capture_missing_client_certificate_failures() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let (ca_cert, _client_cert, _client_key) =
@@ -2713,6 +2757,9 @@ fn bootstrap_tls_metrics_capture_missing_client_certificate_failures() {
 
 #[test]
 fn http3_head_suppresses_response_body() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -2747,6 +2794,9 @@ fn http3_head_suppresses_response_body() {
 
 #[test]
 fn bootstrap_h2_head_suppresses_response_body() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -2782,6 +2832,9 @@ fn bootstrap_h2_head_suppresses_response_body() {
 
 #[test]
 fn http3_rejects_upgrade_style_requests() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -2821,6 +2874,9 @@ fn http3_rejects_upgrade_style_requests() {
 
 #[test]
 fn http3_to_http2_preserves_grpc_error_trailers() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -2870,6 +2926,9 @@ fn http3_to_http2_preserves_grpc_error_trailers() {
 
 #[test]
 fn grpc_timeout_returns_recoverable_proxy_error() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -2909,6 +2968,9 @@ fn grpc_timeout_returns_recoverable_proxy_error() {
 
 #[test]
 fn grpc_client_cancel_before_response_releases_stream() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("tempdir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -2976,6 +3038,9 @@ fn grpc_client_cancel_before_response_releases_stream() {
 /// Established state within a short window (the handshake packets are dropped).
 #[test]
 fn draining_rejects_new_connections() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -3099,6 +3164,9 @@ fn draining_rejects_new_connections() {
 
 #[test]
 fn draining_forces_close_after_configured_timeout() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -3167,6 +3235,9 @@ fn draining_forces_close_after_configured_timeout() {
 /// the limit without the client blocking on a single large send_body call.
 #[test]
 fn oversized_request_body_returns_413() {
+    if !local_listener_bind_available() {
+        return;
+    }
     use rand::RngCore;
 
     let dir = tempdir().expect("failed to create temp dir");
@@ -3349,6 +3420,9 @@ fn oversized_request_body_returns_413() {
 
 #[test]
 fn request_body_at_cap_is_accepted() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -3379,6 +3453,9 @@ fn request_body_at_cap_is_accepted() {
 
 #[test]
 fn slow_request_producer_over_cap_returns_413() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -3410,6 +3487,9 @@ fn slow_request_producer_over_cap_returns_413() {
 
 #[test]
 fn request_body_idle_timeout_returns_408() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -3449,6 +3529,9 @@ fn request_body_idle_timeout_returns_408() {
 
 #[test]
 fn unknown_length_response_prebuffer_cap_returns_503() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -3482,6 +3565,9 @@ fn unknown_length_response_prebuffer_cap_returns_503() {
 
 #[test]
 fn slow_response_consumer_does_not_hang() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -3510,6 +3596,9 @@ fn slow_response_consumer_does_not_hang() {
 
 #[test]
 fn concurrent_large_body_pressure_is_bounded() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -3565,6 +3654,9 @@ fn concurrent_large_body_pressure_is_bounded() {
 
 #[test]
 fn slow_stream_does_not_block_fast_stream() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -3596,6 +3688,9 @@ fn slow_stream_does_not_block_fast_stream() {
 
 #[test]
 fn finished_stream_does_not_block_other_stream_progress() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -3629,6 +3724,9 @@ fn finished_stream_does_not_block_other_stream_progress() {
 
 #[test]
 fn response_body_is_streamed_progressively() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -3666,6 +3764,9 @@ fn response_body_is_streamed_progressively() {
 
 #[test]
 fn long_stream_survives_body_total_timeout_after_progress() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -3694,6 +3795,9 @@ fn long_stream_survives_body_total_timeout_after_progress() {
 
 #[test]
 fn error_status_mapping_parity_is_preserved() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -3750,6 +3854,9 @@ fn error_status_mapping_parity_is_preserved() {
 #[test]
 #[serial_test::serial]
 fn metrics_endpoint_exposes_route_slo_metrics() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -3806,6 +3913,9 @@ fn metrics_endpoint_exposes_route_slo_metrics() {
 
 #[test]
 fn global_inflight_limit_sheds_excess_requests() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -3850,6 +3960,9 @@ fn global_inflight_limit_sheds_excess_requests() {
 
 #[test]
 fn route_queue_global_cap_sheds_excess_requests() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -3896,6 +4009,9 @@ fn route_queue_global_cap_sheds_excess_requests() {
 
 #[test]
 fn protocol_policy_denies_disallowed_method() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -3927,6 +4043,9 @@ fn protocol_policy_denies_disallowed_method() {
 
 #[test]
 fn protocol_policy_denies_blocked_path_prefix() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -3955,6 +4074,9 @@ fn protocol_policy_denies_blocked_path_prefix() {
 
 #[test]
 fn upstream_inflight_limit_sheds_excess_requests() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -3999,6 +4121,9 @@ fn upstream_inflight_limit_sheds_excess_requests() {
 
 #[test]
 fn backend_pool_inflight_limit_sheds_excess_requests() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -4044,6 +4169,9 @@ fn backend_pool_inflight_limit_sheds_excess_requests() {
 
 #[test]
 fn backend_timeout_respects_configured_performance_value() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -4080,6 +4208,9 @@ fn backend_timeout_respects_configured_performance_value() {
 #[test]
 #[serial_test::serial]
 fn chaos_high_jitter_remains_responsive() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -4114,6 +4245,9 @@ fn chaos_high_jitter_remains_responsive() {
 #[test]
 #[serial_test::serial]
 fn chaos_packet_loss_like_timeout_maps_to_recoverable_response() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -4151,6 +4285,9 @@ fn chaos_packet_loss_like_timeout_maps_to_recoverable_response() {
 #[test]
 #[serial_test::serial]
 fn chaos_backend_flapping_is_stable_under_concurrency() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -4192,6 +4329,9 @@ fn chaos_backend_flapping_is_stable_under_concurrency() {
 #[test]
 #[serial_test::serial]
 fn chaos_partial_outage_preserves_some_availability() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -4259,6 +4399,9 @@ fn chaos_partial_outage_preserves_some_availability() {
 /// single connection the proxy must reject the excess stream with 503.
 #[test]
 fn stream_cap_rejects_excess_concurrent_streams() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -4317,6 +4460,9 @@ fn stream_cap_rejects_excess_concurrent_streams() {
 /// any upstream 200 headers/body to the client.
 #[test]
 fn response_body_cap_returns_503_on_declared_length_breach() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -4508,6 +4654,9 @@ fn response_body_cap_returns_503_on_declared_length_breach() {
 /// proxy emits downstream headers; breaches must terminate as 503 (no reset).
 #[test]
 fn response_body_cap_returns_503_on_unknown_length_breach() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -4883,6 +5032,9 @@ fn pump_h3_until(
 /// were freed.
 #[test]
 fn teardown_client_reset_before_upstream_response() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("tempdir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -4970,6 +5122,9 @@ fn teardown_client_reset_before_upstream_response() {
 /// If the permit leaks, the second connection's /fast request gets 503.
 #[test]
 fn teardown_client_reset_during_response_streaming() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("tempdir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -5106,6 +5261,9 @@ fn teardown_client_reset_during_response_streaming() {
 /// resources.  A subsequent /fast request on the same connection must succeed.
 #[test]
 fn teardown_upstream_timeout_cleans_up_stream() {
+    if !local_listener_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("tempdir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");

@@ -72,7 +72,7 @@ impl fmt::Display for ValidationError {
 impl StdError for ValidationError {}
 
 thread_local! {
-    static LAST_VALIDATION_ERROR: RefCell<Option<ValidationError>> = RefCell::new(None);
+    static LAST_VALIDATION_ERROR: RefCell<Option<ValidationError>> = const { RefCell::new(None) };
 }
 
 fn clear_validation_error() {

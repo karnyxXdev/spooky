@@ -1,31 +1,26 @@
 use http_body_util::combinators::BoxBody;
 use hyper::Request;
 use hyper::body::Bytes;
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper_util::client::legacy::Client;
 use std::convert::Infallible;
 
 use crate::h2_client::{
-    DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_IDLE_PER_HOST, DEFAULT_POOL_IDLE_TIMEOUT,
-    SharedDnsResolver, TokioExecutor,
+    ConnectObserver, DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_IDLE_PER_HOST, DEFAULT_POOL_IDLE_TIMEOUT,
+    ObservedHttpConnector, SharedDnsResolver, TokioExecutor, build_observed_http_connector,
 };
 
 pub struct H1Client {
-    client: Client<HttpConnector<SharedDnsResolver>, BoxBody<Bytes, Infallible>>,
+    client: Client<ObservedHttpConnector, BoxBody<Bytes, Infallible>>,
 }
 
 impl Default for H1Client {
     fn default() -> Self {
-        let dns_resolver = SharedDnsResolver::new();
-        let mut http = HttpConnector::new_with_resolver(dns_resolver);
-        http.enforce_http(true);
-        http.set_connect_timeout(Some(DEFAULT_CONNECT_TIMEOUT));
-
-        let client = Client::builder(TokioExecutor)
-            .pool_max_idle_per_host(DEFAULT_MAX_IDLE_PER_HOST)
-            .pool_idle_timeout(DEFAULT_POOL_IDLE_TIMEOUT)
-            .build(http);
-
-        Self { client }
+        Self::new(
+            DEFAULT_MAX_IDLE_PER_HOST,
+            DEFAULT_POOL_IDLE_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
+            SharedDnsResolver::new(),
+        )
     }
 }
 
@@ -36,9 +31,24 @@ impl H1Client {
         connect_timeout: std::time::Duration,
         dns_resolver: SharedDnsResolver,
     ) -> Self {
-        let mut http = HttpConnector::new_with_resolver(dns_resolver);
-        http.enforce_http(true);
-        http.set_connect_timeout(Some(connect_timeout));
+        Self::new_with_observer(
+            max_idle_per_host,
+            pool_idle_timeout,
+            connect_timeout,
+            dns_resolver,
+            None,
+        )
+    }
+
+    pub fn new_with_observer(
+        max_idle_per_host: usize,
+        pool_idle_timeout: std::time::Duration,
+        connect_timeout: std::time::Duration,
+        dns_resolver: SharedDnsResolver,
+        connect_observer: Option<ConnectObserver>,
+    ) -> Self {
+        let http =
+            build_observed_http_connector(dns_resolver, true, connect_timeout, connect_observer);
 
         let client = Client::builder(TokioExecutor)
             .pool_max_idle_per_host(max_idle_per_host)

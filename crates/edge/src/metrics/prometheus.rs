@@ -618,7 +618,7 @@ impl Metrics {
         );
         out.push_str("# TYPE spooky_backend_client_rotations counter\n");
         out.push_str(
-            "# HELP spooky_backend_connect_attempt_total Observed backend send attempts grouped by backend identity, hostname, and retained resolved address.\n",
+            "# HELP spooky_backend_connect_attempt_total Observed upstream socket connects grouped by backend identity, hostname, and resolved address.\n",
         );
         out.push_str("# TYPE spooky_backend_connect_attempt_total counter\n");
         for (backend, state) in self.snapshot_backend_dns_state() {

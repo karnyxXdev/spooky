@@ -461,20 +461,13 @@ impl QUICListener {
         }
     }
 
-    fn record_backend_connect_attempt(
+    fn record_backend_connect(
         metrics: &Metrics,
-        backend_resolution_store: &RuntimeBackendResolutionStore,
         backend: &str,
+        hostname: &str,
+        resolved_addr: StdSocketAddr,
     ) {
-        if let Some(resolution) = backend_resolution_store.get(backend) {
-            metrics.record_backend_connect_attempt(
-                backend,
-                &resolution.authority_host,
-                &resolution.resolved_addrs,
-            );
-        } else {
-            metrics.record_backend_connect_attempt(backend, backend, &[]);
-        }
+        metrics.record_backend_connect(backend, hostname, resolved_addr);
     }
 
     pub fn build_shared_state(config: &RuntimeConfig) -> Result<SharedRuntimeState, ProxyError> {
@@ -610,11 +603,26 @@ impl QUICListener {
             }
         }
 
+        let mut route_labels = config.upstreams.keys().cloned().collect::<Vec<_>>();
+        route_labels.push("unrouted".to_string());
+        let routing_index = Arc::new(RouteIndex::from_upstreams(&config.upstreams_as_config()));
+        let metrics = Arc::new(Metrics::new(worker_slots, route_labels));
         let backend_dns_resolver = SharedDnsResolver::new();
         let backend_resolution_store =
             Arc::new(RuntimeBackendResolutionStore::new(backend_resolutions));
+        let connect_metrics = Arc::clone(&metrics);
+        let connect_observer: spooky_transport::h2_client::ConnectObserver = Arc::new(
+            move |observation: spooky_transport::h2_client::ConnectObservation| {
+                Self::record_backend_connect(
+                    &connect_metrics,
+                    &observation.backend,
+                    &observation.hostname,
+                    observation.resolved_addr,
+                );
+            },
+        );
         let transport_pool = Arc::new(
-            UpstreamTransportPool::new(
+            UpstreamTransportPool::new_with_observer(
                 backend_transports,
                 backend_tls_configs,
                 max_inflight_per_backend,
@@ -622,6 +630,7 @@ impl QUICListener {
                 Duration::from_millis(config.performance.h2_pool_idle_timeout_ms),
                 Duration::from_millis(config.performance.backend_connect_timeout_ms),
                 backend_dns_resolver.clone(),
+                Some(connect_observer),
             )
             .map_err(ProxyError::Tls)?,
         );
@@ -676,10 +685,6 @@ impl QUICListener {
             global_inflight_limit,
         ));
         let watchdog = Arc::new(WatchdogCoordinator::new(&config.resilience.watchdog));
-        let mut route_labels = config.upstreams.keys().cloned().collect::<Vec<_>>();
-        route_labels.push("unrouted".to_string());
-        let routing_index = Arc::new(RouteIndex::from_upstreams(&config.upstreams_as_config()));
-        let metrics = Arc::new(Metrics::new(worker_slots, route_labels));
         for (listener_label, inventory) in listener_tls_store.snapshot() {
             Self::update_listener_tls_expiry_metrics(&metrics, &listener_label, &inventory);
         }

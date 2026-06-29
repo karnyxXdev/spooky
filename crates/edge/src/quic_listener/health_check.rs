@@ -5,7 +5,7 @@ impl QUICListener {
         upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
         transport_pool: Arc<UpstreamTransportPool>,
         backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
-        backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
+        _backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
         metrics: Arc<Metrics>,
         task_registry: Arc<RuntimeTaskRegistry>,
     ) {
@@ -84,7 +84,7 @@ impl QUICListener {
 
         for (base_interval_ms, mut jobs) in grouped_jobs {
             let transport_pool = Arc::clone(&transport_pool);
-            let backend_resolution_store = Arc::clone(&backend_resolution_store);
+            let _backend_resolution_store = Arc::clone(&_backend_resolution_store);
             let task_metrics = Arc::clone(&metrics);
             let handle = handle.clone();
             let supervise_metrics = Arc::clone(&task_metrics);
@@ -115,11 +115,6 @@ impl QUICListener {
                                 Err(_) => continue,
                             };
 
-                            Self::record_backend_connect_attempt(
-                                &task_metrics,
-                                &backend_resolution_store,
-                                &job.backend_identity,
-                            );
                             let result = tokio::time::timeout(
                                 job.timeout,
                                 transport_pool.send(&job.backend_identity, request),

@@ -206,6 +206,7 @@ impl QUICListener {
         traceparent: Option<String>,
         mut body_rx: mpsc::Receiver<Bytes>,
         backend_timeout: Duration,
+        metrics: Arc<Metrics>,
     ) -> ForwardResult {
         let request = Self::build_http1_websocket_tunnel_request(
             &endpoint,
@@ -226,6 +227,14 @@ impl QUICListener {
         .await
         .map_err(|_| ProxyError::Timeout)?
         .map_err(|err| ProxyError::Transport(err.to_string()))?;
+        let resolved_addr = stream
+            .peer_addr()
+            .map_err(|err| ProxyError::Transport(err.to_string()))?;
+        metrics.record_backend_connect(
+            endpoint.authority(),
+            endpoint.authority_host(),
+            resolved_addr,
+        );
         let io = TokioIo::new(stream);
         let (mut sender, conn) = client_http1::handshake(io)
             .await
@@ -1246,8 +1255,7 @@ impl QUICListener {
                             let retry_budget = Arc::clone(&resilience.retry_budget);
                             let route_name = upstream_name.clone();
                             let backend_endpoints = Arc::clone(&backend_endpoints);
-                            let backend_resolutions = Arc::clone(&backend_resolution_store);
-                            let send_metrics = Arc::clone(&metrics);
+                            let _backend_resolutions = Arc::clone(&backend_resolution_store);
                             let allow_hedge = !is_tunnel_mode(tunnel_mode)
                                 && bodyless_mode
                                 && resilience.hedging_allowed_for(&method, &upstream_name, true);
@@ -1277,6 +1285,7 @@ impl QUICListener {
                             let path_for_upstream = path.clone();
                             let authority_for_upstream = authority.clone();
                             let traceparent_for_upstream = traceparent.clone();
+                            let upstream_metrics = Arc::clone(&metrics);
                             let fut = async move {
                                 let mut hedge_telemetry = crate::HedgeTelemetry::default();
                                 let mut retry_count: u8 = 0;
@@ -1291,19 +1300,12 @@ impl QUICListener {
                                             BoxBody<Bytes, std::convert::Infallible>,
                                         >,
                                          cb: Arc<crate::resilience::CircuitBreakers>,
-                                         transport: Arc<UpstreamTransportPool>,
-                                         metrics: Arc<Metrics>,
-                                         backend_resolutions: Arc<RuntimeBackendResolutionStore>| async move {
+                                         transport: Arc<UpstreamTransportPool>| async move {
                                             if !cb.allow_request(&backend) {
                                                 return Err(ProxyError::Pool(
                                                     PoolError::CircuitOpen(backend),
                                                 ));
                                             }
-                                            Self::record_backend_connect_attempt(
-                                                &metrics,
-                                                &backend_resolutions,
-                                                &backend,
-                                            );
                                             let send_result = tokio::time::timeout(
                                                 backend_timeout,
                                                 transport.send(&backend, req),
@@ -1335,6 +1337,7 @@ impl QUICListener {
                                             traceparent_for_upstream.clone(),
                                             body_rx,
                                             backend_timeout,
+                                            Arc::clone(&upstream_metrics),
                                         )
                                         .await?
                                     } else {
@@ -1359,8 +1362,6 @@ impl QUICListener {
                                                 request,
                                                 Arc::clone(&cb),
                                                 Arc::clone(&transport),
-                                                Arc::clone(&send_metrics),
-                                                Arc::clone(&backend_resolutions),
                                             );
                                             tokio::pin!(primary_fut);
                                             let hedge_sleep = tokio::time::sleep(hedge_delay);
@@ -1378,9 +1379,7 @@ impl QUICListener {
                                                     hedge_request,
                                                     Arc::clone(&cb),
                                                     Arc::clone(&transport),
-                                                    Arc::clone(&send_metrics),
-                                                    Arc::clone(&backend_resolutions),
-                                                );
+                                                        );
                                                 tokio::pin!(hedge_fut);
                                                 tokio::select! {
                                                     result = &mut primary_fut => {
@@ -1405,8 +1404,6 @@ impl QUICListener {
                                                 request,
                                                 Arc::clone(&cb),
                                                 Arc::clone(&transport),
-                                                Arc::clone(&send_metrics),
-                                                Arc::clone(&backend_resolutions),
                                             )
                                             .await?
                                         }
@@ -1416,8 +1413,6 @@ impl QUICListener {
                                             request,
                                             Arc::clone(&cb),
                                             Arc::clone(&transport),
-                                            Arc::clone(&send_metrics),
-                                            Arc::clone(&backend_resolutions),
                                         )
                                         .await
                                         {
@@ -1458,9 +1453,7 @@ impl QUICListener {
                                                         retry_request,
                                                         Arc::clone(&cb),
                                                         Arc::clone(&transport),
-                                                        Arc::clone(&send_metrics),
-                                                        Arc::clone(&backend_resolutions),
-                                                    )
+                                                                    )
                                                     .await?
                                                 } else {
                                                     return Err(primary_err);

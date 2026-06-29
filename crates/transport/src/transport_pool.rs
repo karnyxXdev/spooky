@@ -5,7 +5,7 @@ use hyper::Request;
 use hyper::body::{Bytes, Incoming};
 
 use crate::h1_pool::H1Pool;
-use crate::h2_client::{SharedDnsResolver, TlsClientConfig};
+use crate::h2_client::{ConnectObserver, SharedDnsResolver, TlsClientConfig};
 use crate::h2_pool::H2Pool;
 pub use spooky_errors::PoolError;
 
@@ -34,6 +34,31 @@ impl UpstreamTransportPool {
     where
         I: IntoIterator<Item = (String, BackendTransportKind)>,
     {
+        Self::new_with_observer(
+            backends,
+            backend_tls,
+            max_inflight,
+            max_idle_per_backend,
+            pool_idle_timeout,
+            connect_timeout,
+            dns_resolver,
+            None,
+        )
+    }
+
+    pub fn new_with_observer<I>(
+        backends: I,
+        backend_tls: HashMap<String, TlsClientConfig>,
+        max_inflight: usize,
+        max_idle_per_backend: usize,
+        pool_idle_timeout: Duration,
+        connect_timeout: Duration,
+        dns_resolver: SharedDnsResolver,
+        connect_observer: Option<ConnectObserver>,
+    ) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = (String, BackendTransportKind)>,
+    {
         let mut backend_kinds = HashMap::new();
         let mut h1_backends = Vec::new();
         let mut h2_backends = Vec::new();
@@ -46,15 +71,16 @@ impl UpstreamTransportPool {
             }
         }
 
-        let h1_pool = H1Pool::new(
+        let h1_pool = H1Pool::new_with_observer(
             h1_backends,
             max_inflight,
             max_idle_per_backend,
             pool_idle_timeout,
             connect_timeout,
             dns_resolver.clone(),
+            connect_observer.clone(),
         );
-        let h2_pool = H2Pool::new(
+        let h2_pool = H2Pool::new_with_observer(
             h2_backends,
             backend_tls,
             max_inflight,
@@ -62,6 +88,7 @@ impl UpstreamTransportPool {
             pool_idle_timeout,
             connect_timeout,
             dns_resolver,
+            connect_observer,
         )?;
 
         Ok(Self {

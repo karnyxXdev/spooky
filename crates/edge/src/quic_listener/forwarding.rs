@@ -324,6 +324,14 @@ impl QUICListener {
         )
     }
 
+    fn request_metrics_outcome_for_status(status: StatusCode) -> (bool, RouteOutcome) {
+        if status.is_server_error() {
+            (false, RouteOutcome::Failure)
+        } else {
+            (true, RouteOutcome::Success)
+        }
+    }
+
     pub(super) fn pick_alternate_backend(
         upstream_pool: &Arc<RwLock<UpstreamPool>>,
         primary_index: usize,
@@ -2424,7 +2432,7 @@ impl QUICListener {
                             }
                         }
 
-                        // Update health/metrics for successful upstream response.
+                        // Update health/metrics for upstream response.
                         if let Some(req) = streams.get(&stream_id) {
                             if let (Some(addr), Some(idx)) = (&req.backend_addr, req.backend_index)
                                 && let Some(pool) = req.upstream_pool.as_ref()
@@ -2447,13 +2455,15 @@ impl QUICListener {
                                     Self::log_health_transition(addr, t);
                                 }
                             }
-                            metrics.inc_success();
+                            let (is_success, route_outcome) =
+                                Self::request_metrics_outcome_for_status(status);
+                            if is_success {
+                                metrics.inc_success();
+                            } else {
+                                metrics.inc_failure();
+                            }
                             let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
-                            metrics.record_route(
-                                route_label,
-                                req.start.elapsed(),
-                                RouteOutcome::Success,
-                            );
+                            metrics.record_route(route_label, req.start.elapsed(), route_outcome);
                             resilience
                                 .adaptive_admission
                                 .observe(req.start.elapsed(), false);
@@ -3047,6 +3057,28 @@ mod tests {
             QUICListener::classify_upstream_failure_reason(false, "request timed out"),
             (HealthFailureReason::Timeout, "timeout")
         );
+    }
+
+    #[test]
+    fn request_metrics_treat_server_error_as_failure() {
+        let (is_success, route_outcome) =
+            QUICListener::request_metrics_outcome_for_status(StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!is_success);
+        match route_outcome {
+            RouteOutcome::Failure => {}
+            _ => panic!("unexpected route outcome"),
+        }
+    }
+
+    #[test]
+    fn request_metrics_treat_success_response_as_success() {
+        let (is_success, route_outcome) =
+            QUICListener::request_metrics_outcome_for_status(StatusCode::OK);
+        assert!(is_success);
+        match route_outcome {
+            RouteOutcome::Success => {}
+            _ => panic!("unexpected route outcome"),
+        }
     }
 
     #[derive(Debug)]

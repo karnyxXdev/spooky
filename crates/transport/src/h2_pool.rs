@@ -68,6 +68,7 @@ impl H2Pool {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_observer<I>(
         backends: I,
         backend_tls: HashMap<String, TlsClientConfig>,

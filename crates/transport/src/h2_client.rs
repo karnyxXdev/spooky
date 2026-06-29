@@ -347,17 +347,6 @@ where
     addrs
 }
 
-fn default_tls_config() -> ClientConfig {
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let mut cfg = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    cfg.enable_sni = true;
-    cfg
-}
-
 fn build_tls_config(tls: &TlsClientConfig) -> Result<ClientConfig, String> {
     if !tls.verify_certificates {
         warn!(

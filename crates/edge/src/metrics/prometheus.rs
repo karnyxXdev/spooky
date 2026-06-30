@@ -649,6 +649,61 @@ impl Metrics {
             ));
         }
         out.push_str(
+            "# HELP spooky_upstream_requests_total Total completed requests grouped by upstream, status class, and outcome.\n",
+        );
+        out.push_str("# TYPE spooky_upstream_requests_total counter\n");
+        for (key, count) in self.snapshot_upstream_request_counts() {
+            out.push_str(&format!(
+                "spooky_upstream_requests_total{{upstream=\"{}\",status_class=\"{}\",outcome=\"{}\"}} {}\n",
+                escape_prometheus_label(&key.upstream),
+                escape_prometheus_label(&key.status_class),
+                escape_prometheus_label(&key.outcome),
+                count
+            ));
+        }
+        out.push_str(
+            "# HELP spooky_backend_requests_total Total completed requests grouped by upstream, backend, status class, and outcome.\n",
+        );
+        out.push_str("# TYPE spooky_backend_requests_total counter\n");
+        for (key, count) in self.snapshot_backend_request_counts() {
+            out.push_str(&format!(
+                "spooky_backend_requests_total{{upstream=\"{}\",backend=\"{}\",status_class=\"{}\",outcome=\"{}\"}} {}\n",
+                escape_prometheus_label(&key.upstream),
+                escape_prometheus_label(&key.backend),
+                escape_prometheus_label(&key.status_class),
+                escape_prometheus_label(&key.outcome),
+                count
+            ));
+        }
+        out.push_str(
+            "# HELP spooky_upstream_request_latency_ms Upstream request latency histogram grouped by upstream and final outcome.\n",
+        );
+        out.push_str("# TYPE spooky_upstream_request_latency_ms histogram\n");
+        for (key, stats) in self.snapshot_upstream_request_latency() {
+            let upstream = escape_prometheus_label(&key.upstream);
+            let outcome = escape_prometheus_label(&key.outcome);
+            let mut cumulative = 0u64;
+            for (idx, bucket_value) in stats.latency_buckets.iter().enumerate() {
+                cumulative = cumulative.saturating_add(*bucket_value);
+                let le = LATENCY_BUCKETS_MS
+                    .get(idx)
+                    .map(u64::to_string)
+                    .unwrap_or_else(|| "+Inf".to_string());
+                out.push_str(&format!(
+                    "spooky_upstream_request_latency_ms_bucket{{upstream=\"{}\",outcome=\"{}\",le=\"{}\"}} {}\n",
+                    upstream, outcome, le, cumulative
+                ));
+            }
+            out.push_str(&format!(
+                "spooky_upstream_request_latency_ms_sum{{upstream=\"{}\",outcome=\"{}\"}} {}\n",
+                upstream, outcome, stats.latency_ms_sum
+            ));
+            out.push_str(&format!(
+                "spooky_upstream_request_latency_ms_count{{upstream=\"{}\",outcome=\"{}\"}} {}\n",
+                upstream, outcome, stats.count
+            ));
+        }
+        out.push_str(
             "# HELP spooky_route_latency_sample_every Route latency histogram sampling interval (1 = every request).\n",
         );
         out.push_str("# TYPE spooky_route_latency_sample_every gauge\n");

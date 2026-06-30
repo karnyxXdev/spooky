@@ -432,6 +432,21 @@ impl QUICListener {
         }
     }
 
+    fn record_request_observation(
+        metrics: &Metrics,
+        req: &RequestEnvelope,
+        status: Option<u16>,
+        outcome: RouteOutcome,
+    ) {
+        metrics.record_request_result(
+            req.upstream_name.as_deref().unwrap_or("unrouted"),
+            req.backend_addr.as_deref(),
+            status,
+            outcome,
+            req.start.elapsed(),
+        );
+    }
+
     /// Handle an already-resolved `ForwardResult`, applying health transitions
     /// and sending the H3 response.
     #[allow(clippy::too_many_arguments)]
@@ -455,6 +470,16 @@ impl QUICListener {
             _ => {
                 metrics.inc_failure();
                 metrics.record_route(route_label, start.elapsed(), RouteOutcome::Failure);
+                Self::record_request_observation(
+                    metrics,
+                    req,
+                    Some(if req.method.is_empty() || req.path.is_empty() {
+                        http::StatusCode::BAD_REQUEST.as_u16()
+                    } else {
+                        http::StatusCode::SERVICE_UNAVAILABLE.as_u16()
+                    }),
+                    RouteOutcome::Failure,
+                );
                 return Self::send_simple_response(
                     h3,
                     quic,
@@ -483,6 +508,12 @@ impl QUICListener {
                 metrics.inc_failure();
                 metrics.inc_backend_error();
                 metrics.record_route(route_label, start.elapsed(), RouteOutcome::BackendError);
+                Self::record_request_observation(
+                    metrics,
+                    req,
+                    Some(http::StatusCode::BAD_GATEWAY.as_u16()),
+                    RouteOutcome::BackendError,
+                );
                 Self::send_simple_response(
                     h3,
                     quic,
@@ -495,6 +526,12 @@ impl QUICListener {
                 error!("Bridge error: {:?}", err);
                 metrics.inc_failure();
                 metrics.record_route(route_label, start.elapsed(), RouteOutcome::Failure);
+                Self::record_request_observation(
+                    metrics,
+                    req,
+                    Some(http::StatusCode::BAD_REQUEST.as_u16()),
+                    RouteOutcome::Failure,
+                );
                 Self::log_access(req, 400);
                 Self::send_simple_response(
                     h3,
@@ -513,6 +550,12 @@ impl QUICListener {
                     metrics.inc_overload_shed_reason(OverloadShedReason::BackendInflight);
                 }
                 metrics.record_route(route_label, start.elapsed(), RouteOutcome::OverloadShed);
+                Self::record_request_observation(
+                    metrics,
+                    req,
+                    Some(http::StatusCode::SERVICE_UNAVAILABLE.as_u16()),
+                    RouteOutcome::OverloadShed,
+                );
                 Self::log_access(req, 503);
                 Self::send_overload_response(
                     h3,
@@ -527,6 +570,12 @@ impl QUICListener {
                 metrics.inc_circuit_breaker_rejected();
                 metrics.inc_overload_shed_reason(OverloadShedReason::CircuitOpen);
                 metrics.record_route(route_label, start.elapsed(), RouteOutcome::OverloadShed);
+                Self::record_request_observation(
+                    metrics,
+                    req,
+                    Some(http::StatusCode::SERVICE_UNAVAILABLE.as_u16()),
+                    RouteOutcome::OverloadShed,
+                );
                 Self::log_access(req, 503);
                 Self::send_overload_response(
                     h3,
@@ -559,6 +608,12 @@ impl QUICListener {
                 metrics.inc_failure();
                 metrics.inc_backend_error();
                 metrics.record_route(route_label, start.elapsed(), RouteOutcome::BackendError);
+                Self::record_request_observation(
+                    metrics,
+                    req,
+                    Some(http::StatusCode::BAD_GATEWAY.as_u16()),
+                    RouteOutcome::BackendError,
+                );
                 Self::log_access(req, 502);
                 Self::send_simple_response(
                     h3,
@@ -588,6 +643,12 @@ impl QUICListener {
                 metrics.inc_failure();
                 metrics.inc_backend_error();
                 metrics.record_route(route_label, start.elapsed(), RouteOutcome::BackendError);
+                Self::record_request_observation(
+                    metrics,
+                    req,
+                    Some(http::StatusCode::BAD_GATEWAY.as_u16()),
+                    RouteOutcome::BackendError,
+                );
                 Self::log_access(req, 502);
                 Self::send_simple_response(
                     h3,
@@ -612,6 +673,12 @@ impl QUICListener {
                 metrics.inc_failure();
                 metrics.inc_backend_error();
                 metrics.record_route(route_label, start.elapsed(), RouteOutcome::BackendError);
+                Self::record_request_observation(
+                    metrics,
+                    req,
+                    Some(http::StatusCode::BAD_GATEWAY.as_u16()),
+                    RouteOutcome::BackendError,
+                );
                 Self::log_access(req, 502);
                 Self::send_simple_response(
                     h3,
@@ -626,6 +693,12 @@ impl QUICListener {
                 metrics.inc_failure();
                 metrics.inc_backend_error();
                 metrics.record_route(route_label, start.elapsed(), RouteOutcome::BackendError);
+                Self::record_request_observation(
+                    metrics,
+                    req,
+                    Some(http::StatusCode::BAD_GATEWAY.as_u16()),
+                    RouteOutcome::BackendError,
+                );
                 Self::log_access(req, 502);
                 Self::send_simple_response(
                     h3,
@@ -649,6 +722,12 @@ impl QUICListener {
                 metrics.inc_failure();
                 metrics.inc_timeout();
                 metrics.record_route(route_label, start.elapsed(), RouteOutcome::Timeout);
+                Self::record_request_observation(
+                    metrics,
+                    req,
+                    Some(http::StatusCode::SERVICE_UNAVAILABLE.as_u16()),
+                    RouteOutcome::Timeout,
+                );
                 Self::log_access(req, 503);
                 Self::send_simple_response(
                     h3,
@@ -663,6 +742,12 @@ impl QUICListener {
                 metrics.inc_health_failure(HealthFailureReason::Tls);
                 metrics.inc_failure();
                 metrics.record_route(route_label, start.elapsed(), RouteOutcome::Failure);
+                Self::record_request_observation(
+                    metrics,
+                    req,
+                    Some(http::StatusCode::INTERNAL_SERVER_ERROR.as_u16()),
+                    RouteOutcome::Failure,
+                );
                 Self::log_access(req, 500);
                 Self::send_simple_response(
                     h3,
@@ -2464,6 +2549,12 @@ impl QUICListener {
                             }
                             let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
                             metrics.record_route(route_label, req.start.elapsed(), route_outcome);
+                            Self::record_request_observation(
+                                metrics,
+                                req,
+                                Some(status.as_u16()),
+                                route_outcome,
+                            );
                             resilience
                                 .adaptive_admission
                                 .observe(req.start.elapsed(), false);
@@ -2564,6 +2655,12 @@ impl QUICListener {
                                         req.start.elapsed(),
                                         RouteOutcome::BackendError,
                                     );
+                                    Self::record_request_observation(
+                                        metrics,
+                                        req,
+                                        Some(status.as_u16()),
+                                        RouteOutcome::BackendError,
+                                    );
                                     resilience
                                         .adaptive_admission
                                         .observe(req.start.elapsed(), true);
@@ -2593,6 +2690,12 @@ impl QUICListener {
                                     metrics.record_route(
                                         route_label,
                                         req.start.elapsed(),
+                                        RouteOutcome::BackendError,
+                                    );
+                                    Self::record_request_observation(
+                                        metrics,
+                                        req,
+                                        req.response_status,
                                         RouteOutcome::BackendError,
                                     );
                                     resilience
@@ -2635,6 +2738,12 @@ impl QUICListener {
                                         req.start.elapsed(),
                                         RouteOutcome::BackendError,
                                     );
+                                    Self::record_request_observation(
+                                        metrics,
+                                        req,
+                                        req.response_status,
+                                        RouteOutcome::BackendError,
+                                    );
                                     resilience
                                         .adaptive_admission
                                         .observe(req.start.elapsed(), true);
@@ -2666,6 +2775,12 @@ impl QUICListener {
                                 metrics.record_route(
                                     route_label,
                                     req.start.elapsed(),
+                                    RouteOutcome::BackendError,
+                                );
+                                Self::record_request_observation(
+                                    metrics,
+                                    req,
+                                    req.response_status,
                                     RouteOutcome::BackendError,
                                 );
                                 resilience
@@ -2722,6 +2837,14 @@ impl QUICListener {
                                         req.start.elapsed(),
                                         RouteOutcome::Timeout,
                                     );
+                                    Self::record_request_observation(
+                                        metrics,
+                                        req,
+                                        req.response_status.or(Some(
+                                            http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                                        )),
+                                        RouteOutcome::Timeout,
+                                    );
                                     resilience
                                         .adaptive_admission
                                         .observe(req.start.elapsed(), true);
@@ -2752,6 +2875,14 @@ impl QUICListener {
                                         req.start.elapsed(),
                                         RouteOutcome::OverloadShed,
                                     );
+                                    Self::record_request_observation(
+                                        metrics,
+                                        req,
+                                        req.response_status.or(Some(
+                                            http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                                        )),
+                                        RouteOutcome::OverloadShed,
+                                    );
                                     resilience
                                         .adaptive_admission
                                         .observe(req.start.elapsed(), true);
@@ -2769,6 +2900,13 @@ impl QUICListener {
                                     metrics.record_route(
                                         route_label,
                                         req.start.elapsed(),
+                                        RouteOutcome::BackendError,
+                                    );
+                                    Self::record_request_observation(
+                                        metrics,
+                                        req,
+                                        req.response_status
+                                            .or(Some(http::StatusCode::BAD_GATEWAY.as_u16())),
                                         RouteOutcome::BackendError,
                                     );
                                     resilience

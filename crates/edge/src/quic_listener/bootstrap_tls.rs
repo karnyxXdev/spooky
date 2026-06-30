@@ -156,9 +156,16 @@ impl QUICListener {
 
         spawn_supervised_async_task(&handle, "bootstrap-tls-listener", None, async move {
             info!(
-                "Bootstrap TLS listener on https://{} (TCP+TLS) — advertising Alt-Svc: {} (max_connections={}, connection_timeout_ms={})",
+                "Bootstrap TLS listener ready bind=https://{} protocol=tcp+tls",
                 bind,
-                alt_svc_value,
+            );
+            info!(
+                "Bootstrap TLS listener alt_svc bind={} value={}",
+                bind, alt_svc_value,
+            );
+            info!(
+                "Bootstrap TLS listener limits bind={} max_connections={} connection_timeout_ms={}",
+                bind,
                 max_connections,
                 connection_timeout.as_millis()
             );

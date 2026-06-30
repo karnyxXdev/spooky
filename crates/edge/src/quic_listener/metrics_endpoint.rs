@@ -111,9 +111,12 @@ impl QUICListener {
                         match Self::bind_tcp_listener(&desired_bind, None, "metrics endpoint") {
                             Ok(listener) => {
                                 info!(
-                                    "Metrics endpoint listening on http://{}{} (max_connections={}, connection_timeout_ms={})",
+                                    "Metrics endpoint ready bind=http://{}{}",
+                                    desired_bind, endpoint.path,
+                                );
+                                info!(
+                                    "Metrics endpoint limits bind={} max_connections={} connection_timeout_ms={}",
                                     desired_bind,
-                                    endpoint.path,
                                     endpoint.max_connections.max(1),
                                     endpoint.connection_timeout_ms.max(1)
                                 );

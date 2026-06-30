@@ -15,6 +15,7 @@ use std::{
 
 use http_body_util::combinators::BoxBody;
 use hyper::body::Bytes;
+use hyper::http::Uri;
 use hyper::{Request, rt::Executor};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{
@@ -24,6 +25,7 @@ use hyper_util::client::legacy::{
         dns::{GaiResolver, Name},
     },
 };
+use hyper_util::rt::TokioIo;
 
 use log::warn;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -59,6 +61,15 @@ pub(crate) const DEFAULT_MAX_IDLE_PER_HOST: usize = 64;
 pub(crate) const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[derive(Debug, Clone)]
+pub struct ConnectObservation {
+    pub backend: String,
+    pub hostname: String,
+    pub resolved_addr: SocketAddr,
+}
+
+pub type ConnectObserver = Arc<dyn Fn(ConnectObservation) + Send + Sync>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsCacheUpdate {
     pub host: String,
@@ -80,6 +91,66 @@ impl DnsCacheUpdate {
 pub struct SharedDnsResolver {
     cache: Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>,
     fallback: GaiResolver,
+}
+
+#[derive(Clone)]
+pub(crate) struct ObservedHttpConnector {
+    inner: HttpConnector<SharedDnsResolver>,
+    observer: Option<ConnectObserver>,
+}
+
+impl ObservedHttpConnector {
+    fn new(inner: HttpConnector<SharedDnsResolver>, observer: Option<ConnectObserver>) -> Self {
+        Self { inner, observer }
+    }
+}
+
+pub(crate) fn build_observed_http_connector(
+    dns_resolver: SharedDnsResolver,
+    enforce_http: bool,
+    connect_timeout: Duration,
+    connect_observer: Option<ConnectObserver>,
+) -> ObservedHttpConnector {
+    let mut http = HttpConnector::new_with_resolver(dns_resolver);
+    http.enforce_http(enforce_http);
+    http.set_connect_timeout(Some(connect_timeout));
+    ObservedHttpConnector::new(http, connect_observer)
+}
+
+impl Service<Uri> for ObservedHttpConnector {
+    type Response = TokioIo<tokio::net::TcpStream>;
+    type Error = <HttpConnector<SharedDnsResolver> as Service<Uri>>::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, dst: Uri) -> Self::Future {
+        let mut inner = self.inner.clone();
+        let observer = self.observer.clone();
+        Box::pin(async move {
+            let stream = inner.call(dst.clone()).await?;
+            if let Some(observer) = observer
+                && let Ok(resolved_addr) = stream.inner().peer_addr()
+            {
+                let backend = dst
+                    .authority()
+                    .map(|authority: &hyper::http::uri::Authority| authority.as_str().to_string())
+                    .unwrap_or_else(|| dst.to_string());
+                let hostname = dst
+                    .host()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| backend.clone());
+                observer(ConnectObservation {
+                    backend,
+                    hostname,
+                    resolved_addr,
+                });
+            }
+            Ok(stream)
+        })
+    }
 }
 
 impl SharedDnsResolver {
@@ -170,29 +241,21 @@ impl Service<Name> for SharedDnsResolver {
 }
 
 pub struct H2Client {
-    client: Client<HttpsConnector<HttpConnector<SharedDnsResolver>>, BoxBody<Bytes, Infallible>>,
+    client: Client<HttpsConnector<ObservedHttpConnector>, BoxBody<Bytes, Infallible>>,
 }
 
 impl Default for H2Client {
     fn default() -> Self {
-        let dns_resolver = SharedDnsResolver::new();
-        let mut http = HttpConnector::new_with_resolver(dns_resolver);
-        http.enforce_http(false);
-        http.set_connect_timeout(Some(DEFAULT_CONNECT_TIMEOUT));
-
-        let https = HttpsConnectorBuilder::new()
-            .with_tls_config(default_tls_config())
-            .https_or_http()
-            .enable_http2()
-            .wrap_connector(http);
-
-        let client = Client::builder(TokioExecutor)
-            .http2_only(true)
-            .pool_max_idle_per_host(DEFAULT_MAX_IDLE_PER_HOST)
-            .pool_idle_timeout(DEFAULT_POOL_IDLE_TIMEOUT)
-            .build(https);
-
-        Self { client }
+        // infallible: default TLS config uses well-known roots and no custom certs
+        #[allow(clippy::expect_used)]
+        Self::new(
+            DEFAULT_MAX_IDLE_PER_HOST,
+            DEFAULT_POOL_IDLE_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
+            TlsClientConfig::default(),
+            SharedDnsResolver::new(),
+        )
+        .expect("default H2 client should build")
     }
 }
 
@@ -217,9 +280,26 @@ impl H2Client {
         tls: TlsClientConfig,
         dns_resolver: SharedDnsResolver,
     ) -> Result<Self, String> {
-        let mut http = HttpConnector::new_with_resolver(dns_resolver);
-        http.enforce_http(false);
-        http.set_connect_timeout(Some(connect_timeout));
+        Self::new_with_observer(
+            max_idle_per_host,
+            pool_idle_timeout,
+            connect_timeout,
+            tls,
+            dns_resolver,
+            None,
+        )
+    }
+
+    pub fn new_with_observer(
+        max_idle_per_host: usize,
+        pool_idle_timeout: Duration,
+        connect_timeout: Duration,
+        tls: TlsClientConfig,
+        dns_resolver: SharedDnsResolver,
+        connect_observer: Option<ConnectObserver>,
+    ) -> Result<Self, String> {
+        let http =
+            build_observed_http_connector(dns_resolver, false, connect_timeout, connect_observer);
 
         let tls_config = build_tls_config(&tls)?;
         let https = HttpsConnectorBuilder::new()
@@ -267,17 +347,6 @@ where
     addrs.sort_unstable();
     addrs.dedup();
     addrs
-}
-
-fn default_tls_config() -> ClientConfig {
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let mut cfg = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    cfg.enable_sni = true;
-    cfg
 }
 
 fn build_tls_config(tls: &TlsClientConfig) -> Result<ClientConfig, String> {

@@ -207,13 +207,15 @@ mod tests {
         );
         metrics.inc_backend_dns_refresh_failure();
         metrics.inc_backend_client_rotation("backend.internal:443");
-        metrics.record_backend_connect_attempt(
+        metrics.record_backend_connect(
             "backend.internal:443",
             "backend.internal",
-            &[
-                "10.0.0.10:443".parse().expect("addr one"),
-                "10.0.0.11:443".parse().expect("addr two"),
-            ],
+            "10.0.0.10:443".parse().expect("addr one"),
+        );
+        metrics.record_backend_connect(
+            "backend.internal:443",
+            "backend.internal",
+            "10.0.0.11:443".parse().expect("addr two"),
         );
 
         let output = metrics.render_prometheus();

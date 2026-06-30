@@ -11,7 +11,7 @@ use hyper::body::{Bytes, Incoming};
 use tokio::sync::{Semaphore, TryAcquireError};
 
 use crate::h1_client::H1Client;
-use crate::h2_client::SharedDnsResolver;
+use crate::h2_client::{ConnectObserver, SharedDnsResolver};
 pub use spooky_errors::PoolError;
 
 struct BackendClientState {
@@ -29,6 +29,7 @@ pub struct H1Pool {
     pool_idle_timeout: Duration,
     connect_timeout: Duration,
     dns_resolver: SharedDnsResolver,
+    connect_observer: Option<ConnectObserver>,
 }
 
 impl H1Pool {
@@ -43,15 +44,39 @@ impl H1Pool {
     where
         I: IntoIterator<Item = String>,
     {
+        Self::new_with_observer(
+            backends,
+            max_inflight,
+            max_idle_per_backend,
+            pool_idle_timeout,
+            connect_timeout,
+            dns_resolver,
+            None,
+        )
+    }
+
+    pub fn new_with_observer<I>(
+        backends: I,
+        max_inflight: usize,
+        max_idle_per_backend: usize,
+        pool_idle_timeout: Duration,
+        connect_timeout: Duration,
+        dns_resolver: SharedDnsResolver,
+        connect_observer: Option<ConnectObserver>,
+    ) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
         let inflight = max_inflight.max(1);
         let max_idle_per_backend = max_idle_per_backend.max(1);
         let mut map = HashMap::new();
         for backend in backends {
-            let client = Arc::new(H1Client::new(
+            let client = Arc::new(H1Client::new_with_observer(
                 max_idle_per_backend,
                 pool_idle_timeout,
                 connect_timeout,
                 dns_resolver.clone(),
+                connect_observer.clone(),
             ));
             map.insert(
                 backend,
@@ -68,6 +93,7 @@ impl H1Pool {
             pool_idle_timeout,
             connect_timeout,
             dns_resolver,
+            connect_observer,
         }
     }
 
@@ -102,11 +128,12 @@ impl H1Pool {
             return Ok(false);
         };
 
-        let client = Arc::new(H1Client::new(
+        let client = Arc::new(H1Client::new_with_observer(
             self.max_idle_per_backend,
             self.pool_idle_timeout,
             self.connect_timeout,
             self.dns_resolver.clone(),
+            self.connect_observer.clone(),
         ));
 
         let mut state = handle

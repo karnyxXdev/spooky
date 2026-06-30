@@ -670,28 +670,20 @@ impl Metrics {
         }
     }
 
-    pub fn record_backend_connect_attempt(
+    pub fn record_backend_connect(
         &self,
         backend: &str,
         hostname: &str,
-        resolved_addrs: &[std::net::SocketAddr],
+        resolved_addr: std::net::SocketAddr,
     ) {
-        let labels = if resolved_addrs.is_empty() {
-            vec!["unresolved".to_string()]
-        } else {
-            resolved_addrs.iter().map(ToString::to_string).collect()
-        };
-
         if let Ok(mut guard) = self.backend_connect_attempts.write() {
-            for resolved_addr in labels {
-                *guard
-                    .entry(BackendConnectAttemptKey {
-                        backend: backend.to_string(),
-                        hostname: hostname.to_string(),
-                        resolved_addr,
-                    })
-                    .or_default() += 1;
-            }
+            *guard
+                .entry(BackendConnectAttemptKey {
+                    backend: backend.to_string(),
+                    hostname: hostname.to_string(),
+                    resolved_addr: resolved_addr.to_string(),
+                })
+                .or_default() += 1;
         }
     }
 

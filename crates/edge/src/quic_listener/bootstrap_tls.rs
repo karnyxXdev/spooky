@@ -304,7 +304,7 @@ impl QUICListener {
                             let alt = alt_svc_conn.clone();
                             let transport_pool = Arc::clone(&transport_pool);
                             let backend_endpoints = Arc::clone(&backend_endpoints);
-                            let backend_resolution_store = Arc::clone(&backend_resolution_store);
+                            let _backend_resolution_store = Arc::clone(&backend_resolution_store);
                             let upstream_policies = Arc::clone(&upstream_policies);
                             let metrics = Arc::clone(&metrics);
                             let resilience = Arc::clone(&resilience);
@@ -710,7 +710,16 @@ impl QUICListener {
                                     )
                                     .await
                                     {
-                                        Ok(Ok(s)) => s,
+                                        Ok(Ok(s)) => {
+                                            if let Ok(resolved_addr) = s.peer_addr() {
+                                                metrics.record_backend_connect(
+                                                    &backend_target,
+                                                    endpoint.authority_host(),
+                                                    resolved_addr,
+                                                );
+                                            }
+                                            s
+                                        }
                                         Ok(Err(err)) => {
                                             warn!("Bootstrap WebSocket connect error: {}", err);
                                             return Ok(Response::builder()
@@ -800,11 +809,6 @@ impl QUICListener {
                                         }
                                     }
                                 } else {
-                                    Self::record_backend_connect_attempt(
-                                        &metrics,
-                                        &backend_resolution_store,
-                                        &backend_addr,
-                                    );
                                     match tokio::time::timeout(
                                         backend_timeout,
                                         transport_pool.send(&backend_addr, upstream_req),

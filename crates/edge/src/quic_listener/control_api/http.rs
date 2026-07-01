@@ -127,13 +127,18 @@ impl QUICListener {
                         match Self::bind_tcp_listener(&desired_bind, None, "control API endpoint") {
                             Ok(listener) => {
                                 let paths = ControlApiPaths::from_endpoint(&endpoint);
+                                info!("Control API endpoint ready bind=https://{}", desired_bind,);
                                 info!(
-                                    "Control API endpoint listening on https://{}{} (ready={}, runtime={}, reload_certs={}, max_connections={}, connection_timeout_ms={})",
+                                    "Control API endpoint paths bind={} health={} ready={} runtime={} reload_certs={}",
                                     desired_bind,
                                     paths.health_path,
                                     paths.ready_path,
                                     paths.runtime_path,
                                     paths.reload_certs_path,
+                                );
+                                info!(
+                                    "Control API endpoint limits bind={} max_connections={} connection_timeout_ms={}",
+                                    desired_bind,
                                     endpoint.max_connections.max(1),
                                     endpoint.connection_timeout_ms.max(1)
                                 );

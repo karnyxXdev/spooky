@@ -487,29 +487,42 @@ impl QUICListener {
             .saturating_mul(worker_threads);
 
         info!(
-            "Performance profile: worker_threads={} control_plane_threads={} reuseport={} pin_workers={} global_inflight_limit={} per_upstream_inflight_limit={} per_backend_inflight_limit={} max_active_connections={} backend_connect_timeout_ms={} backend_timeout_ms={} backend_body_idle_timeout_ms={} backend_body_total_timeout_ms={} backend_total_request_timeout_ms={} client_body_idle_timeout_ms={} max_request_body_bytes={} max_response_body_bytes={} request_buffer_global_cap_bytes={} unknown_length_response_prebuffer_bytes={} udp_recv_buffer_bytes={} udp_send_buffer_bytes={} h2_pool_max_idle_per_backend={} h2_pool_idle_timeout_ms={}",
+            "Runtime performance concurrency worker_threads={} control_plane_threads={} packet_shards_per_worker={} reuseport={} pin_workers={}",
             worker_threads,
             config.performance.control_plane_threads.max(1),
+            shard_count,
             config.performance.reuseport,
             config.performance.pin_workers,
+        );
+        info!(
+            "Runtime performance inflight_limits global_inflight_limit={} per_upstream_inflight_limit={} per_backend_inflight_limit={} max_active_connections={}",
             global_inflight_limit,
             per_upstream_limit,
             config.performance.per_backend_inflight_limit,
             config.performance.max_active_connections,
+        );
+        info!(
+            "Runtime performance upstream_timeouts backend_connect_timeout_ms={} backend_timeout_ms={} backend_body_idle_timeout_ms={} backend_body_total_timeout_ms={} backend_total_request_timeout_ms={}",
             config.performance.backend_connect_timeout_ms,
             config.performance.backend_timeout_ms,
             config.performance.backend_body_idle_timeout_ms,
             config.performance.backend_body_total_timeout_ms,
             config.performance.backend_total_request_timeout_ms,
+        );
+        info!(
+            "Runtime performance request_limits client_body_idle_timeout_ms={} max_request_body_bytes={} max_response_body_bytes={} request_buffer_global_cap_bytes={} unknown_length_response_prebuffer_bytes={}",
             config.performance.client_body_idle_timeout_ms,
             config.performance.max_request_body_bytes,
             config.performance.max_response_body_bytes,
             config.performance.request_buffer_global_cap_bytes,
             config.performance.unknown_length_response_prebuffer_bytes,
+        );
+        info!(
+            "Runtime performance transport_buffers udp_recv_buffer_bytes={} udp_send_buffer_bytes={} h2_pool_max_idle_per_backend={} h2_pool_idle_timeout_ms={}",
             config.performance.udp_recv_buffer_bytes,
             config.performance.udp_send_buffer_bytes,
             config.performance.h2_pool_max_idle_per_backend,
-            config.performance.h2_pool_idle_timeout_ms
+            config.performance.h2_pool_idle_timeout_ms,
         );
 
         let listener_runtime_configs = config

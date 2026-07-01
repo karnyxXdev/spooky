@@ -95,6 +95,9 @@ pub struct Metrics {
     backend_dns_state: RwLock<HashMap<String, BackendDnsState>>,
     backend_rotation_state: RwLock<HashMap<String, BackendRotationState>>,
     backend_connect_attempts: RwLock<HashMap<BackendConnectAttemptKey, u64>>,
+    upstream_request_counts: RwLock<HashMap<UpstreamRequestCountKey, u64>>,
+    backend_request_counts: RwLock<HashMap<BackendRequestCountKey, u64>>,
+    upstream_request_latency: RwLock<HashMap<UpstreamRequestLatencyKey, RequestLatencyStats>>,
     downstream_tls_handshake_failures: RwLock<HashMap<DownstreamTlsHandshakeFailureKey, u64>>,
     downstream_tls_cert_selections: RwLock<HashMap<DownstreamTlsCertSelectionKey, u64>>,
     downstream_tls_alpn_negotiated: RwLock<HashMap<DownstreamTlsAlpnKey, u64>>,
@@ -118,6 +121,27 @@ pub(crate) struct BackendConnectAttemptKey {
     pub(crate) backend: String,
     pub(crate) hostname: String,
     pub(crate) resolved_addr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct UpstreamRequestCountKey {
+    pub(crate) upstream: String,
+    pub(crate) status_class: String,
+    pub(crate) outcome: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct BackendRequestCountKey {
+    pub(crate) upstream: String,
+    pub(crate) backend: String,
+    pub(crate) status_class: String,
+    pub(crate) outcome: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct UpstreamRequestLatencyKey {
+    pub(crate) upstream: String,
+    pub(crate) outcome: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -175,6 +199,13 @@ struct WorkerStats {
     ingress_packets_total: u64,
     ingress_queue_drops: u64,
     ingress_queue_drop_bytes: u64,
+}
+
+#[derive(Default, Clone)]
+pub(crate) struct RequestLatencyStats {
+    pub(crate) latency_buckets: [u64; LATENCY_BUCKETS_MS.len() + 1],
+    pub(crate) latency_ms_sum: u64,
+    pub(crate) count: u64,
 }
 
 struct RouteStatsAtomic {
@@ -251,12 +282,44 @@ impl WorkerStatsAtomic {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 pub enum RouteOutcome {
     Success,
     Failure,
     Timeout,
     BackendError,
     OverloadShed,
+}
+
+fn normalize_metric_label(raw: &str, fallback: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn status_class_label(status: Option<u16>) -> &'static str {
+    match status {
+        Some(100..=199) => "1xx",
+        Some(200..=299) => "2xx",
+        Some(300..=399) => "3xx",
+        Some(400..=499) => "4xx",
+        Some(500..=599) => "5xx",
+        Some(_) => "other",
+        None => "unknown",
+    }
+}
+
+fn route_outcome_label(outcome: RouteOutcome) -> &'static str {
+    match outcome {
+        RouteOutcome::Success => "success",
+        RouteOutcome::Failure => "failure",
+        RouteOutcome::Timeout => "timeout",
+        RouteOutcome::BackendError => "backend_error",
+        RouteOutcome::OverloadShed => "overload_shed",
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,6 +482,9 @@ impl Metrics {
             backend_dns_state: RwLock::new(HashMap::new()),
             backend_rotation_state: RwLock::new(HashMap::new()),
             backend_connect_attempts: RwLock::new(HashMap::new()),
+            upstream_request_counts: RwLock::new(HashMap::new()),
+            backend_request_counts: RwLock::new(HashMap::new()),
+            upstream_request_latency: RwLock::new(HashMap::new()),
             downstream_tls_handshake_failures: RwLock::new(HashMap::new()),
             downstream_tls_cert_selections: RwLock::new(HashMap::new()),
             downstream_tls_alpn_negotiated: RwLock::new(HashMap::new()),
@@ -687,6 +753,55 @@ impl Metrics {
         }
     }
 
+    pub fn record_request_result(
+        &self,
+        upstream: &str,
+        backend: Option<&str>,
+        status: Option<u16>,
+        outcome: RouteOutcome,
+        latency: Duration,
+    ) {
+        let upstream = normalize_metric_label(upstream, "unrouted");
+        let backend = normalize_metric_label(backend.unwrap_or("__none__"), "__none__");
+        let status_class = status_class_label(status).to_string();
+        let outcome = route_outcome_label(outcome).to_string();
+
+        if let Ok(mut guard) = self.upstream_request_counts.write() {
+            *guard
+                .entry(UpstreamRequestCountKey {
+                    upstream: upstream.clone(),
+                    status_class: status_class.clone(),
+                    outcome: outcome.clone(),
+                })
+                .or_default() += 1;
+        }
+
+        if let Ok(mut guard) = self.backend_request_counts.write() {
+            *guard
+                .entry(BackendRequestCountKey {
+                    upstream: upstream.clone(),
+                    backend,
+                    status_class,
+                    outcome: outcome.clone(),
+                })
+                .or_default() += 1;
+        }
+
+        let latency_ms = latency.as_millis() as u64;
+        let bucket = LATENCY_BUCKETS_MS
+            .iter()
+            .position(|cutoff| latency_ms <= *cutoff)
+            .unwrap_or(LATENCY_BUCKETS_MS.len());
+        if let Ok(mut guard) = self.upstream_request_latency.write() {
+            let stats = guard
+                .entry(UpstreamRequestLatencyKey { upstream, outcome })
+                .or_default();
+            stats.count = stats.count.saturating_add(1);
+            stats.latency_ms_sum = stats.latency_ms_sum.saturating_add(latency_ms);
+            stats.latency_buckets[bucket] = stats.latency_buckets[bucket].saturating_add(1);
+        }
+    }
+
     pub(crate) fn snapshot_backend_dns_state(&self) -> Vec<(String, BackendDnsState)> {
         self.backend_dns_state
             .read()
@@ -728,6 +843,65 @@ impl Metrics {
                         .cmp(&right.backend)
                         .then_with(|| left.hostname.cmp(&right.hostname))
                         .then_with(|| left.resolved_addr.cmp(&right.resolved_addr))
+                });
+                entries
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn snapshot_upstream_request_counts(&self) -> Vec<(UpstreamRequestCountKey, u64)> {
+        self.upstream_request_counts
+            .read()
+            .map(|guard| {
+                let mut entries = guard
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value))
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| {
+                    left.upstream
+                        .cmp(&right.upstream)
+                        .then_with(|| left.status_class.cmp(&right.status_class))
+                        .then_with(|| left.outcome.cmp(&right.outcome))
+                });
+                entries
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn snapshot_backend_request_counts(&self) -> Vec<(BackendRequestCountKey, u64)> {
+        self.backend_request_counts
+            .read()
+            .map(|guard| {
+                let mut entries = guard
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value))
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| {
+                    left.upstream
+                        .cmp(&right.upstream)
+                        .then_with(|| left.backend.cmp(&right.backend))
+                        .then_with(|| left.status_class.cmp(&right.status_class))
+                        .then_with(|| left.outcome.cmp(&right.outcome))
+                });
+                entries
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn snapshot_upstream_request_latency(
+        &self,
+    ) -> Vec<(UpstreamRequestLatencyKey, RequestLatencyStats)> {
+        self.upstream_request_latency
+            .read()
+            .map(|guard| {
+                let mut entries = guard
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| {
+                    left.upstream
+                        .cmp(&right.upstream)
+                        .then_with(|| left.outcome.cmp(&right.outcome))
                 });
                 entries
             })

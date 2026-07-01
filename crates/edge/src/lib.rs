@@ -31,15 +31,36 @@ mod tests {
     fn metrics_render_includes_route_percentiles() {
         let metrics = Metrics::new(1, [String::from("api_pool")]);
         metrics.record_route("api_pool", Duration::from_millis(12), RouteOutcome::Success);
+        metrics.record_request_result(
+            "api_pool",
+            Some("https://10.0.0.10:443"),
+            Some(200),
+            RouteOutcome::Success,
+            Duration::from_millis(12),
+        );
         metrics.record_route(
             "api_pool",
             Duration::from_millis(320),
             RouteOutcome::Timeout,
         );
+        metrics.record_request_result(
+            "api_pool",
+            Some("https://10.0.0.10:443"),
+            Some(503),
+            RouteOutcome::Timeout,
+            Duration::from_millis(320),
+        );
         metrics.record_route(
             "api_pool",
             Duration::from_millis(900),
             RouteOutcome::BackendError,
+        );
+        metrics.record_request_result(
+            "api_pool",
+            Some("https://10.0.0.11:443"),
+            Some(502),
+            RouteOutcome::BackendError,
+            Duration::from_millis(900),
         );
 
         let output = metrics.render_prometheus();
@@ -47,6 +68,21 @@ mod tests {
         assert!(output.contains("spooky_route_latency_ms_p50{route=\"api_pool\"}"));
         assert!(output.contains("spooky_route_latency_ms_p95{route=\"api_pool\"}"));
         assert!(output.contains("spooky_route_latency_ms_p99{route=\"api_pool\"}"));
+        assert!(output.contains(
+            "spooky_upstream_requests_total{upstream=\"api_pool\",status_class=\"2xx\",outcome=\"success\"} 1"
+        ));
+        assert!(output.contains(
+            "spooky_upstream_requests_total{upstream=\"api_pool\",status_class=\"5xx\",outcome=\"timeout\"} 1"
+        ));
+        assert!(output.contains(
+            "spooky_backend_requests_total{upstream=\"api_pool\",backend=\"https://10.0.0.11:443\",status_class=\"5xx\",outcome=\"backend_error\"} 1"
+        ));
+        assert!(output.contains(
+            "spooky_upstream_request_latency_ms_bucket{upstream=\"api_pool\",outcome=\"success\",le=\"25\"} 1"
+        ));
+        assert!(output.contains(
+            "spooky_upstream_request_latency_ms_count{upstream=\"api_pool\",outcome=\"backend_error\"} 1"
+        ));
     }
 
     #[test]

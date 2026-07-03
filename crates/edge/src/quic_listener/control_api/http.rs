@@ -290,7 +290,7 @@ impl QUICListener {
         listener_tls_store: &ListenerTlsReloadStore,
         metrics: &Metrics,
     ) -> Response<Full<Bytes>> {
-        let mut reloaded = Vec::new();
+        let mut staged = Vec::with_capacity(listener_runtime_configs.len());
         for (listener_label, listener_config) in listener_runtime_configs {
             let reloaded_state = match Self::build_listener_tls_reload_state(listener_config) {
                 Ok(state) => state,
@@ -305,31 +305,32 @@ impl QUICListener {
                     );
                 }
             };
-            let generation = match listener_tls_store.replace_listener(
-                listener_label,
-                reloaded_state.inventory.clone(),
-                reloaded_state.bootstrap_server_config,
-            ) {
-                Ok(generation) => generation,
-                Err(err) => {
-                    return Self::json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        json!({
-                            "reloaded": false,
-                            "listener": listener_label,
-                            "error": err.to_string(),
-                        }),
-                    );
-                }
-            };
+            staged.push((listener_label.clone(), reloaded_state));
+        }
+
+        let generations = match listener_tls_store.replace_listeners(&staged) {
+            Ok(generations) => generations,
+            Err(err) => {
+                return Self::json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({
+                        "reloaded": false,
+                        "error": err.to_string(),
+                    }),
+                );
+            }
+        };
+
+        let mut reloaded = Vec::with_capacity(staged.len());
+        for (listener_label, reloaded_state) in staged {
             Self::update_listener_tls_expiry_metrics(
                 metrics,
-                listener_label,
+                &listener_label,
                 &reloaded_state.inventory,
             );
             reloaded.push(json!({
                 "listener": listener_label,
-                "generation": generation,
+                "generation": generations.get(&listener_label).copied().unwrap_or(0),
             }));
         }
 

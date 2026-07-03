@@ -176,21 +176,31 @@ impl QUICListener {
                     let status = command.status().await;
                     match status {
                         Ok(status) => {
-                            info!(
-                                "Watchdog restart hook exited with status {}",
-                                status
-                                    .code()
-                                    .map(|code| code.to_string())
-                                    .unwrap_or_else(|| "signal".to_string())
-                            );
+                            metrics.inc_watchdog_restart_hook();
+                            let exit_status = status
+                                .code()
+                                .map(|code| code.to_string())
+                                .unwrap_or_else(|| "signal".to_string());
+                            if status.success() {
+                                info!(
+                                    "Watchdog restart hook exited successfully with status {}",
+                                    exit_status
+                                );
+                                watchdog.complete_restart_cycle();
+                            } else {
+                                error!(
+                                    "Watchdog restart hook exited unsuccessfully with status {}; keeping restart pending",
+                                    exit_status
+                                );
+                            }
                         }
                         Err(err) => {
-                            error!("Watchdog restart hook execution failed: {}", err);
+                            error!(
+                                "Watchdog restart hook execution failed: {}; keeping restart pending",
+                                err
+                            );
                         }
                     }
-                    metrics.inc_watchdog_restart_hook();
-
-                    watchdog.complete_restart_cycle();
                 }
             },
         );

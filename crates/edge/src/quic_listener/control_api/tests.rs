@@ -230,6 +230,37 @@ fn control_api_state_prefers_reloaded_paths_and_auth_token() {
 }
 
 #[test]
+fn control_api_state_uses_live_primary_listener_label_after_runtime_swap() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+    let startup = test_config(cert.clone(), key.clone());
+
+    let mut reloaded = startup.clone();
+    reloaded.listeners = vec![
+        Listen {
+            protocol: "http3".to_string(),
+            port: 9890,
+            address: "127.0.0.1".to_string(),
+            tls: Tls {
+                cert: cert.clone(),
+                key: key.clone(),
+                certificates: vec![],
+                client_auth: ClientAuth::default(),
+            },
+        },
+        startup.listen.clone(),
+    ];
+
+    let state = control_api_state_with_runtime_bundle(&startup, &reloaded);
+
+    assert_eq!(state.primary_listener_label, "127.0.0.1:9889");
+    assert_eq!(
+        state.current_primary_listener_label().as_deref(),
+        Some("127.0.0.1:9890")
+    );
+}
+
+#[test]
 fn validate_control_api_reload_compatibility_allows_bind_change_when_socket_is_free() {
     let dir = tempdir().expect("tempdir");
     let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
@@ -490,5 +521,63 @@ async fn runtime_bundle_cert_reload_ignores_unrelated_config_drift_and_bundle_sw
             .unwrap_or(0)
             > tls_generation_before,
         "expected cert reload to rotate the live listener TLS generation"
+    );
+}
+
+#[tokio::test]
+async fn reload_listener_certs_is_atomic_when_any_listener_reload_fails() {
+    let dir = tempdir().expect("tempdir");
+    let (cert1, key1) = write_test_cert_for_name(dir.path(), "server-one", "api.example.com");
+    let (cert2, key2) = write_test_cert_for_name(dir.path(), "server-two", "admin.example.com");
+    let mut config = test_config(cert1.clone(), key1.clone());
+    config.listeners = vec![
+        Listen {
+            protocol: "http3".to_string(),
+            port: 9889,
+            address: "127.0.0.1".to_string(),
+            tls: Tls {
+                cert: cert1,
+                key: key1,
+                certificates: vec![],
+                client_auth: ClientAuth::default(),
+            },
+        },
+        Listen {
+            protocol: "http3".to_string(),
+            port: 9890,
+            address: "127.0.0.1".to_string(),
+            tls: Tls {
+                cert: cert2.clone(),
+                key: key2,
+                certificates: vec![],
+                client_auth: ClientAuth::default(),
+            },
+        },
+    ];
+
+    let bundle = runtime_bundle_from_config("current.yaml", &config);
+    let generations_before = bundle.shared_state.listener_tls_store.generations();
+
+    std::fs::write(&cert2, "not a valid certificate").expect("corrupt cert");
+
+    let response = QUICListener::reload_listener_certs(
+        bundle.shared_state.listener_runtime_configs.as_ref(),
+        bundle.shared_state.listener_tls_store.as_ref(),
+        bundle.shared_state.metrics.as_ref(),
+    );
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect response body")
+        .to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("response json");
+    assert_eq!(payload["reloaded"], serde_json::Value::Bool(false));
+
+    assert_eq!(
+        bundle.shared_state.listener_tls_store.generations(),
+        generations_before
     );
 }

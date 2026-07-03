@@ -343,7 +343,7 @@ impl RetryBudget {
 
     pub fn allow_retry(&self, route: &str) -> Result<(), RetryReason> {
         if !self.enabled {
-            return Err(RetryReason::BudgetDenied);
+            return Ok(());
         }
 
         let ratio = self
@@ -708,6 +708,13 @@ mod tests {
         rb.mark_primary("api");
         assert!(rb.allow_retry("api").is_ok());
         assert!(rb.allow_retry("api").is_err());
+    }
+
+    #[test]
+    fn retry_budget_disabled_allows_retries() {
+        let rb = RetryBudget::new(false, 0, HashMap::new());
+        assert!(rb.allow_retry("api").is_ok());
+        assert!(rb.allow_retry("api").is_ok());
     }
 
     #[test]

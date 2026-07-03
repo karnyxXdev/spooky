@@ -158,7 +158,10 @@ latest_note="${OUT_BASE}/latest_run_path.txt"
 
 echo -n >"${summary_tsv}"
 
-for profile_dir in "${RUN_DIR}"/profile_*; do
+for profile_dir in "${RUN_DIR}"/*; do
+  if [[ ! -d "${profile_dir}" ]]; then
+    continue
+  fi
   profile="$(basename "${profile_dir}")"
   if [[ ! -f "${profile_dir}/latest.tsv" ]]; then
     continue

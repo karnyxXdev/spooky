@@ -1521,7 +1521,9 @@ impl QUICListener {
                                                 if !can_retry {
                                                     if !bodyless_mode {
                                                         retry_denial_reason = Some(RetryReason::NotBodylessMode);
-                                                    } else if !is_retryable_err || !budget_ok {
+                                                    } else if !is_retryable_err {
+                                                        retry_denial_reason = None;
+                                                    } else if !budget_ok {
                                                         retry_denial_reason = Some(RetryReason::BudgetDenied);
                                                     } else {
                                                         retry_denial_reason = Some(RetryReason::NoAlternateBackend);
@@ -2084,10 +2086,10 @@ impl QUICListener {
                     metrics.observe_hedge_primary_late_ms(forward_result.hedge.primary_late_ms);
                 }
                 if let Some(reason) = forward_result.retry_attempt_reason {
-                    metrics.inc_retry(reason);
+                    metrics.inc_retry_attempt(reason);
                 }
                 if let Some(reason) = forward_result.retry_denial_reason {
-                    metrics.inc_retry(reason);
+                    metrics.inc_retry_denied(reason);
                 }
 
                 if let Some(req) = streams.get_mut(&stream_id) {

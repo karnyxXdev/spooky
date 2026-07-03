@@ -17,6 +17,7 @@ use crate::listener_group::{
     ListenerGroupRuntime, collect_finished_listener_groups, log_listener_startup,
     reconcile_listener_groups, spawn_managed_listener_group,
 };
+use crate::privilege_drop;
 use crate::runtime_guard;
 
 #[derive(Parser)]
@@ -197,6 +198,7 @@ async fn run(
     }
 
     log_listener_startup(&runtime_config, &listener_groups);
+    apply_privilege_drop(uid, &runtime_config);
 
     let mut worker_failed = false;
     while !shutdown.load(Ordering::Relaxed) {
@@ -283,4 +285,31 @@ fn fatal_startup_error(message: &str, logger_ready: bool, exit_code: i32) -> ! {
         eprintln!("Error: {}", message);
     }
     std::process::exit(exit_code);
+}
+
+fn apply_privilege_drop(uid: libc::uid_t, runtime_config: &RuntimeConfig) {
+    if uid != 0 || !runtime_config.security.privileges.enabled {
+        return;
+    }
+
+    let user = runtime_config.security.privileges.user.trim();
+    let group = runtime_config.security.privileges.group.trim();
+    match privilege_drop::drop_privileges(user, group) {
+        Ok(()) => {
+            info!(
+                "Dropped process privileges to user='{}' group='{}'",
+                user, group
+            );
+        }
+        Err(err) => {
+            fatal_startup_error(
+                &format!(
+                    "Failed to drop process privileges to user='{}' group='{}': {}",
+                    user, group, err
+                ),
+                true,
+                1,
+            );
+        }
+    }
 }

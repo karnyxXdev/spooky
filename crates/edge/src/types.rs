@@ -384,6 +384,39 @@ impl ListenerTlsReloadStore {
         Ok(state.generation)
     }
 
+    pub fn replace_listeners(
+        &self,
+        updates: &[(String, ListenerTlsReloadState)],
+    ) -> Result<HashMap<String, u64>, ProxyError> {
+        let mut listeners = self.listeners.write().map_err(|_| {
+            ProxyError::Transport("listener TLS reload store lock poisoned".to_string())
+        })?;
+
+        for (listener, _) in updates {
+            if !listeners.contains_key(listener) {
+                return Err(ProxyError::Transport(format!(
+                    "listener TLS reload requested for unknown listener '{}'",
+                    listener
+                )));
+            }
+        }
+
+        let mut generations = HashMap::with_capacity(updates.len());
+        for (listener, update) in updates {
+            let state = listeners.get_mut(listener).ok_or_else(|| {
+                ProxyError::Transport(format!(
+                    "listener TLS reload requested for unknown listener '{}'",
+                    listener
+                ))
+            })?;
+            state.generation = state.generation.saturating_add(1);
+            state.inventory = update.inventory.clone();
+            state.bootstrap_server_config = Arc::clone(&update.bootstrap_server_config);
+            generations.insert(listener.clone(), state.generation);
+        }
+        Ok(generations)
+    }
+
     pub fn snapshot(&self) -> HashMap<String, ListenerTlsInventory> {
         self.listeners
             .read()

@@ -49,6 +49,11 @@ impl ConcurrencyTracker {
     }
 }
 
+fn loopback_bind_restricted(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(err.raw_os_error(), Some(1) | Some(13))
+}
+
 async fn start_h1_server(tracker: Arc<ConcurrencyTracker>) -> std::io::Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
@@ -84,7 +89,11 @@ async fn start_h1_server(tracker: Arc<ConcurrencyTracker>) -> std::io::Result<u1
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pool_limits_inflight_per_backend() {
     let tracker = Arc::new(ConcurrencyTracker::new());
-    let port = start_h1_server(tracker.clone()).await.unwrap();
+    let port = match start_h1_server(tracker.clone()).await {
+        Ok(port) => port,
+        Err(err) if loopback_bind_restricted(&err) => return,
+        Err(err) => panic!("failed to start h1 test server: {err}"),
+    };
     let backend = format!("127.0.0.1:{port}");
 
     let pool = Arc::new(H1Pool::new(
@@ -157,7 +166,11 @@ async fn pool_rejects_unknown_backend() {
 #[tokio::test]
 async fn pool_reports_overload_when_inflight_is_exhausted() {
     let tracker = Arc::new(ConcurrencyTracker::new());
-    let port = start_h1_server(tracker).await.unwrap();
+    let port = match start_h1_server(tracker).await {
+        Ok(port) => port,
+        Err(err) if loopback_bind_restricted(&err) => return,
+        Err(err) => panic!("failed to start h1 test server: {err}"),
+    };
     let backend = format!("127.0.0.1:{port}");
     let pool = Arc::new(H1Pool::new(
         vec![backend.clone()],

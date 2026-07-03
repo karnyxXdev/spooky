@@ -1140,7 +1140,7 @@ impl Metrics {
         self.runtime_panics.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn inc_retry(&self, reason: RetryReason) {
+    pub fn inc_retry_attempt(&self, reason: RetryReason) {
         self.retries_total.fetch_add(1, Ordering::Relaxed);
         match reason {
             RetryReason::BackendTimeout => {
@@ -1152,6 +1152,14 @@ impl Metrics {
             RetryReason::BackendPool => {
                 self.retry_reason_pool.fetch_add(1, Ordering::Relaxed);
             }
+            RetryReason::BudgetDenied
+            | RetryReason::NotBodylessMode
+            | RetryReason::NoAlternateBackend => {}
+        }
+    }
+
+    pub fn inc_retry_denied(&self, reason: RetryReason) {
+        match reason {
             RetryReason::BudgetDenied => {
                 self.retry_denied_budget.fetch_add(1, Ordering::Relaxed);
             }
@@ -1163,6 +1171,9 @@ impl Metrics {
                 self.retry_denied_no_alternate
                     .fetch_add(1, Ordering::Relaxed);
             }
+            RetryReason::BackendTimeout
+            | RetryReason::BackendTransport
+            | RetryReason::BackendPool => {}
         }
     }
 

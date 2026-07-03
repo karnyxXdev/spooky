@@ -168,13 +168,13 @@ mod tests {
     #[test]
     fn resilience_metrics_increment_correctly() {
         let metrics = Metrics::default();
-        metrics.inc_retry(RetryReason::BackendTimeout);
-        metrics.inc_retry(RetryReason::BudgetDenied);
+        metrics.inc_retry_attempt(RetryReason::BackendTimeout);
+        metrics.inc_retry_denied(RetryReason::BudgetDenied);
         metrics.inc_circuit_breaker_rejected();
         metrics.inc_circuit_breaker_rejected();
         metrics.set_brownout_active(true);
         let output = metrics.render_prometheus();
-        assert!(output.contains("spooky_retries_total 2\n"));
+        assert!(output.contains("spooky_retries_total 1\n"));
         assert!(output.contains("spooky_retry_attempts_total{reason=\"timeout\"} 1\n"));
         assert!(output.contains("spooky_retry_denied_total{reason=\"budget\"} 1\n"));
         assert!(output.contains("spooky_circuit_breaker_rejected_total 2\n"));

@@ -2084,10 +2084,10 @@ impl QUICListener {
                     metrics.observe_hedge_primary_late_ms(forward_result.hedge.primary_late_ms);
                 }
                 if let Some(reason) = forward_result.retry_attempt_reason {
-                    metrics.inc_retry(reason);
+                    metrics.inc_retry_attempt(reason);
                 }
                 if let Some(reason) = forward_result.retry_denial_reason {
-                    metrics.inc_retry(reason);
+                    metrics.inc_retry_denied(reason);
                 }
 
                 if let Some(req) = streams.get_mut(&stream_id) {

@@ -415,8 +415,10 @@ impl QUICListener {
                                         Some(&lb_header_lookup),
                                     ) {
                                         Some("ApiKey")
-                                    } else if !Self::jwt_is_authorized(policy, Some(&lb_header_lookup))
-                                    {
+                                    } else if !Self::jwt_is_authorized(
+                                        policy,
+                                        Some(&lb_header_lookup),
+                                    ) {
                                         Some("Bearer")
                                     } else {
                                         None
@@ -481,7 +483,9 @@ impl QUICListener {
                                             b"request rate limited\n",
                                         )))
                                         .unwrap_or_else(|_| {
-                                            Response::new(boxed_full(Bytes::from_static(b"error\n")))
+                                            Response::new(boxed_full(Bytes::from_static(
+                                                b"error\n",
+                                            )))
                                         }));
                                 }
 

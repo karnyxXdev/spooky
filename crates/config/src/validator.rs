@@ -1172,12 +1172,41 @@ fn validate_inner(config: &Config) -> bool {
                     }
                 }
                 ExternalAuth::Oidc {
+                    discovery_url,
                     issuer_url,
                     client_id,
+                    client_secret,
                     audience,
+                    scopes,
                     timeout_ms,
                 } => {
-                    if !is_valid_http_url(issuer_url) {
+                    let has_discovery_url = discovery_url
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty());
+                    let has_issuer_url = issuer_url
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty());
+                    if !has_discovery_url && !has_issuer_url {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc requires discovery_url or issuer_url",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                    if let Some(discovery_url) = discovery_url.as_deref()
+                        && !discovery_url.trim().is_empty()
+                        && !is_valid_http_url(discovery_url)
+                    {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc.discovery_url must be an absolute http(s) URL",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                    if let Some(issuer_url) = issuer_url.as_deref()
+                        && !issuer_url.trim().is_empty()
+                        && !is_valid_http_url(issuer_url)
+                    {
                         validation_error!(
                             "upstream '{}' auth.external_auth.oidc.issuer_url must be an absolute http(s) URL",
                             upstream_name
@@ -1191,12 +1220,29 @@ fn validate_inner(config: &Config) -> bool {
                         );
                         return false;
                     }
+                    if client_secret
+                        .as_deref()
+                        .is_some_and(|value| value.trim().is_empty())
+                    {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc.client_secret must be non-empty when provided",
+                            upstream_name
+                        );
+                        return false;
+                    }
                     if audience
                         .as_deref()
                         .is_some_and(|value| value.trim().is_empty())
                     {
                         validation_error!(
                             "upstream '{}' auth.external_auth.oidc.audience must be non-empty when provided",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                    if scopes.iter().any(|scope| scope.trim().is_empty()) {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc.scopes must not contain empty values",
                             upstream_name
                         );
                         return false;

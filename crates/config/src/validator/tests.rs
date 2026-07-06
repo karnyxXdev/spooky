@@ -240,6 +240,73 @@ upstream:
 }
 
 #[test]
+fn yaml_parse_applies_oidc_external_auth_defaults() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let yaml = format!(
+        r#"
+version: 1
+listen:
+  protocol: http3
+  address: "127.0.0.1"
+  port: 9889
+  tls:
+    cert: "{}"
+    key: "{}"
+upstream:
+  test_upstream:
+    auth:
+      external_auth:
+        kind: oidc
+        discovery_url: "https://issuer.example.com/.well-known/openid-configuration"
+        client_id: "edge-gateway"
+    route:
+      path_prefix: "/"
+    backends:
+      - id: "b1"
+        address: "127.0.0.1:8080"
+        weight: 1
+        health_check: {{}}
+"#,
+        cert.display(),
+        key.display()
+    );
+
+    let cfg: Config = serde_yaml::from_str(&yaml).expect("parse");
+    match cfg
+        .upstream
+        .get("test_upstream")
+        .expect("upstream")
+        .auth
+        .external_auth
+        .as_ref()
+    {
+        Some(ExternalAuth::Oidc {
+            discovery_url,
+            issuer_url,
+            client_id,
+            client_secret,
+            audience,
+            scopes,
+            timeout_ms,
+        }) => {
+            assert_eq!(
+                discovery_url.as_deref(),
+                Some("https://issuer.example.com/.well-known/openid-configuration")
+            );
+            assert_eq!(issuer_url, &None);
+            assert_eq!(client_id, "edge-gateway");
+            assert_eq!(client_secret, &None);
+            assert_eq!(audience, &None);
+            assert!(scopes.is_empty());
+            assert_eq!(*timeout_ms, 1_000);
+        }
+        other => panic!("unexpected external auth config: {:?}", other),
+    }
+}
+
+#[test]
 fn yaml_parse_rejects_unknown_external_auth_field() {
     let dir = tempdir().expect("tempdir");
     let (cert, key) = write_test_certs(dir.path());
@@ -1257,13 +1324,91 @@ fn accepts_oidc_external_auth() {
         .expect("upstream")
         .auth
         .external_auth = Some(ExternalAuth::Oidc {
-        issuer_url: "https://issuer.example.com".to_string(),
+        discovery_url: Some(
+            "https://issuer.example.com/.well-known/openid-configuration".to_string(),
+        ),
+        issuer_url: Some("https://issuer.example.com".to_string()),
         client_id: "edge-gateway".to_string(),
+        client_secret: Some("secret-1".to_string()),
         audience: Some("spooky-api".to_string()),
+        scopes: vec!["openid".to_string(), "profile".to_string()],
         timeout_ms: 1_500,
     });
 
     assert!(validate(&cfg).is_ok());
+}
+
+#[test]
+fn rejects_oidc_external_auth_without_discovery_or_issuer() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth
+        .external_auth = Some(ExternalAuth::Oidc {
+        discovery_url: None,
+        issuer_url: None,
+        client_id: "edge-gateway".to_string(),
+        client_secret: Some("secret-1".to_string()),
+        audience: Some("spooky-api".to_string()),
+        scopes: vec!["openid".to_string()],
+        timeout_ms: 1_500,
+    });
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_oidc_external_auth_with_empty_client_secret() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth
+        .external_auth = Some(ExternalAuth::Oidc {
+        discovery_url: Some(
+            "https://issuer.example.com/.well-known/openid-configuration".to_string(),
+        ),
+        issuer_url: Some("https://issuer.example.com".to_string()),
+        client_id: "edge-gateway".to_string(),
+        client_secret: Some("   ".to_string()),
+        audience: Some("spooky-api".to_string()),
+        scopes: vec!["openid".to_string()],
+        timeout_ms: 1_500,
+    });
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_oidc_external_auth_with_empty_scope() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth
+        .external_auth = Some(ExternalAuth::Oidc {
+        discovery_url: Some(
+            "https://issuer.example.com/.well-known/openid-configuration".to_string(),
+        ),
+        issuer_url: Some("https://issuer.example.com".to_string()),
+        client_id: "edge-gateway".to_string(),
+        client_secret: Some("secret-1".to_string()),
+        audience: Some("spooky-api".to_string()),
+        scopes: vec!["openid".to_string(), "   ".to_string()],
+        timeout_ms: 1_500,
+    });
+
+    assert!(validate(&cfg).is_err());
 }
 
 #[test]

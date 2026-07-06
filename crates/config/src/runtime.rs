@@ -324,6 +324,60 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_preserves_oidc_external_auth_metadata() {
+        let mut config = sample_config();
+        config
+            .upstream
+            .get_mut("api")
+            .expect("api")
+            .auth
+            .external_auth = Some(crate::config::ExternalAuth::Oidc {
+            discovery_url: Some(
+                "https://issuer.example.com/.well-known/openid-configuration".to_string(),
+            ),
+            issuer_url: Some("https://issuer.example.com".to_string()),
+            client_id: "edge-gateway".to_string(),
+            client_secret: Some("secret-1".to_string()),
+            audience: Some("spooky-api".to_string()),
+            scopes: vec!["openid".to_string(), "profile".to_string()],
+            timeout_ms: 1_500,
+        });
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        match runtime
+            .upstreams
+            .get("api")
+            .expect("api")
+            .policy
+            .upstream_auth
+            .external_auth
+            .as_ref()
+        {
+            Some(crate::config::ExternalAuth::Oidc {
+                discovery_url,
+                issuer_url,
+                client_id,
+                client_secret,
+                audience,
+                scopes,
+                timeout_ms,
+            }) => {
+                assert_eq!(
+                    discovery_url.as_deref(),
+                    Some("https://issuer.example.com/.well-known/openid-configuration")
+                );
+                assert_eq!(issuer_url.as_deref(), Some("https://issuer.example.com"));
+                assert_eq!(client_id, "edge-gateway");
+                assert_eq!(client_secret.as_deref(), Some("secret-1"));
+                assert_eq!(audience.as_deref(), Some("spooky-api"));
+                assert_eq!(scopes, &vec!["openid".to_string(), "profile".to_string()]);
+                assert_eq!(*timeout_ms, 1_500);
+            }
+            other => panic!("unexpected external_auth contract: {:?}", other),
+        }
+    }
+
+    #[test]
     fn runtime_listeners_uses_legacy_listen_when_explicit_list_is_empty() {
         let config = sample_config();
         let listeners = runtime_listeners(&config).expect("legacy listeners");

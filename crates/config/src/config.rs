@@ -257,10 +257,17 @@ pub enum ExternalAuth {
         timeout_ms: u64,
     },
     Oidc {
-        issuer_url: String,
+        #[serde(default)]
+        discovery_url: Option<String>,
+        #[serde(default)]
+        issuer_url: Option<String>,
         client_id: String,
         #[serde(default)]
+        client_secret: Option<String>,
+        #[serde(default)]
         audience: Option<String>,
+        #[serde(default)]
+        scopes: Vec<String>,
         #[serde(default = "auth_default_external_timeout_ms")]
         timeout_ms: u64,
     },

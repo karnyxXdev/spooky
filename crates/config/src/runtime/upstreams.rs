@@ -305,13 +305,27 @@ fn validate_upstream_policy(
                 }
             }
             crate::config::ExternalAuth::Oidc {
+                discovery_url,
                 issuer_url,
                 client_id,
+                client_secret,
                 audience,
+                scopes,
                 timeout_ms,
             } => {
-                let valid_issuer_url =
-                    issuer_url
+                let has_discovery_url = discovery_url
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty());
+                let has_issuer_url = issuer_url
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty());
+                if !has_discovery_url && !has_issuer_url {
+                    return Err(RuntimeConfigError::ConfigInvalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.oidc requires discovery_url or issuer_url"
+                    )));
+                }
+                if let Some(discovery_url) = discovery_url.as_deref() {
+                    let valid_discovery_url = discovery_url
                         .trim()
                         .parse::<http::Uri>()
                         .ok()
@@ -319,14 +333,39 @@ fn validate_upstream_policy(
                             matches!(uri.scheme_str(), Some("http") | Some("https"))
                                 && uri.authority().is_some()
                         });
-                if !valid_issuer_url {
-                    return Err(RuntimeConfigError::ConfigInvalid(format!(
-                        "upstream '{upstream_name}' auth.external_auth.oidc.issuer_url must be an absolute http(s) URL"
-                    )));
+                    if !discovery_url.trim().is_empty() && !valid_discovery_url {
+                        return Err(RuntimeConfigError::ConfigInvalid(format!(
+                            "upstream '{upstream_name}' auth.external_auth.oidc.discovery_url must be an absolute http(s) URL"
+                        )));
+                    }
+                }
+                if let Some(issuer_url) = issuer_url.as_deref() {
+                    let valid_issuer_url =
+                        issuer_url
+                            .trim()
+                            .parse::<http::Uri>()
+                            .ok()
+                            .is_some_and(|uri| {
+                                matches!(uri.scheme_str(), Some("http") | Some("https"))
+                                    && uri.authority().is_some()
+                            });
+                    if !issuer_url.trim().is_empty() && !valid_issuer_url {
+                        return Err(RuntimeConfigError::ConfigInvalid(format!(
+                            "upstream '{upstream_name}' auth.external_auth.oidc.issuer_url must be an absolute http(s) URL"
+                        )));
+                    }
                 }
                 if client_id.trim().is_empty() {
                     return Err(RuntimeConfigError::ConfigInvalid(format!(
                         "upstream '{upstream_name}' auth.external_auth.oidc.client_id must be non-empty"
+                    )));
+                }
+                if client_secret
+                    .as_deref()
+                    .is_some_and(|value| value.trim().is_empty())
+                {
+                    return Err(RuntimeConfigError::ConfigInvalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.oidc.client_secret must be non-empty when provided"
                     )));
                 }
                 if audience
@@ -335,6 +374,11 @@ fn validate_upstream_policy(
                 {
                     return Err(RuntimeConfigError::ConfigInvalid(format!(
                         "upstream '{upstream_name}' auth.external_auth.oidc.audience must be non-empty when provided"
+                    )));
+                }
+                if scopes.iter().any(|scope| scope.trim().is_empty()) {
+                    return Err(RuntimeConfigError::ConfigInvalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.oidc.scopes must not contain empty values"
                     )));
                 }
                 if *timeout_ms == 0 {

@@ -1054,7 +1054,8 @@ impl QUICListener {
                     // Balances the in-flight begin_request done inside
                     // resolve_backend; the Drop finishes it on any rejection
                     // below, and is disarmed once the envelope is committed.
-                    let mut backend_inflight_guard: Option<BackendInflightGuard> = None;
+                    // Assigned only in the Ok arm (the Err arm diverges).
+                    let mut backend_inflight_guard: Option<BackendInflightGuard>;
                     let (
                         body_tx,
                         upstream_result_rx,
@@ -3418,9 +3419,7 @@ impl QUICListener {
         let Ok(now_secs) = now.duration_since(UNIX_EPOCH).map(|value| value.as_secs()) else {
             return None;
         };
-        let Some(exp) = claims.get("exp").and_then(Value::as_u64) else {
-            return None;
-        };
+        let exp = claims.get("exp").and_then(Value::as_u64)?;
         if now_secs > exp.saturating_add(jwt.clock_skew_secs) {
             return None;
         }
@@ -3446,9 +3445,7 @@ impl QUICListener {
             return None;
         }
         if let Some(audience) = jwt.audience.as_deref() {
-            let Some(claim_aud) = claims.get("aud") else {
-                return None;
-            };
+            let claim_aud = claims.get("aud")?;
             match claim_aud {
                 Value::String(value) if value == audience => {}
                 Value::Array(values)

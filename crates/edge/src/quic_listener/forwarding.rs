@@ -131,9 +131,12 @@ pub(crate) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> Stre
     }
     req.body_buf.clear();
     req.body_tx = None;
+    req.auth_result_rx = None;
     req.upstream_result_rx = None;
     req.response_chunk_rx = None;
     req.pending_chunk = None;
+    req.pending_forward = None;
+    req.auth_deadline = None;
     req.global_inflight_permit = None;
     req.upstream_inflight_permit = None;
     req.adaptive_admission_permit = None;
@@ -1827,6 +1830,8 @@ impl QUICListener {
                             retry_count: 0,
                             error_kind: None,
                             pending_forward,
+                            auth_result_rx: None,
+                            auth_deadline: None,
                             phase: StreamPhase::ReceivingRequest,
                             admission_state: StreamAdmissionState::ReadyToForward,
                             request_fin_received,

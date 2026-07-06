@@ -767,6 +767,8 @@ pub struct ExternalAuthChallengeResponse {
     pub body: Vec<u8>,
 }
 
+pub type ExternalAuthResult = Result<ExternalAuthDecision, ProxyError>;
+
 /// Lifecycle phase of a single HTTP/3 request stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamPhase {
@@ -892,6 +894,10 @@ pub struct RequestEnvelope {
     pub error_kind: Option<&'static str>,
     /// Deferred request-building snapshot for async auth/admission handoff.
     pub pending_forward: Option<Arc<PendingForward>>,
+    /// Receives the external auth decision once async auth completes.
+    pub auth_result_rx: Option<oneshot::Receiver<ExternalAuthResult>>,
+    /// Deadline for the external auth decision, when auth is running asynchronously.
+    pub auth_deadline: Option<Instant>,
 
     /// Current lifecycle phase of this stream.
     pub phase: StreamPhase,

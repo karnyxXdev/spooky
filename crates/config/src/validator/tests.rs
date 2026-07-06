@@ -192,6 +192,91 @@ upstream:
 }
 
 #[test]
+fn yaml_parse_applies_external_auth_defaults() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let yaml = format!(
+        r#"
+version: 1
+listen:
+  protocol: http3
+  address: "127.0.0.1"
+  port: 9889
+  tls:
+    cert: "{}"
+    key: "{}"
+upstream:
+  test_upstream:
+    auth:
+      external_auth:
+        kind: http
+        endpoint: "https://auth.internal/check"
+    route:
+      path_prefix: "/"
+    backends:
+      - id: "b1"
+        address: "127.0.0.1:8080"
+        weight: 1
+        health_check: {{}}
+"#,
+        cert.display(),
+        key.display()
+    );
+
+    let cfg: Config = serde_yaml::from_str(&yaml).expect("parse");
+    let auth = &cfg.upstream.get("test_upstream").expect("upstream").auth;
+
+    match auth.external_auth.as_ref() {
+        Some(ExternalAuth::Http {
+            endpoint,
+            timeout_ms,
+        }) => {
+            assert_eq!(endpoint, "https://auth.internal/check");
+            assert_eq!(*timeout_ms, 1_000);
+        }
+        other => panic!("unexpected external auth config: {:?}", other),
+    }
+}
+
+#[test]
+fn yaml_parse_rejects_unknown_external_auth_field() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let yaml = format!(
+        r#"
+version: 1
+listen:
+  protocol: http3
+  address: "127.0.0.1"
+  port: 9889
+  tls:
+    cert: "{}"
+    key: "{}"
+upstream:
+  test_upstream:
+    auth:
+      external_auth:
+        kind: http
+        endpoint: "https://auth.internal/check"
+        unexpected: true
+    route:
+      path_prefix: "/"
+    backends:
+      - id: "b1"
+        address: "127.0.0.1:8080"
+        weight: 1
+        health_check: {{}}
+"#,
+        cert.display(),
+        key.display()
+    );
+
+    assert!(serde_yaml::from_str::<Config>(&yaml).is_err());
+}
+
+#[test]
 fn rejects_invalid_performance_and_observability_values() {
     let dir = tempdir().expect("tempdir");
     let (cert, key) = write_test_certs(dir.path());

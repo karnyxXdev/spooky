@@ -3338,7 +3338,7 @@ impl QUICListener {
         policy: &RuntimeUpstreamPolicy,
         header_lookup: Option<&LbHeaderLookup<'_>>,
     ) -> bool {
-        let Some(api_key) = policy.auth.api_key.as_ref() else {
+        let Some(api_key) = policy.upstream_auth.api_key.as_ref() else {
             return true;
         };
         let Some(provided) = header_lookup.and_then(|lookup| lookup(api_key.header_name.as_str()))
@@ -3357,7 +3357,7 @@ impl QUICListener {
         policy: &RuntimeUpstreamPolicy,
         header_lookup: Option<&LbHeaderLookup<'_>>,
     ) -> bool {
-        let Some(jwt) = policy.auth.jwt.as_ref() else {
+        let Some(jwt) = policy.upstream_auth.jwt.as_ref() else {
             return true;
         };
         let Some(raw) =
@@ -3463,12 +3463,12 @@ impl QUICListener {
         let scopes = Self::jwt_string_claim_values(claims, &["scope", "scp"]);
         let roles = Self::jwt_string_claim_values(claims, &["roles", "role"]);
         policy
-            .auth
+            .upstream_auth
             .required_scopes
             .iter()
             .all(|required| scopes.contains(required))
             && policy
-                .auth
+                .upstream_auth
                 .required_roles
                 .iter()
                 .all(|required| roles.contains(required))
@@ -3682,7 +3682,7 @@ mod tests {
     #[test]
     fn api_key_authorization_requires_exact_configured_match() {
         let policy = RuntimeUpstreamPolicy {
-            auth: RouteAuth {
+            upstream_auth: RouteAuth {
                 api_key: Some(ApiKeyAuth {
                     header_name: "x-api-key".to_string(),
                     keys: vec!["secret-key".to_string()],
@@ -3725,7 +3725,7 @@ mod tests {
             "HS256",
         );
         let policy = RuntimeUpstreamPolicy {
-            auth: RouteAuth {
+            upstream_auth: RouteAuth {
                 api_key: None,
                 jwt: Some(JwtAuth {
                     secret: "jwt-secret".to_string(),
@@ -3750,7 +3750,7 @@ mod tests {
         assert!(
             QUICListener::validated_hs256_jwt_claims(
                 token.as_str(),
-                policy.auth.jwt.as_ref().expect("jwt policy"),
+                policy.upstream_auth.jwt.as_ref().expect("jwt policy"),
                 now
             )
             .is_some()
@@ -3789,7 +3789,7 @@ mod tests {
     #[test]
     fn jwt_rbac_requires_configured_scopes_and_roles() {
         let policy = RuntimeUpstreamPolicy {
-            auth: RouteAuth {
+            upstream_auth: RouteAuth {
                 api_key: None,
                 jwt: None,
                 external_auth: None,

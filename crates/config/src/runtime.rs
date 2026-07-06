@@ -220,7 +220,8 @@ pub struct RuntimeProtocolPolicy(pub ProtocolPolicy);
 
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeUpstreamPolicy {
-    pub auth: RouteAuth,
+    /// Upstream-owned auth policy selected after route lookup resolves an upstream.
+    pub upstream_auth: RouteAuth,
     pub host: RuntimeHostPolicy,
     pub forwarded_headers: RuntimeForwardedHeaderPolicy,
     pub protocol: RuntimeProtocolPolicy,
@@ -304,7 +305,12 @@ mod tests {
         });
 
         let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
-        let auth = &runtime.upstreams.get("api").expect("api").policy.auth;
+        let auth = &runtime
+            .upstreams
+            .get("api")
+            .expect("api")
+            .policy
+            .upstream_auth;
         match auth.external_auth.as_ref() {
             Some(crate::config::ExternalAuth::Http {
                 endpoint,

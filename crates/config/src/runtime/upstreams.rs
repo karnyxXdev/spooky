@@ -14,7 +14,7 @@ impl RuntimeUpstream {
             load_balancing: upstream.load_balancing.clone(),
             route: upstream.route.clone(),
             policy: RuntimeUpstreamPolicy {
-                auth: upstream.auth.clone(),
+                upstream_auth: upstream.auth.clone(),
                 host: RuntimeHostPolicy(upstream.host_policy.clone()),
                 forwarded_headers: RuntimeForwardedHeaderPolicy(upstream.forwarded_headers.clone()),
                 protocol: RuntimeProtocolPolicy(config.resilience.protocol.clone()),
@@ -35,7 +35,7 @@ impl RuntimeUpstream {
     pub fn as_config_upstream(&self) -> Upstream {
         Upstream {
             load_balancing: self.load_balancing.clone(),
-            auth: self.policy.auth.clone(),
+            auth: self.policy.upstream_auth.clone(),
             host_policy: self.policy.host.0.clone(),
             forwarded_headers: self.policy.forwarded_headers.0.clone(),
             tls: Some(self.effective_tls.clone()),

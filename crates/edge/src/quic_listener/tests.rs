@@ -1995,25 +1995,14 @@ fn traceparent_parser_rejects_invalid_value() {
 }
 
 #[test]
-fn inflight_micro_wait_acquires_when_permit_recovers() {
+fn inflight_micro_wait_acquires_available_permit_without_blocking() {
     let semaphore = Arc::new(Semaphore::new(1));
-    let held = semaphore
-        .clone()
-        .try_acquire_owned()
-        .expect("acquire initial permit");
-    let semaphore_for_task = Arc::clone(&semaphore);
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(5));
-        drop(held);
-    });
-
     let acquired = super::QUICListener::try_acquire_owned_with_micro_wait(
-        semaphore_for_task,
+        Arc::clone(&semaphore),
         Duration::from_millis(50),
     );
-    assert!(acquired.is_ok());
-    let (_, waited) = acquired.expect("permit should be acquired");
-    assert!(waited, "acquire should report that it waited");
+    let (_permit, waited) = acquired.expect("permit should be acquired");
+    assert!(!waited, "acquire must never block the worker thread");
 }
 
 #[test]

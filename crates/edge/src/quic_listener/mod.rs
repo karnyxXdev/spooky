@@ -1914,24 +1914,11 @@ impl QUICListener {
 
     fn try_acquire_owned_with_micro_wait(
         semaphore: Arc<Semaphore>,
-        wait_budget: Duration,
+        _wait_budget: Duration,
     ) -> Result<(tokio::sync::OwnedSemaphorePermit, bool), tokio::sync::TryAcquireError> {
-        match Arc::clone(&semaphore).try_acquire_owned() {
-            Ok(permit) => return Ok((permit, false)),
-            Err(err) if wait_budget.is_zero() => return Err(err),
-            Err(_) => {}
-        }
-
-        let start = Instant::now();
-        loop {
-            if start.elapsed() >= wait_budget {
-                return Err(tokio::sync::TryAcquireError::NoPermits);
-            }
-            std::thread::sleep(Duration::from_millis(1));
-            if let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() {
-                return Ok((permit, true));
-            }
-        }
+        // Never block the synchronous QUIC worker thread: acquire immediately or
+        // shed. A blocking wait here stalls every connection on the shard.
+        semaphore.try_acquire_owned().map(|permit| (permit, false))
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -850,11 +850,16 @@ impl Metrics {
 }
 
 fn percentile_ms(stats: &RouteStats, quantile: f64) -> f64 {
-    if stats.requests_total == 0 {
+    // Percentiles are computed over the recorded latency samples, which under
+    // latency sampling (SAMPLE_EVERY > 1) are only a subset of requests_total.
+    // Using requests_total as the denominator would push the target past the
+    // sampled bucket population and always return the sentinel bucket.
+    let sampled: u64 = stats.latency_buckets.iter().sum();
+    if sampled == 0 {
         return 0.0;
     }
 
-    let target = ((stats.requests_total as f64) * quantile).ceil() as u64;
+    let target = ((sampled as f64) * quantile).ceil() as u64;
     let mut running = 0u64;
 
     for (idx, count) in stats.latency_buckets.iter().enumerate() {

@@ -3377,7 +3377,7 @@ impl QUICListener {
 
     fn validated_hs256_jwt_claims(
         token: &str,
-        jwt: &spooky_config::config::JwtAuth,
+        jwt: &spooky_config::runtime::RuntimeJwtAuth,
         now: SystemTime,
     ) -> Option<Value> {
         let mut parts = token.split('.');
@@ -3553,8 +3553,9 @@ impl QUICListener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spooky_config::config::{
-        ApiKeyAuth, JwtAuth, RouteAuth, ScopedRateLimit, ScopedRateLimitScope,
+    use spooky_config::config::{ScopedRateLimit, ScopedRateLimitScope};
+    use spooky_config::runtime::{
+        RuntimeApiKeyAuth, RuntimeAuthPolicy, RuntimeJwtAuth, RuntimeUpstreamPolicy,
     };
 
     fn test_hs256_jwt(secret: &str, claims: serde_json::Value, alg: &str) -> String {
@@ -3682,8 +3683,8 @@ mod tests {
     #[test]
     fn api_key_authorization_requires_exact_configured_match() {
         let policy = RuntimeUpstreamPolicy {
-            upstream_auth: RouteAuth {
-                api_key: Some(ApiKeyAuth {
+            upstream_auth: RuntimeAuthPolicy {
+                api_key: Some(RuntimeApiKeyAuth {
                     header_name: "x-api-key".to_string(),
                     keys: vec!["secret-key".to_string()],
                 }),
@@ -3725,9 +3726,9 @@ mod tests {
             "HS256",
         );
         let policy = RuntimeUpstreamPolicy {
-            upstream_auth: RouteAuth {
+            upstream_auth: RuntimeAuthPolicy {
                 api_key: None,
-                jwt: Some(JwtAuth {
+                jwt: Some(RuntimeJwtAuth {
                     secret: "jwt-secret".to_string(),
                     issuer: Some("issuer-1".to_string()),
                     audience: Some("aud-1".to_string()),
@@ -3756,7 +3757,7 @@ mod tests {
             .is_some()
         );
 
-        let wrong_secret = JwtAuth {
+        let wrong_secret = RuntimeJwtAuth {
             secret: "wrong".to_string(),
             issuer: Some("issuer-1".to_string()),
             audience: Some("aud-1".to_string()),
@@ -3774,7 +3775,7 @@ mod tests {
         assert!(
             QUICListener::validated_hs256_jwt_claims(
                 expired.as_str(),
-                &JwtAuth {
+                &RuntimeJwtAuth {
                     secret: "jwt-secret".to_string(),
                     issuer: None,
                     audience: None,
@@ -3789,7 +3790,7 @@ mod tests {
     #[test]
     fn jwt_rbac_requires_configured_scopes_and_roles() {
         let policy = RuntimeUpstreamPolicy {
-            upstream_auth: RouteAuth {
+            upstream_auth: RuntimeAuthPolicy {
                 api_key: None,
                 jwt: None,
                 external_auth: None,

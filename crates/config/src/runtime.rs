@@ -4,8 +4,8 @@ use crate::{
     backend_endpoint::BackendEndpoint,
     config::{
         Backend, ClientAuth, Config, ForwardedHeaderPolicy, Listen, LoadBalancing, Observability,
-        Performance, ProtocolPolicy, Resilience, RouteAuth, RouteMatch, Security, TlsCertificate,
-        Upstream, UpstreamHostPolicy, UpstreamHostPolicyMode, UpstreamTls,
+        Performance, ProtocolPolicy, Resilience, RouteMatch, Security, TlsCertificate, Upstream,
+        UpstreamHostPolicy, UpstreamHostPolicyMode, UpstreamTls,
     },
 };
 
@@ -219,9 +219,59 @@ pub struct RuntimeForwardedHeaderPolicy(pub ForwardedHeaderPolicy);
 pub struct RuntimeProtocolPolicy(pub ProtocolPolicy);
 
 #[derive(Debug, Clone, Default)]
+pub struct RuntimeApiKeyAuth {
+    pub header_name: String,
+    pub keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeJwtAuth {
+    pub secret: String,
+    pub issuer: Option<String>,
+    pub audience: Option<String>,
+    pub clock_skew_secs: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeExternalAuthRequestHeader {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum RuntimeExternalAuth {
+    Http {
+        endpoint: String,
+        request_headers: Vec<RuntimeExternalAuthRequestHeader>,
+        response_header_allowlist: Vec<String>,
+        timeout_ms: u64,
+    },
+    Oidc {
+        discovery_url: Option<String>,
+        issuer_url: Option<String>,
+        client_id: String,
+        client_secret: Option<String>,
+        audience: Option<String>,
+        scopes: Vec<String>,
+        request_headers: Vec<RuntimeExternalAuthRequestHeader>,
+        response_header_allowlist: Vec<String>,
+        timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeAuthPolicy {
+    pub api_key: Option<RuntimeApiKeyAuth>,
+    pub jwt: Option<RuntimeJwtAuth>,
+    pub external_auth: Option<RuntimeExternalAuth>,
+    pub required_scopes: Vec<String>,
+    pub required_roles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct RuntimeUpstreamPolicy {
     /// Upstream-owned auth policy selected after route lookup resolves an upstream.
-    pub upstream_auth: RouteAuth,
+    pub upstream_auth: RuntimeAuthPolicy,
     pub host: RuntimeHostPolicy,
     pub forwarded_headers: RuntimeForwardedHeaderPolicy,
     pub protocol: RuntimeProtocolPolicy,
@@ -314,7 +364,7 @@ mod tests {
             .policy
             .upstream_auth;
         match auth.external_auth.as_ref() {
-            Some(crate::config::ExternalAuth::Http {
+            Some(RuntimeExternalAuth::Http {
                 endpoint,
                 request_headers,
                 response_header_allowlist,
@@ -361,7 +411,7 @@ mod tests {
             .external_auth
             .as_ref()
         {
-            Some(crate::config::ExternalAuth::Oidc {
+            Some(RuntimeExternalAuth::Oidc {
                 discovery_url,
                 issuer_url,
                 client_id,

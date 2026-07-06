@@ -3146,10 +3146,10 @@ impl QUICListener {
                     cid_key,
                     header_lookup,
                 );
-                // When a passively-ejected backend is due for re-admission, skip
+                // When a passively-ejected backend is pending re-admission, skip
                 // the read-only fast path so the write-locked slow path can
                 // reconcile it back into rotation.
-                let fast_selected = if pool.pool.readmit_due(Instant::now()) {
+                let fast_selected = if pool.pool.readmit_due() {
                     None
                 } else {
                     pool.pick_readonly(key.as_str())

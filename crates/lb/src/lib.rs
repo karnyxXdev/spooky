@@ -211,7 +211,7 @@ impl UpstreamPool {
     }
 
     pub fn pick(&mut self, key: &str) -> Option<usize> {
-        self.pool.reconcile_readmit(Instant::now());
+        self.pool.reconcile_readmit();
         let selected = self.load_balancer.pick(key, &self.pool)?;
         self.pool.begin_request(selected);
         Some(selected)
@@ -357,16 +357,30 @@ impl BackendPool {
         transition
     }
 
-    /// True when a passively-ejected backend's cooldown has elapsed and it is
-    /// due for re-admission (cheap O(1) check for the read-locked pick path).
-    pub fn readmit_due(&self, now: Instant) -> bool {
-        self.earliest_readmit.is_some_and(|at| now >= at)
+    /// True when any backend is passively ejected and pending re-admission.
+    /// Clock-free so the read-locked hot path pays only a branch (no syscall):
+    /// while something is pending, callers take the write-locked slow path where
+    /// `reconcile_readmit` checks the actual cooldown clock.
+    pub fn readmit_due(&self) -> bool {
+        self.earliest_readmit.is_some()
     }
 
     /// Re-admit passively-ejected backends whose cooldown has elapsed so live
-    /// traffic can probe them; recomputes the next pending expiry.
-    pub fn reconcile_readmit(&mut self, now: Instant) {
-        if !self.readmit_due(now) {
+    /// traffic can probe them. Reads the clock only when a re-admission is
+    /// actually pending, keeping the healthy pick path syscall-free.
+    pub fn reconcile_readmit(&mut self) {
+        if self.earliest_readmit.is_some() {
+            self.reconcile_readmit_at(Instant::now());
+        }
+    }
+
+    /// Core of [`reconcile_readmit`] with an injectable clock. Recomputes the
+    /// next pending expiry; early-returns while the soonest cooldown is unmet.
+    fn reconcile_readmit_at(&mut self, now: Instant) {
+        let Some(earliest) = self.earliest_readmit else {
+            return;
+        };
+        if now < earliest {
             return;
         }
         let mut next: Option<Instant> = None;

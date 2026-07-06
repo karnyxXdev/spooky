@@ -300,6 +300,38 @@ pub(super) fn is_valid_connect_authority(value: &str) -> bool {
     port.parse::<u16>().ok().is_some_and(|value| value > 0)
 }
 
+pub(super) fn is_valid_request_key_spec(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "path"
+            | "authority"
+            | "method"
+            | "cid"
+            | "sticky-cid"
+            | "peer_ip"
+            | "client_ip"
+            | "bearer_token"
+    ) {
+        return true;
+    }
+
+    let Some((source, key_name)) = trimmed.split_once(':') else {
+        return false;
+    };
+    let source = source.trim();
+    let key_name = key_name.trim();
+    !key_name.is_empty()
+        && matches!(
+            source.to_ascii_lowercase().as_str(),
+            "header" | "cookie" | "query"
+        )
+}
+
 pub(super) fn normalize_route_host(raw: &str) -> String {
     let trimmed = raw.trim();
     let host = if let Some(rest) = trimmed.strip_prefix('[') {

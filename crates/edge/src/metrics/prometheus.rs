@@ -42,6 +42,15 @@ impl Metrics {
             self.policy_denied.load(Ordering::Relaxed)
         ));
 
+        out.push_str(
+            "# HELP spooky_request_rate_limited Total requests rejected by scoped request rate limits.\n",
+        );
+        out.push_str("# TYPE spooky_request_rate_limited counter\n");
+        out.push_str(&format!(
+            "spooky_request_rate_limited {}\n",
+            self.request_rate_limited.load(Ordering::Relaxed)
+        ));
+
         out.push_str("# HELP spooky_early_data_accepted Total requests accepted in early data.\n");
         out.push_str("# TYPE spooky_early_data_accepted counter\n");
         out.push_str(&format!(
@@ -741,6 +750,10 @@ impl Metrics {
             out.push_str(&format!(
                 "spooky_route_timeout_total{{route=\"{}\"}} {}\n",
                 route, stats.timeout
+            ));
+            out.push_str(&format!(
+                "spooky_route_rate_limited_total{{route=\"{}\"}} {}\n",
+                route, stats.rate_limited
             ));
             out.push_str(&format!(
                 "spooky_route_backend_error_total{{route=\"{}\"}} {}\n",

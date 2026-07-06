@@ -1,8 +1,8 @@
 use super::validate;
 use crate::config::{
     Backend, ClientAuth, Config, ControlApi, HealthCheck, Listen, LoadBalancing, Log, LogFormat,
-    MetricsEndpoint, Observability, Performance, Resilience, RouteMatch, Security, Tls,
-    TlsCertificate, Tracing, Upstream, UpstreamTls,
+    MetricsEndpoint, Observability, Performance, Resilience, RouteMatch, ScopedRateLimit,
+    ScopedRateLimitScope, Security, Tls, TlsCertificate, Tracing, Upstream, UpstreamTls,
 };
 use rcgen::{Certificate, CertificateParams, SanType};
 use std::collections::HashMap;
@@ -920,6 +920,82 @@ fn rejects_host_policy_host_when_mode_is_not_rewrite() {
         .expect("upstream")
         .host_policy
         .host = Some("ignored.example.com".to_string());
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn accepts_scoped_rate_limit_with_supported_key_spec() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.scoped_rate_limits.push(ScopedRateLimit {
+        name: "tenant-header".to_string(),
+        scope: ScopedRateLimitScope::Tenant,
+        requests_per_sec: 50,
+        burst: 100,
+        key: Some("header:x-tenant-id".to_string()),
+        route_allowlist: vec!["test_upstream".to_string()],
+        idle_ttl_secs: 300,
+    });
+
+    assert!(validate(&cfg).is_ok());
+}
+
+#[test]
+fn rejects_tenant_scoped_rate_limit_without_key() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.scoped_rate_limits.push(ScopedRateLimit {
+        name: "tenant-missing-key".to_string(),
+        scope: ScopedRateLimitScope::Tenant,
+        requests_per_sec: 50,
+        burst: 100,
+        key: None,
+        route_allowlist: Vec::new(),
+        idle_ttl_secs: 300,
+    });
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_route_scoped_rate_limit_with_custom_key() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.scoped_rate_limits.push(ScopedRateLimit {
+        name: "route-key".to_string(),
+        scope: ScopedRateLimitScope::Route,
+        requests_per_sec: 10,
+        burst: 20,
+        key: Some("header:x-tenant-id".to_string()),
+        route_allowlist: Vec::new(),
+        idle_ttl_secs: 300,
+    });
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_scoped_rate_limit_with_empty_allowlist_entry() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.scoped_rate_limits.push(ScopedRateLimit {
+        name: "empty-route".to_string(),
+        scope: ScopedRateLimitScope::Client,
+        requests_per_sec: 10,
+        burst: 20,
+        key: Some("peer_ip".to_string()),
+        route_allowlist: vec![" ".to_string()],
+        idle_ttl_secs: 300,
+    });
 
     assert!(validate(&cfg).is_err());
 }

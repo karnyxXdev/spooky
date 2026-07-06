@@ -17,6 +17,7 @@ pub struct Metrics {
     pub requests_failure: AtomicU64,
     pub request_validation_rejects: AtomicU64,
     pub policy_denied: AtomicU64,
+    pub request_rate_limited: AtomicU64,
     pub early_data_accepted: AtomicU64,
     pub early_data_rejected: AtomicU64,
     pub health_checks_total: AtomicU64,
@@ -185,6 +186,7 @@ struct RouteStats {
     requests_total: u64,
     success: u64,
     failure: u64,
+    rate_limited: u64,
     timeout: u64,
     backend_error: u64,
     overload_shed: u64,
@@ -212,6 +214,7 @@ struct RouteStatsAtomic {
     requests_total: AtomicU64,
     success: AtomicU64,
     failure: AtomicU64,
+    rate_limited: AtomicU64,
     timeout: AtomicU64,
     backend_error: AtomicU64,
     overload_shed: AtomicU64,
@@ -224,6 +227,7 @@ impl RouteStatsAtomic {
             requests_total: AtomicU64::new(0),
             success: AtomicU64::new(0),
             failure: AtomicU64::new(0),
+            rate_limited: AtomicU64::new(0),
             timeout: AtomicU64::new(0),
             backend_error: AtomicU64::new(0),
             overload_shed: AtomicU64::new(0),
@@ -241,6 +245,7 @@ impl RouteStatsAtomic {
             requests_total: self.requests_total.load(Ordering::Relaxed),
             success: self.success.load(Ordering::Relaxed),
             failure: self.failure.load(Ordering::Relaxed),
+            rate_limited: self.rate_limited.load(Ordering::Relaxed),
             timeout: self.timeout.load(Ordering::Relaxed),
             backend_error: self.backend_error.load(Ordering::Relaxed),
             overload_shed: self.overload_shed.load(Ordering::Relaxed),
@@ -286,6 +291,7 @@ impl WorkerStatsAtomic {
 pub enum RouteOutcome {
     Success,
     Failure,
+    RateLimited,
     Timeout,
     BackendError,
     OverloadShed,
@@ -316,6 +322,7 @@ fn route_outcome_label(outcome: RouteOutcome) -> &'static str {
     match outcome {
         RouteOutcome::Success => "success",
         RouteOutcome::Failure => "failure",
+        RouteOutcome::RateLimited => "rate_limited",
         RouteOutcome::Timeout => "timeout",
         RouteOutcome::BackendError => "backend_error",
         RouteOutcome::OverloadShed => "overload_shed",
@@ -404,6 +411,7 @@ impl Metrics {
             requests_failure: AtomicU64::new(0),
             request_validation_rejects: AtomicU64::new(0),
             policy_denied: AtomicU64::new(0),
+            request_rate_limited: AtomicU64::new(0),
             early_data_accepted: AtomicU64::new(0),
             early_data_rejected: AtomicU64::new(0),
             health_checks_total: AtomicU64::new(0),
@@ -520,6 +528,10 @@ impl Metrics {
 
     pub fn inc_policy_denied(&self) {
         self.policy_denied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_request_rate_limited(&self) {
+        self.request_rate_limited.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_early_data_accepted(&self) {
@@ -1291,6 +1303,9 @@ impl Metrics {
             }
             RouteOutcome::Failure => {
                 entry.failure.fetch_add(1, Ordering::Relaxed);
+            }
+            RouteOutcome::RateLimited => {
+                entry.rate_limited.fetch_add(1, Ordering::Relaxed);
             }
             RouteOutcome::Timeout => {
                 entry.timeout.fetch_add(1, Ordering::Relaxed);

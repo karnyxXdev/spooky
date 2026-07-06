@@ -185,6 +185,21 @@ mod tests {
     }
 
     #[test]
+    fn metrics_render_includes_rate_limited_counters() {
+        let metrics = Metrics::new(1, [String::from("api_pool")]);
+        metrics.inc_request_rate_limited();
+        metrics.record_route(
+            "api_pool",
+            Duration::from_millis(8),
+            RouteOutcome::RateLimited,
+        );
+
+        let output = metrics.render_prometheus();
+        assert!(output.contains("spooky_request_rate_limited 1\n"));
+        assert!(output.contains("spooky_route_rate_limited_total{route=\"api_pool\"} 1\n"));
+    }
+
+    #[test]
     fn ingress_drop_counters_increment_correctly() {
         let metrics = Metrics::default();
         metrics.inc_ingress_bad_header();

@@ -1,5 +1,5 @@
 use super::*;
-use spooky_config::config::{ForwardedHeaderPolicy, UpstreamHostPolicy};
+use spooky_config::config::{ForwardedHeaderPolicy, ScopedRateLimitScope, UpstreamHostPolicy};
 use std::error::Error as StdError;
 
 #[derive(Clone)]
@@ -801,6 +801,29 @@ impl QUICListener {
         Ok(())
     }
 
+    pub(super) fn send_rate_limited_response(
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+        body: &[u8],
+        retry_after_seconds: u32,
+    ) -> Result<(), quiche::h3::Error> {
+        let retry_after = retry_after_seconds.max(1).to_string();
+        let resp_headers = vec![
+            quiche::h3::Header::new(
+                b":status",
+                http::StatusCode::TOO_MANY_REQUESTS.as_str().as_bytes(),
+            ),
+            quiche::h3::Header::new(b"content-type", b"text/plain"),
+            quiche::h3::Header::new(b"retry-after", retry_after.as_bytes()),
+            quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
+        ];
+
+        h3.send_response(quic, stream_id, &resp_headers, false)?;
+        h3.send_body(quic, stream_id, body, true)?;
+        Ok(())
+    }
+
     pub(super) fn flush_send(
         socket: &UdpSocket,
         send_buf: &mut [u8],
@@ -1026,6 +1049,40 @@ impl QUICListener {
                                 resilience
                                     .adaptive_admission
                                     .observe(request_start.elapsed(), true);
+                                continue;
+                            }
+
+                            if let Some(rejection) =
+                                resilience.scoped_rate_limits.check(&upstream_name, |rule| {
+                                    Self::resolve_scoped_rate_limit_key(
+                                        rule,
+                                        &upstream_name,
+                                        &method,
+                                        &path,
+                                        authority.as_deref(),
+                                        connection.peer_address,
+                                        Some(&lb_header_lookup),
+                                    )
+                                })
+                            {
+                                metrics.inc_failure();
+                                metrics.inc_request_rate_limited();
+                                metrics.record_route(
+                                    &upstream_name,
+                                    request_start.elapsed(),
+                                    RouteOutcome::RateLimited,
+                                );
+                                warn!(
+                                    "request_id=unassigned route={} scoped rate limit exceeded by rule={}",
+                                    rejection.route, rejection.rule_name
+                                );
+                                Self::send_rate_limited_response(
+                                    h3,
+                                    &mut connection.quic,
+                                    stream_id,
+                                    b"request rate limited\n",
+                                    rejection.retry_after_seconds,
+                                )?;
                                 continue;
                             }
 
@@ -3056,6 +3113,7 @@ impl QUICListener {
         path: &str,
         authority: Option<&str>,
         cid_key: Option<&str>,
+        client_addr: Option<SocketAddr>,
         header_lookup: Option<&LbHeaderLookup<'_>>,
     ) -> Option<String> {
         let spec = lb_key_spec.trim();
@@ -3075,6 +3133,14 @@ impl QUICListener {
         }
         if spec.eq_ignore_ascii_case("cid") || spec.eq_ignore_ascii_case("sticky-cid") {
             return cid_key.map(str::to_string);
+        }
+        if spec.eq_ignore_ascii_case("peer_ip") || spec.eq_ignore_ascii_case("client_ip") {
+            return client_addr.map(|addr| addr.ip().to_string());
+        }
+        if spec.eq_ignore_ascii_case("bearer_token") {
+            let raw =
+                header_lookup.and_then(|lookup| lookup(http::header::AUTHORIZATION.as_str()))?;
+            return Self::bearer_token_from_authorization_value(&raw);
         }
 
         let (source, key_name) = spec.split_once(':')?;
@@ -3124,6 +3190,7 @@ impl QUICListener {
                 path,
                 authority,
                 cid_key,
+                None,
                 header_lookup,
             )
             && !value.is_empty()
@@ -3139,11 +3206,69 @@ impl QUICListener {
 
         default_key
     }
+
+    fn bearer_token_from_authorization_value(raw: &str) -> Option<String> {
+        let raw = raw.trim();
+        let split = raw.find(char::is_whitespace)?;
+        let (scheme, rest) = raw.split_at(split);
+        if !scheme.eq_ignore_ascii_case("bearer") {
+            return None;
+        }
+        let token = rest.trim_start();
+        if token.is_empty() {
+            return None;
+        }
+        Some(token.to_string())
+    }
+
+    fn resolve_scoped_rate_limit_key(
+        rule: &crate::resilience::ScopedRateLimitRule,
+        route: &str,
+        method: &str,
+        path: &str,
+        authority: Option<&str>,
+        client_addr: SocketAddr,
+        header_lookup: Option<&LbHeaderLookup<'_>>,
+    ) -> Option<String> {
+        match rule.scope() {
+            ScopedRateLimitScope::Route => Some(route.to_string()),
+            ScopedRateLimitScope::Client => Self::resolve_lb_key_from_spec(
+                rule.key_spec().unwrap_or("peer_ip"),
+                method,
+                path,
+                authority,
+                None,
+                Some(client_addr),
+                header_lookup,
+            ),
+            ScopedRateLimitScope::Tenant => rule.key_spec().and_then(|key_spec| {
+                Self::resolve_lb_key_from_spec(
+                    key_spec,
+                    method,
+                    path,
+                    authority,
+                    None,
+                    Some(client_addr),
+                    header_lookup,
+                )
+            }),
+            ScopedRateLimitScope::Token => Self::resolve_lb_key_from_spec(
+                rule.key_spec().unwrap_or("bearer_token"),
+                method,
+                path,
+                authority,
+                None,
+                Some(client_addr),
+                header_lookup,
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spooky_config::config::{ScopedRateLimit, ScopedRateLimitScope};
 
     #[test]
     fn internal_pool_errors_are_classified_as_control_plane_only() {
@@ -3251,5 +3376,95 @@ mod tests {
     fn format_error_chain_includes_nested_causes() {
         let msg = QUICListener::format_error_chain(&OuterErr(InnerErr));
         assert_eq!(msg, "outer: inner");
+    }
+
+    #[test]
+    fn resolve_lb_key_from_spec_supports_peer_ip_and_bearer_token() {
+        let headers = [("authorization".to_string(), "Bearer token-1".to_string())]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
+        let client_addr = "203.0.113.9:443".parse().expect("client addr");
+
+        assert_eq!(
+            QUICListener::resolve_lb_key_from_spec(
+                "peer_ip",
+                "GET",
+                "/",
+                Some("api.example.com"),
+                None,
+                Some(client_addr),
+                Some(&lookup),
+            )
+            .as_deref(),
+            Some("203.0.113.9")
+        );
+        assert_eq!(
+            QUICListener::resolve_lb_key_from_spec(
+                "bearer_token",
+                "GET",
+                "/",
+                Some("api.example.com"),
+                None,
+                Some(client_addr),
+                Some(&lookup),
+            )
+            .as_deref(),
+            Some("token-1")
+        );
+    }
+
+    #[test]
+    fn resolve_scoped_rate_limit_key_defaults_match_scope() {
+        let client_rule = crate::resilience::ScopedRateLimitRule::from_config(&ScopedRateLimit {
+            name: "client".to_string(),
+            scope: ScopedRateLimitScope::Client,
+            requests_per_sec: 10,
+            burst: 10,
+            key: None,
+            route_allowlist: Vec::new(),
+            idle_ttl_secs: 300,
+        });
+        let token_rule = crate::resilience::ScopedRateLimitRule::from_config(&ScopedRateLimit {
+            name: "token".to_string(),
+            scope: ScopedRateLimitScope::Token,
+            requests_per_sec: 10,
+            burst: 10,
+            key: None,
+            route_allowlist: Vec::new(),
+            idle_ttl_secs: 300,
+        });
+        let headers = [("authorization".to_string(), "Bearer token-2".to_string())]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
+        let client_addr = "198.51.100.10:443".parse().expect("client addr");
+
+        assert_eq!(
+            QUICListener::resolve_scoped_rate_limit_key(
+                &client_rule,
+                "api",
+                "GET",
+                "/resource",
+                Some("api.example.com"),
+                client_addr,
+                Some(&lookup),
+            )
+            .as_deref(),
+            Some("198.51.100.10")
+        );
+        assert_eq!(
+            QUICListener::resolve_scoped_rate_limit_key(
+                &token_rule,
+                "api",
+                "GET",
+                "/resource",
+                Some("api.example.com"),
+                client_addr,
+                Some(&lookup),
+            )
+            .as_deref(),
+            Some("token-2")
+        );
     }
 }

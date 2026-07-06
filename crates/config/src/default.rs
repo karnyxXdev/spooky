@@ -219,6 +219,10 @@ pub fn perf_default_request_buffer_global_cap_bytes() -> usize {
     64 * 1024 * 1024 // 64 MiB
 }
 
+pub fn resilience_default_scoped_rate_limit_idle_ttl_secs() -> u64 {
+    300
+}
+
 pub fn perf_default_unknown_length_response_prebuffer_bytes() -> usize {
     2 * 1024 * 1024 // 2 MiB
 }

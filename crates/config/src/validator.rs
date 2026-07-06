@@ -1,7 +1,7 @@
 use crate::backend_endpoint::{BackendEndpoint, BackendScheme};
 use crate::config::{
-    CURRENT_CONFIG_VERSION, Config, Listen, SUPPORTED_CONFIG_VERSIONS, UpstreamHostPolicyMode,
-    UpstreamTls,
+    CURRENT_CONFIG_VERSION, Config, Listen, SUPPORTED_CONFIG_VERSIONS, ScopedRateLimitScope,
+    UpstreamHostPolicyMode, UpstreamTls,
 };
 use log::{info, warn};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -645,6 +645,96 @@ fn validate_inner(config: &Config) -> bool {
     {
         validation_error!("resilience.retry_budget.per_route_ratio_percent values must be <= 100");
         return false;
+    }
+
+    let mut seen_scoped_rate_limit_names = std::collections::HashSet::new();
+    for rule in &config.resilience.scoped_rate_limits {
+        let rule_name = rule.name.trim();
+        if rule_name.is_empty() {
+            validation_error!("resilience.scoped_rate_limits[].name must be non-empty");
+            return false;
+        }
+        if !seen_scoped_rate_limit_names.insert(rule_name.to_string()) {
+            validation_error!(
+                "resilience.scoped_rate_limits contains duplicate rule name '{}'",
+                rule_name
+            );
+            return false;
+        }
+        if rule.requests_per_sec == 0 {
+            validation_error!(
+                "resilience.scoped_rate_limits['{}'].requests_per_sec must be greater than 0",
+                rule_name
+            );
+            return false;
+        }
+        if rule.burst == 0 {
+            validation_error!(
+                "resilience.scoped_rate_limits['{}'].burst must be greater than 0",
+                rule_name
+            );
+            return false;
+        }
+        if rule.idle_ttl_secs == 0 {
+            validation_error!(
+                "resilience.scoped_rate_limits['{}'].idle_ttl_secs must be greater than 0",
+                rule_name
+            );
+            return false;
+        }
+        if rule
+            .route_allowlist
+            .iter()
+            .any(|route| route.trim().is_empty())
+        {
+            validation_error!(
+                "resilience.scoped_rate_limits['{}'].route_allowlist must not contain empty values",
+                rule_name
+            );
+            return false;
+        }
+        match rule.scope {
+            ScopedRateLimitScope::Route => {
+                if rule
+                    .key
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    validation_error!(
+                        "resilience.scoped_rate_limits['{}'].key is invalid for scope=route",
+                        rule_name
+                    );
+                    return false;
+                }
+            }
+            ScopedRateLimitScope::Tenant => {
+                let Some(key_spec) = rule.key.as_deref() else {
+                    validation_error!(
+                        "resilience.scoped_rate_limits['{}'].key is required for scope=tenant",
+                        rule_name
+                    );
+                    return false;
+                };
+                if !is_valid_request_key_spec(key_spec) {
+                    validation_error!(
+                        "resilience.scoped_rate_limits['{}'].key must be a supported request key spec",
+                        rule_name
+                    );
+                    return false;
+                }
+            }
+            ScopedRateLimitScope::Client | ScopedRateLimitScope::Token => {
+                if let Some(key_spec) = rule.key.as_deref()
+                    && !is_valid_request_key_spec(key_spec)
+                {
+                    validation_error!(
+                        "resilience.scoped_rate_limits['{}'].key must be a supported request key spec",
+                        rule_name
+                    );
+                    return false;
+                }
+            }
+        }
     }
 
     if config.resilience.brownout.trigger_inflight_percent > 100

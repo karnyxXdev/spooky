@@ -50,6 +50,7 @@ use crate::default::{
     resilience_default_retry_budget_enabled, resilience_default_retry_budget_ratio_percent,
     resilience_default_route_queue_default_cap, resilience_default_route_queue_global_cap,
     resilience_default_route_queue_shed_retry_after_seconds,
+    resilience_default_scoped_rate_limit_idle_ttl_secs,
     resilience_default_watchdog_check_interval_ms, resilience_default_watchdog_drain_grace_ms,
     resilience_default_watchdog_enabled, resilience_default_watchdog_min_requests_per_window,
     resilience_default_watchdog_overload_inflight_percent,
@@ -559,6 +560,8 @@ pub struct Resilience {
     #[serde(default)]
     pub route_queue: RouteQueue,
     #[serde(default)]
+    pub scoped_rate_limits: Vec<ScopedRateLimit>,
+    #[serde(default)]
     pub protocol: ProtocolPolicy,
     #[serde(default)]
     pub circuit_breaker: CircuitBreaker,
@@ -620,6 +623,111 @@ impl Resilience {
                 self.retry_budget.ratio_percent,
             ));
         }
+        for rule in &self.scoped_rate_limits {
+            let rule_name = rule.name.trim();
+            if rule_name.is_empty() {
+                return Err("resilience.scoped_rate_limits[].name must be non-empty".into());
+            }
+            if rule.requests_per_sec == 0 {
+                return Err(format!(
+                    "resilience.scoped_rate_limits['{}'].requests_per_sec must be > 0",
+                    rule_name
+                ));
+            }
+            if rule.burst == 0 {
+                return Err(format!(
+                    "resilience.scoped_rate_limits['{}'].burst must be > 0",
+                    rule_name
+                ));
+            }
+            if rule.idle_ttl_secs == 0 {
+                return Err(format!(
+                    "resilience.scoped_rate_limits['{}'].idle_ttl_secs must be > 0",
+                    rule_name
+                ));
+            }
+            if rule
+                .route_allowlist
+                .iter()
+                .any(|route| route.trim().is_empty())
+            {
+                return Err(format!(
+                    "resilience.scoped_rate_limits['{}'].route_allowlist must not contain empty values",
+                    rule_name
+                ));
+            }
+            match rule.scope {
+                ScopedRateLimitScope::Route => {
+                    if rule
+                        .key
+                        .as_ref()
+                        .is_some_and(|value| !value.trim().is_empty())
+                    {
+                        return Err(format!(
+                            "resilience.scoped_rate_limits['{}'].key is invalid for scope=route",
+                            rule_name
+                        ));
+                    }
+                }
+                ScopedRateLimitScope::Tenant => {
+                    let Some(key_spec) = rule.key.as_deref() else {
+                        return Err(format!(
+                            "resilience.scoped_rate_limits['{}'].key is required for scope=tenant",
+                            rule_name
+                        ));
+                    };
+                    if !matches!(
+                        key_spec.trim().to_ascii_lowercase().as_str(),
+                        "path"
+                            | "authority"
+                            | "method"
+                            | "cid"
+                            | "sticky-cid"
+                            | "peer_ip"
+                            | "client_ip"
+                            | "bearer_token"
+                    ) && !key_spec.split_once(':').is_some_and(|(source, key_name)| {
+                        !key_name.trim().is_empty()
+                            && matches!(
+                                source.trim().to_ascii_lowercase().as_str(),
+                                "header" | "cookie" | "query"
+                            )
+                    }) {
+                        return Err(format!(
+                            "resilience.scoped_rate_limits['{}'].key must be a supported request key spec",
+                            rule_name
+                        ));
+                    }
+                }
+                ScopedRateLimitScope::Client | ScopedRateLimitScope::Token => {
+                    if let Some(key_spec) = rule.key.as_deref()
+                        && !matches!(
+                            key_spec.trim().to_ascii_lowercase().as_str(),
+                            "path"
+                                | "authority"
+                                | "method"
+                                | "cid"
+                                | "sticky-cid"
+                                | "peer_ip"
+                                | "client_ip"
+                                | "bearer_token"
+                        )
+                        && !key_spec.split_once(':').is_some_and(|(source, key_name)| {
+                            !key_name.trim().is_empty()
+                                && matches!(
+                                    source.trim().to_ascii_lowercase().as_str(),
+                                    "header" | "cookie" | "query"
+                                )
+                        })
+                    {
+                        return Err(format!(
+                            "resilience.scoped_rate_limits['{}'].key must be a supported request key spec",
+                            rule_name
+                        ));
+                    }
+                }
+            }
+        }
         if self.hedging.enabled && self.hedging.delay_ms == 0 {
             return Err("resilience.hedging: delay_ms must be > 0 when hedging is enabled".into());
         }
@@ -662,6 +770,30 @@ impl Default for RouteQueue {
             caps: HashMap::new(),
         }
     }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopedRateLimitScope {
+    Route,
+    Client,
+    Tenant,
+    Token,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedRateLimit {
+    pub name: String,
+    pub scope: ScopedRateLimitScope,
+    pub requests_per_sec: u32,
+    pub burst: u32,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub route_allowlist: Vec<String>,
+    #[serde(default = "resilience_default_scoped_rate_limit_idle_ttl_secs")]
+    pub idle_ttl_secs: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

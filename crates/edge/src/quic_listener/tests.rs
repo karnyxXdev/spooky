@@ -1795,6 +1795,7 @@ fn make_envelope(phase: StreamPhase) -> RequestEnvelope {
         bodyless_mode: false,
         retry_count: 0,
         error_kind: None,
+        pending_forward: None,
         tunnel_mode: crate::types::TunnelMode::None,
         phase,
         admission_state: StreamAdmissionState::ReadyToForward,

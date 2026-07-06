@@ -16,9 +16,9 @@ pub use hash::{stable_hash_socket_addr, stable_hash64};
 pub use metrics::{HealthFailureReason, Metrics, OverloadShedReason, RetryReason, RouteOutcome};
 pub use quic_listener::configure_async_runtime;
 pub use types::{
-    ForwardResult, HealthClassification, HedgeTelemetry, QUICListener, QuicConnection,
-    RequestEnvelope, ResponseChunk, SharedRuntimeState, StreamAdmissionState, StreamPhase,
-    UpstreamResult, outcome_from_status,
+    ForwardResult, HealthClassification, HedgeTelemetry, PendingForward, PendingHeaderMutation,
+    QUICListener, QuicConnection, RequestEnvelope, ResponseChunk, SharedRuntimeState,
+    StreamAdmissionState, StreamPhase, UpstreamResult, outcome_from_status,
 };
 #[cfg(test)]
 mod tests {

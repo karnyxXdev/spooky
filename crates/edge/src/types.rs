@@ -4,7 +4,7 @@ use log::warn;
 use rustls::ServerConfig as RustlsServerConfig;
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
-    config::Log,
+    config::{ForwardedHeaderPolicy, Log, UpstreamHostPolicy},
     runtime::{
         ListenerRuntimeConfig, RuntimeConfig, RuntimeListenerTls, RuntimeTlsIdentity,
         RuntimeUpstreamPolicy,
@@ -793,6 +793,35 @@ pub enum StreamAdmissionState {
     Denied,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingHeaderMutation {
+    Upsert { name: Vec<u8>, value: Vec<u8> },
+    Remove { name: Vec<u8> },
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingForward {
+    pub method: Arc<str>,
+    pub path: Arc<str>,
+    pub authority: Option<Arc<str>>,
+    pub headers: Arc<Vec<quiche::h3::Header>>,
+    pub upstream_name: Arc<str>,
+    pub route_reason: Arc<str>,
+    pub route_path_len: usize,
+    pub route_host_specific: bool,
+    pub backend_addr: Arc<str>,
+    pub backend_index: usize,
+    pub backend_lb: Option<Arc<str>>,
+    pub client_addr: SocketAddr,
+    pub request_id: u64,
+    pub trace_id: Option<Arc<str>>,
+    pub span_id: Option<Arc<str>>,
+    pub traceparent: Option<Arc<str>>,
+    pub host_policy: UpstreamHostPolicy,
+    pub forwarded_header_policy: ForwardedHeaderPolicy,
+    pub auth_header_mutations: Vec<PendingHeaderMutation>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunnelMode {
     None,
@@ -861,6 +890,8 @@ pub struct RequestEnvelope {
 
     pub retry_count: u8,
     pub error_kind: Option<&'static str>,
+    /// Deferred request-building snapshot for async auth/admission handoff.
+    pub pending_forward: Option<Arc<PendingForward>>,
 
     /// Current lifecycle phase of this stream.
     pub phase: StreamPhase,

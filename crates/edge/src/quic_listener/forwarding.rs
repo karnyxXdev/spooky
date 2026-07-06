@@ -1,38 +1,47 @@
 use super::*;
-use crate::StreamAdmissionState;
+use crate::{PendingForward, PendingHeaderMutation, StreamAdmissionState};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::Sha256;
-use spooky_config::config::{ForwardedHeaderPolicy, ScopedRateLimitScope, UpstreamHostPolicy};
+use spooky_config::config::ScopedRateLimitScope;
 use std::error::Error as StdError;
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
-#[derive(Clone)]
-pub(super) struct ForwardRequestMeta {
-    pub(super) method: Arc<str>,
-    pub(super) path: Arc<str>,
-    pub(super) authority: Option<Arc<str>>,
-    pub(super) headers: Arc<Vec<quiche::h3::Header>>,
-    pub(super) client_addr: SocketAddr,
-    pub(super) request_id: u64,
-    pub(super) traceparent: Option<Arc<str>>,
-    pub(super) host_policy: UpstreamHostPolicy,
-    pub(super) forwarded_header_policy: ForwardedHeaderPolicy,
-}
+impl PendingForward {
+    fn request_headers(&self) -> Vec<quiche::h3::Header> {
+        let mut headers = self.headers.as_ref().clone();
+        for mutation in &self.auth_header_mutations {
+            match mutation {
+                PendingHeaderMutation::Upsert { name, value } => {
+                    headers.retain(|header| !header.name().eq_ignore_ascii_case(name.as_slice()));
+                    headers.push(quiche::h3::Header::new(name.as_slice(), value.as_slice()));
+                }
+                PendingHeaderMutation::Remove { name } => {
+                    headers.retain(|header| !header.name().eq_ignore_ascii_case(name.as_slice()));
+                }
+            }
+        }
+        headers
+    }
 
-impl ForwardRequestMeta {
-    pub(super) fn build_bodyless_request(
-        &self,
-        endpoint: &BackendEndpoint,
-    ) -> Result<Request<BoxBody<Bytes, std::convert::Infallible>>, ProxyError> {
-        let ctx = ForwardedContext {
+    fn forwarded_context(&self) -> ForwardedContext<'_> {
+        ForwardedContext {
             client_addr: self.client_addr,
             request_authority: self.authority.as_deref(),
             request_id: self.request_id,
             traceparent: self.traceparent.as_deref(),
-        };
+        }
+    }
+
+    fn build_request(
+        &self,
+        endpoint: &BackendEndpoint,
+        body: BoxBody<Bytes, std::convert::Infallible>,
+        content_length: Option<usize>,
+    ) -> Result<Request<BoxBody<Bytes, std::convert::Infallible>>, ProxyError> {
+        let headers = self.request_headers();
         if endpoint.scheme() == BackendScheme::Http {
             build_h1_request_for_endpoint_with_host_policy(
                 endpoint,
@@ -40,10 +49,10 @@ impl ForwardRequestMeta {
                 &self.forwarded_header_policy,
                 &self.method,
                 &self.path,
-                self.headers.as_slice(),
-                BoxBody::new(Full::new(Bytes::new())),
-                Some(0),
-                ctx,
+                &headers,
+                body,
+                content_length,
+                self.forwarded_context(),
             )
             .map_err(ProxyError::from)
         } else {
@@ -53,13 +62,52 @@ impl ForwardRequestMeta {
                 &self.forwarded_header_policy,
                 &self.method,
                 &self.path,
-                self.headers.as_slice(),
-                BoxBody::new(Full::new(Bytes::new())),
-                Some(0),
-                ctx,
+                &headers,
+                body,
+                content_length,
+                self.forwarded_context(),
             )
             .map_err(ProxyError::from)
         }
+    }
+
+    pub(super) fn build_bodyless_request(
+        &self,
+        endpoint: &BackendEndpoint,
+    ) -> Result<Request<BoxBody<Bytes, std::convert::Infallible>>, ProxyError> {
+        self.build_request(endpoint, BoxBody::new(Full::new(Bytes::new())), Some(0))
+    }
+
+    fn build_http1_websocket_tunnel_request(
+        &self,
+        endpoint: &BackendEndpoint,
+    ) -> Result<Request<BoxBody<Bytes, std::convert::Infallible>>, ProxyError> {
+        let mut request_headers = self.request_headers();
+        let has_upgrade = request_headers
+            .iter()
+            .any(|header| header.name().eq_ignore_ascii_case(b"upgrade"));
+        if !has_upgrade {
+            request_headers.push(quiche::h3::Header::new(b"upgrade", b"websocket"));
+        }
+        let has_connection = request_headers
+            .iter()
+            .any(|header| header.name().eq_ignore_ascii_case(b"connection"));
+        if !has_connection {
+            request_headers.push(quiche::h3::Header::new(b"connection", b"upgrade"));
+        }
+
+        build_h1_request_for_endpoint_with_host_policy(
+            endpoint,
+            &self.host_policy,
+            &self.forwarded_header_policy,
+            "GET",
+            &self.path,
+            &request_headers,
+            BoxBody::new(Full::new(Bytes::new())),
+            None,
+            self.forwarded_context(),
+        )
+        .map_err(ProxyError::from)
     }
 }
 
@@ -185,76 +233,14 @@ impl QUICListener {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build_http1_websocket_tunnel_request(
-        endpoint: &BackendEndpoint,
-        host_policy: &UpstreamHostPolicy,
-        forwarded_policy: &ForwardedHeaderPolicy,
-        path: &str,
-        headers: &[quiche::h3::Header],
-        client_addr: SocketAddr,
-        request_authority: Option<&str>,
-        request_id: u64,
-        traceparent: Option<&str>,
-    ) -> Result<Request<BoxBody<Bytes, std::convert::Infallible>>, ProxyError> {
-        let mut request_headers = headers.to_vec();
-        let has_upgrade = request_headers
-            .iter()
-            .any(|header| header.name().eq_ignore_ascii_case(b"upgrade"));
-        if !has_upgrade {
-            request_headers.push(quiche::h3::Header::new(b"upgrade", b"websocket"));
-        }
-        let has_connection = request_headers
-            .iter()
-            .any(|header| header.name().eq_ignore_ascii_case(b"connection"));
-        if !has_connection {
-            request_headers.push(quiche::h3::Header::new(b"connection", b"upgrade"));
-        }
-
-        build_h1_request_for_endpoint_with_host_policy(
-            endpoint,
-            host_policy,
-            forwarded_policy,
-            "GET",
-            path,
-            &request_headers,
-            BoxBody::new(Full::new(Bytes::new())),
-            None,
-            ForwardedContext {
-                client_addr,
-                request_authority,
-                request_id,
-                traceparent,
-            },
-        )
-        .map_err(ProxyError::from)
-    }
-
-    #[allow(clippy::too_many_arguments)]
     async fn forward_http1_websocket_tunnel(
         endpoint: BackendEndpoint,
-        host_policy: UpstreamHostPolicy,
-        forwarded_policy: ForwardedHeaderPolicy,
-        path: String,
-        headers: Vec<quiche::h3::Header>,
-        client_addr: SocketAddr,
-        request_authority: Option<String>,
-        request_id: u64,
-        traceparent: Option<String>,
+        pending_forward: Arc<PendingForward>,
         mut body_rx: mpsc::Receiver<Bytes>,
         backend_timeout: Duration,
         metrics: Arc<Metrics>,
     ) -> ForwardResult {
-        let request = Self::build_http1_websocket_tunnel_request(
-            &endpoint,
-            &host_policy,
-            &forwarded_policy,
-            &path,
-            &headers,
-            client_addr,
-            request_authority.as_deref(),
-            request_id,
-            traceparent.as_deref(),
-        )?;
+        let request = pending_forward.build_http1_websocket_tunnel_request(&endpoint)?;
 
         let stream = tokio::time::timeout(
             backend_timeout,
@@ -1079,6 +1065,7 @@ impl QUICListener {
                         traceparent,
                         trace_span,
                         request_id,
+                        pending_forward,
                     ) = match resolved {
                         Ok(ResolvedBackend {
                             upstream_name,
@@ -1442,66 +1429,57 @@ impl QUICListener {
                                 .get(&upstream_name)
                                 .cloned()
                                 .unwrap_or_default();
-                            let build_result = if backend_endpoint.scheme() == BackendScheme::Http {
-                                build_h1_request_for_endpoint_with_host_policy(
-                                    &backend_endpoint,
-                                    &upstream_policy.host.0,
-                                    &upstream_policy.forwarded_headers.0,
-                                    &method,
-                                    &path,
-                                    &list,
-                                    boxed,
-                                    None,
-                                    ForwardedContext {
-                                        client_addr: connection.peer_address,
-                                        request_authority: authority.as_deref(),
-                                        request_id,
-                                        traceparent: traceparent.as_deref(),
-                                    },
-                                )
-                            } else {
-                                build_h2_request_for_endpoint_with_host_policy(
-                                    &backend_endpoint,
-                                    &upstream_policy.host.0,
-                                    &upstream_policy.forwarded_headers.0,
-                                    &method,
-                                    &path,
-                                    &list,
-                                    boxed,
-                                    None,
-                                    ForwardedContext {
-                                        client_addr: connection.peer_address,
-                                        request_authority: authority.as_deref(),
-                                        request_id,
-                                        traceparent: traceparent.as_deref(),
-                                    },
-                                )
-                            };
-                            let request = match build_result {
-                                Ok(request) => request,
-                                Err(err) => {
-                                    drop(upstream_permit);
-                                    drop(global_permit);
-                                    metrics.inc_failure();
-                                    metrics.record_route(
-                                        &upstream_name,
-                                        request_start.elapsed(),
-                                        RouteOutcome::Failure,
-                                    );
-                                    Self::send_simple_response(
-                                        h3,
-                                        &mut connection.quic,
-                                        stream_id,
-                                        http::StatusCode::BAD_REQUEST,
-                                        b"invalid request\n",
-                                    )?;
-                                    error!("failed to build upstream request: {}", err);
-                                    resilience
-                                        .adaptive_admission
-                                        .observe(request_start.elapsed(), true);
-                                    continue;
-                                }
-                            };
+                            let pending_forward = Arc::new(PendingForward {
+                                method: Arc::<str>::from(method.as_str()),
+                                path: Arc::<str>::from(path.as_str()),
+                                authority: authority.as_deref().map(Arc::<str>::from),
+                                headers: Arc::new(list.clone()),
+                                upstream_name: Arc::<str>::from(upstream_name.as_str()),
+                                route_reason: Arc::<str>::from(format!("{route_reason:?}")),
+                                route_path_len,
+                                route_host_specific,
+                                backend_addr: Arc::<str>::from(addr.as_str()),
+                                backend_index: idx,
+                                backend_lb: Some(Arc::<str>::from(backend_lb.as_str())),
+                                client_addr: connection.peer_address,
+                                request_id,
+                                trace_id: trace_id.as_deref().map(Arc::<str>::from),
+                                span_id: span_id.as_deref().map(Arc::<str>::from),
+                                traceparent: traceparent.as_deref().map(Arc::<str>::from),
+                                host_policy: upstream_policy.host.0.clone(),
+                                forwarded_header_policy: upstream_policy
+                                    .forwarded_headers
+                                    .0
+                                    .clone(),
+                                auth_header_mutations: Vec::new(),
+                            });
+                            let request =
+                                match pending_forward.build_request(&backend_endpoint, boxed, None)
+                                {
+                                    Ok(request) => request,
+                                    Err(err) => {
+                                        drop(upstream_permit);
+                                        drop(global_permit);
+                                        metrics.inc_failure();
+                                        metrics.record_route(
+                                            &upstream_name,
+                                            request_start.elapsed(),
+                                            RouteOutcome::Failure,
+                                        );
+                                        Self::send_simple_response(
+                                            h3,
+                                            &mut connection.quic,
+                                            stream_id,
+                                            http::StatusCode::BAD_REQUEST,
+                                            b"invalid request\n",
+                                        )?;
+                                        error!("failed to build upstream request: {}", err);
+                                        resilience
+                                            .adaptive_admission
+                                            .observe(request_start.elapsed(), true);
+                                        continue;
+                                    }
+                                };
 
                             let transport = transport_pool.clone();
                             let fwd_addr = addr.clone();
@@ -1516,29 +1494,9 @@ impl QUICListener {
                             let hedge_delay = resilience.hedging_delay;
                             let alternate_backend =
                                 Self::pick_alternate_backend(&upstream_pool, idx);
-                            let forward_meta = (!is_tunnel_mode(tunnel_mode) && bodyless_mode)
-                                .then(|| {
-                                    Arc::new(ForwardRequestMeta {
-                                        method: Arc::<str>::from(method.as_str()),
-                                        path: Arc::<str>::from(path.as_str()),
-                                        authority: authority.as_deref().map(Arc::<str>::from),
-                                        headers: Arc::new(list.clone()),
-                                        client_addr: connection.peer_address,
-                                        request_id,
-                                        traceparent: traceparent.as_deref().map(Arc::<str>::from),
-                                        host_policy: upstream_policy.host.0.clone(),
-                                        forwarded_header_policy: upstream_policy
-                                            .forwarded_headers
-                                            .0
-                                            .clone(),
-                                    })
-                                });
                             let trace_span_for_upstream = trace_span.clone();
+                            let pending_forward_for_upstream = Arc::clone(&pending_forward);
                             let (result_tx, result_rx) = oneshot::channel::<UpstreamResult>();
-                            let client_addr = connection.peer_address;
-                            let path_for_upstream = path.clone();
-                            let authority_for_upstream = authority.clone();
-                            let traceparent_for_upstream = traceparent.clone();
                             let upstream_metrics = Arc::clone(&metrics);
                             let fut = async move {
                                 let mut hedge_telemetry = crate::HedgeTelemetry::default();
@@ -1581,14 +1539,7 @@ impl QUICListener {
                                         };
                                         Self::forward_http1_websocket_tunnel(
                                             backend_endpoint.clone(),
-                                            upstream_policy.host.0.clone(),
-                                            upstream_policy.forwarded_headers.0.clone(),
-                                            path_for_upstream.clone(),
-                                            list.clone(),
-                                            client_addr,
-                                            authority_for_upstream.clone(),
-                                            request_id,
-                                            traceparent_for_upstream.clone(),
+                                            Arc::clone(&pending_forward_for_upstream),
                                             body_rx,
                                             backend_timeout,
                                             Arc::clone(&upstream_metrics),
@@ -1599,7 +1550,8 @@ impl QUICListener {
                                         let hedge_candidate = alternate_backend
                                             .clone()
                                             .and_then(|(backend, _idx)| {
-                                                let meta = forward_meta.as_ref()?;
+                                                let meta = (!is_tunnel_mode(tunnel_mode) && bodyless_mode)
+                                                    .then_some(Arc::clone(&pending_forward_for_upstream))?;
                                                 let endpoint = backend_endpoints.get(&backend)?;
                                                 meta.build_bodyless_request(endpoint)
                                                     .ok()
@@ -1692,7 +1644,8 @@ impl QUICListener {
                                                     return Err(primary_err);
                                                 } else if let Some((retry_backend, _)) =
                                                         alternate_backend.clone()
-                                                    && let Some(meta) = forward_meta.as_ref()
+                                                    && let Some(meta) = (!is_tunnel_mode(tunnel_mode) && bodyless_mode)
+                                                        .then_some(Arc::clone(&pending_forward_for_upstream))
                                                     && let Some(endpoint) = backend_endpoints
                                                         .get(&retry_backend)
                                                     && let Ok(retry_request) =
@@ -1766,6 +1719,7 @@ impl QUICListener {
                                 traceparent,
                                 trace_span,
                                 request_id,
+                                Some(pending_forward),
                             )
                         }
                         Err(err) => {
@@ -1872,6 +1826,7 @@ impl QUICListener {
                             tunnel_mode,
                             retry_count: 0,
                             error_kind: None,
+                            pending_forward,
                             phase: StreamPhase::ReceivingRequest,
                             admission_state: StreamAdmissionState::ReadyToForward,
                             request_fin_received,

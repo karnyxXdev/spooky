@@ -325,6 +325,13 @@ fn passively_ejected_backend_recovers_after_cooldown() {
 
     // After the cooldown: re-admitted so live traffic can probe it again.
     pool.reconcile_readmit_at(Instant::now() + Duration::from_millis(10_001));
-    assert_eq!(pool.healthy_len(), 1, "backend should recover after cooldown");
-    assert!(!pool.readmit_due(), "no pending re-admission after recovery");
+    assert_eq!(
+        pool.healthy_len(),
+        1,
+        "backend should recover after cooldown"
+    );
+    assert!(
+        !pool.readmit_due(),
+        "no pending re-admission after recovery"
+    );
 }

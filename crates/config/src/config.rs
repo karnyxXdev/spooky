@@ -237,6 +237,10 @@ pub struct RouteAuth {
     pub api_key: Option<ApiKeyAuth>,
     #[serde(default)]
     pub jwt: Option<JwtAuth>,
+    #[serde(default)]
+    pub required_scopes: Vec<String>,
+    #[serde(default)]
+    pub required_roles: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

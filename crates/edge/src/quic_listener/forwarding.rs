@@ -3318,83 +3318,87 @@ impl QUICListener {
         let Some(token) = Self::bearer_token_from_authorization_value(&raw) else {
             return false;
         };
-        Self::validate_hs256_jwt(token.as_str(), jwt, SystemTime::now())
+        let Some(claims) = Self::validated_hs256_jwt_claims(token.as_str(), jwt, SystemTime::now())
+        else {
+            return false;
+        };
+        Self::jwt_claims_satisfy_rbac(policy, &claims)
     }
 
-    fn validate_hs256_jwt(
+    fn validated_hs256_jwt_claims(
         token: &str,
         jwt: &spooky_config::config::JwtAuth,
         now: SystemTime,
-    ) -> bool {
+    ) -> Option<Value> {
         let mut parts = token.split('.');
         let (Some(header_b64), Some(payload_b64), Some(signature_b64), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
         else {
-            return false;
+            return None;
         };
         let Ok(header_bytes) = URL_SAFE_NO_PAD.decode(header_b64) else {
-            return false;
+            return None;
         };
         let Ok(payload_bytes) = URL_SAFE_NO_PAD.decode(payload_b64) else {
-            return false;
+            return None;
         };
         let Ok(signature) = URL_SAFE_NO_PAD.decode(signature_b64) else {
-            return false;
+            return None;
         };
         let Ok(header) = serde_json::from_slice::<Value>(&header_bytes) else {
-            return false;
+            return None;
         };
         if header.get("alg").and_then(Value::as_str) != Some("HS256") {
-            return false;
+            return None;
         }
 
         let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(jwt.secret.as_bytes()) else {
-            return false;
+            return None;
         };
         mac.update(format!("{header_b64}.{payload_b64}").as_bytes());
         let expected = mac.finalize().into_bytes();
         if expected.len() != signature.len()
             || !bool::from(expected.as_slice().ct_eq(signature.as_slice()))
         {
-            return false;
+            return None;
         }
 
         let Ok(claims) = serde_json::from_slice::<Value>(&payload_bytes) else {
-            return false;
+            return None;
         };
         let Ok(now_secs) = now.duration_since(UNIX_EPOCH).map(|value| value.as_secs()) else {
-            return false;
+            return None;
         };
         let Some(exp) = claims.get("exp").and_then(Value::as_u64) else {
-            return false;
+            return None;
         };
         if now_secs > exp.saturating_add(jwt.clock_skew_secs) {
-            return false;
+            return None;
         }
         if claims
             .get("nbf")
             .and_then(Value::as_u64)
             .is_some_and(|nbf| now_secs.saturating_add(jwt.clock_skew_secs) < nbf)
         {
-            return false;
+            return None;
         }
         if claims
             .get("iat")
             .and_then(Value::as_u64)
             .is_some_and(|iat| now_secs.saturating_add(jwt.clock_skew_secs) < iat)
         {
-            return false;
+            return None;
         }
         if jwt
             .issuer
             .as_deref()
             .is_some_and(|issuer| claims.get("iss").and_then(Value::as_str) != Some(issuer))
         {
-            return false;
+            return None;
         }
         if let Some(audience) = jwt.audience.as_deref() {
             let Some(claim_aud) = claims.get("aud") else {
-                return false;
+                return None;
             };
             match claim_aud {
                 Value::String(value) if value == audience => {}
@@ -3402,11 +3406,58 @@ impl QUICListener {
                     if values
                         .iter()
                         .any(|value| value.as_str().is_some_and(|value| value == audience)) => {}
-                _ => return false,
+                _ => return None,
             }
         }
 
-        true
+        Some(claims)
+    }
+
+    fn jwt_claims_satisfy_rbac(policy: &RuntimeUpstreamPolicy, claims: &Value) -> bool {
+        let scopes = Self::jwt_string_claim_values(claims, &["scope", "scp"]);
+        let roles = Self::jwt_string_claim_values(claims, &["roles", "role"]);
+        policy
+            .auth
+            .required_scopes
+            .iter()
+            .all(|required| scopes.contains(required))
+            && policy
+                .auth
+                .required_roles
+                .iter()
+                .all(|required| roles.contains(required))
+    }
+
+    fn jwt_string_claim_values(
+        claims: &Value,
+        claim_names: &[&str],
+    ) -> std::collections::HashSet<String> {
+        let mut values = std::collections::HashSet::new();
+        for claim_name in claim_names {
+            let Some(value) = claims.get(*claim_name) else {
+                continue;
+            };
+            match value {
+                Value::String(value) => {
+                    for item in value.split_whitespace() {
+                        if !item.is_empty() {
+                            values.insert(item.to_string());
+                        }
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        if let Some(item) = item.as_str()
+                            && !item.is_empty()
+                        {
+                            values.insert(item.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        values
     }
 
     fn resolve_scoped_rate_limit_key(
@@ -3591,6 +3642,8 @@ mod tests {
                     keys: vec!["secret-key".to_string()],
                 }),
                 jwt: None,
+                required_scopes: Vec::new(),
+                required_roles: Vec::new(),
             },
             host: Default::default(),
             forwarded_headers: Default::default(),
@@ -3633,6 +3686,8 @@ mod tests {
                     audience: Some("aud-1".to_string()),
                     clock_skew_secs: 30,
                 }),
+                required_scopes: Vec::new(),
+                required_roles: Vec::new(),
             },
             host: Default::default(),
             forwarded_headers: Default::default(),
@@ -3644,11 +3699,14 @@ mod tests {
         let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
 
         assert!(QUICListener::jwt_is_authorized(&policy, Some(&lookup)));
-        assert!(QUICListener::validate_hs256_jwt(
-            token.as_str(),
-            policy.auth.jwt.as_ref().expect("jwt policy"),
-            now
-        ));
+        assert!(
+            QUICListener::validated_hs256_jwt_claims(
+                token.as_str(),
+                policy.auth.jwt.as_ref().expect("jwt policy"),
+                now
+            )
+            .is_some()
+        );
 
         let wrong_secret = JwtAuth {
             secret: "wrong".to_string(),
@@ -3656,26 +3714,59 @@ mod tests {
             audience: Some("aud-1".to_string()),
             clock_skew_secs: 30,
         };
-        assert!(!QUICListener::validate_hs256_jwt(
-            token.as_str(),
-            &wrong_secret,
-            now
-        ));
+        assert!(
+            QUICListener::validated_hs256_jwt_claims(token.as_str(), &wrong_secret, now).is_none()
+        );
 
         let expired = test_hs256_jwt(
             "jwt-secret",
             serde_json::json!({ "exp": 1_699_999_900u64 }),
             "HS256",
         );
-        assert!(!QUICListener::validate_hs256_jwt(
-            expired.as_str(),
-            &JwtAuth {
-                secret: "jwt-secret".to_string(),
-                issuer: None,
-                audience: None,
-                clock_skew_secs: 0,
+        assert!(
+            QUICListener::validated_hs256_jwt_claims(
+                expired.as_str(),
+                &JwtAuth {
+                    secret: "jwt-secret".to_string(),
+                    issuer: None,
+                    audience: None,
+                    clock_skew_secs: 0,
+                },
+                now
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn jwt_rbac_requires_configured_scopes_and_roles() {
+        let policy = RuntimeUpstreamPolicy {
+            auth: RouteAuth {
+                api_key: None,
+                jwt: None,
+                required_scopes: vec!["read:fast".to_string()],
+                required_roles: vec!["admin".to_string()],
             },
-            now
+            host: Default::default(),
+            forwarded_headers: Default::default(),
+            protocol: Default::default(),
+        };
+        let allowed_claims = serde_json::json!({
+            "scope": "read:fast write:slow",
+            "roles": ["admin", "operator"]
+        });
+        let denied_claims = serde_json::json!({
+            "scope": "write:slow",
+            "roles": ["operator"]
+        });
+
+        assert!(QUICListener::jwt_claims_satisfy_rbac(
+            &policy,
+            &allowed_claims
+        ));
+        assert!(!QUICListener::jwt_claims_satisfy_rbac(
+            &policy,
+            &denied_claims
         ));
     }
 

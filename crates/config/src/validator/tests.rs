@@ -1037,6 +1037,8 @@ fn rejects_upstream_api_key_auth_without_keys() {
             keys: Vec::new(),
         }),
         jwt: None,
+        required_scopes: Vec::new(),
+        required_roles: Vec::new(),
     };
 
     assert!(validate(&cfg).is_err());
@@ -1057,6 +1059,8 @@ fn rejects_upstream_api_key_auth_with_invalid_header_name() {
             keys: vec!["test-key".to_string()],
         }),
         jwt: None,
+        required_scopes: Vec::new(),
+        required_roles: Vec::new(),
     };
 
     assert!(validate(&cfg).is_err());
@@ -1079,6 +1083,8 @@ fn accepts_upstream_jwt_auth_with_issuer_and_audience() {
             audience: Some("aud-1".to_string()),
             clock_skew_secs: 30,
         }),
+        required_scopes: Vec::new(),
+        required_roles: Vec::new(),
     };
 
     assert!(validate(&cfg).is_ok());
@@ -1101,6 +1107,8 @@ fn rejects_upstream_jwt_auth_without_secret() {
             audience: None,
             clock_skew_secs: 30,
         }),
+        required_scopes: Vec::new(),
+        required_roles: Vec::new(),
     };
 
     assert!(validate(&cfg).is_err());
@@ -1123,6 +1131,30 @@ fn rejects_upstream_jwt_auth_with_empty_issuer() {
             audience: None,
             clock_skew_secs: 30,
         }),
+        required_scopes: Vec::new(),
+        required_roles: Vec::new(),
+    };
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_rbac_requirements_without_jwt_auth() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth = RouteAuth {
+        api_key: Some(ApiKeyAuth {
+            header_name: "x-api-key".to_string(),
+            keys: vec!["test-key".to_string()],
+        }),
+        jwt: None,
+        required_scopes: vec!["read:fast".to_string()],
+        required_roles: Vec::new(),
     };
 
     assert!(validate(&cfg).is_err());

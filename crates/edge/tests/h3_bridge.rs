@@ -3520,6 +3520,8 @@ fn upstream_api_key_auth_rejects_missing_key_and_allows_valid_key() {
                 keys: vec!["edge-key".to_string()],
             }),
             jwt: None,
+            required_scopes: Vec::new(),
+            required_roles: Vec::new(),
         };
 
     let listener = QUICListener::new(config).expect("failed to create listener");
@@ -3589,6 +3591,8 @@ fn upstream_jwt_auth_rejects_missing_token_and_allows_valid_token() {
                 audience: Some("aud-1".to_string()),
                 clock_skew_secs: 30,
             }),
+            required_scopes: vec!["read:fast".to_string()],
+            required_roles: Vec::new(),
         };
 
     let listener = QUICListener::new(config).expect("failed to create listener");
@@ -3623,6 +3627,7 @@ fn upstream_jwt_auth_rejects_missing_token_and_allows_valid_token() {
             "iss": "issuer-1",
             "aud": "aud-1",
             "exp": 4_000_000_000u64,
+            "scope": "read:fast",
         }),
     );
     let authorization = format!("Bearer {token}");

@@ -293,6 +293,33 @@ fn validate_upstream_policy(
             )));
         }
     }
+    if upstream
+        .auth
+        .required_scopes
+        .iter()
+        .any(|value| value.trim().is_empty())
+    {
+        return Err(RuntimeConfigError::ConfigInvalid(format!(
+            "upstream '{upstream_name}' auth.required_scopes must not contain empty values"
+        )));
+    }
+    if upstream
+        .auth
+        .required_roles
+        .iter()
+        .any(|value| value.trim().is_empty())
+    {
+        return Err(RuntimeConfigError::ConfigInvalid(format!(
+            "upstream '{upstream_name}' auth.required_roles must not contain empty values"
+        )));
+    }
+    if (!upstream.auth.required_scopes.is_empty() || !upstream.auth.required_roles.is_empty())
+        && upstream.auth.jwt.is_none()
+    {
+        return Err(RuntimeConfigError::ConfigInvalid(format!(
+            "upstream '{upstream_name}' auth.required_scopes/auth.required_roles require auth.jwt"
+        )));
+    }
 
     Ok(())
 }

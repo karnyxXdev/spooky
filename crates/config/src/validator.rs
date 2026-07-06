@@ -1141,6 +1141,39 @@ fn validate_inner(config: &Config) -> bool {
                 return false;
             }
         }
+        if upstream
+            .auth
+            .required_scopes
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            validation_error!(
+                "upstream '{}' auth.required_scopes must not contain empty values",
+                upstream_name
+            );
+            return false;
+        }
+        if upstream
+            .auth
+            .required_roles
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            validation_error!(
+                "upstream '{}' auth.required_roles must not contain empty values",
+                upstream_name
+            );
+            return false;
+        }
+        if (!upstream.auth.required_scopes.is_empty() || !upstream.auth.required_roles.is_empty())
+            && upstream.auth.jwt.is_none()
+        {
+            validation_error!(
+                "upstream '{}' auth.required_scopes/auth.required_roles require auth.jwt",
+                upstream_name
+            );
+            return false;
+        }
 
         // Validate backends
         if upstream.backends.is_empty() {

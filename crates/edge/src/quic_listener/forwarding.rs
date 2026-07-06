@@ -1,6 +1,7 @@
 use super::*;
 use spooky_config::config::{ForwardedHeaderPolicy, ScopedRateLimitScope, UpstreamHostPolicy};
 use std::error::Error as StdError;
+use subtle::ConstantTimeEq;
 
 #[derive(Clone)]
 pub(super) struct ForwardRequestMeta {
@@ -824,6 +825,27 @@ impl QUICListener {
         Ok(())
     }
 
+    pub(super) fn send_unauthorized_response(
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+        body: &[u8],
+    ) -> Result<(), quiche::h3::Error> {
+        let resp_headers = vec![
+            quiche::h3::Header::new(
+                b":status",
+                http::StatusCode::UNAUTHORIZED.as_str().as_bytes(),
+            ),
+            quiche::h3::Header::new(b"content-type", b"text/plain"),
+            quiche::h3::Header::new(b"www-authenticate", b"ApiKey"),
+            quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
+        ];
+
+        h3.send_response(quic, stream_id, &resp_headers, false)?;
+        h3.send_body(quic, stream_id, body, true)?;
+        Ok(())
+    }
+
     pub(super) fn flush_send(
         socket: &UdpSocket,
         send_buf: &mut [u8],
@@ -1027,6 +1049,29 @@ impl QUICListener {
                             route_host_specific,
                             route_reason,
                         }) => {
+                            if upstream_policies.get(&upstream_name).is_some_and(|policy| {
+                                !Self::api_key_is_authorized(policy, Some(&lb_header_lookup))
+                            }) {
+                                metrics.inc_failure();
+                                metrics.inc_policy_denied();
+                                metrics.record_route(
+                                    &upstream_name,
+                                    request_start.elapsed(),
+                                    RouteOutcome::Failure,
+                                );
+                                warn!(
+                                    "request_id=unassigned route={} denied by api key policy",
+                                    upstream_name
+                                );
+                                Self::send_unauthorized_response(
+                                    h3,
+                                    &mut connection.quic,
+                                    stream_id,
+                                    b"unauthorized\n",
+                                )?;
+                                continue;
+                            }
+
                             resilience.brownout.observe_admission_pressure(
                                 resilience.adaptive_admission.inflight_percent(),
                             );
@@ -3221,6 +3266,25 @@ impl QUICListener {
         Some(token.to_string())
     }
 
+    fn api_key_is_authorized(
+        policy: &RuntimeUpstreamPolicy,
+        header_lookup: Option<&LbHeaderLookup<'_>>,
+    ) -> bool {
+        let Some(api_key) = policy.auth.api_key.as_ref() else {
+            return true;
+        };
+        let Some(provided) = header_lookup.and_then(|lookup| lookup(api_key.header_name.as_str()))
+        else {
+            return false;
+        };
+        let provided = provided.trim();
+        !provided.is_empty()
+            && api_key
+                .keys
+                .iter()
+                .any(|expected| bool::from(provided.as_bytes().ct_eq(expected.as_bytes())))
+    }
+
     fn resolve_scoped_rate_limit_key(
         rule: &crate::resilience::ScopedRateLimitRule,
         route: &str,
@@ -3268,7 +3332,7 @@ impl QUICListener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spooky_config::config::{ScopedRateLimit, ScopedRateLimitScope};
+    use spooky_config::config::{ApiKeyAuth, RouteAuth, ScopedRateLimit, ScopedRateLimitScope};
 
     #[test]
     fn internal_pool_errors_are_classified_as_control_plane_only() {
@@ -3376,6 +3440,33 @@ mod tests {
     fn format_error_chain_includes_nested_causes() {
         let msg = QUICListener::format_error_chain(&OuterErr(InnerErr));
         assert_eq!(msg, "outer: inner");
+    }
+
+    #[test]
+    fn api_key_authorization_requires_exact_configured_match() {
+        let policy = RuntimeUpstreamPolicy {
+            auth: RouteAuth {
+                api_key: Some(ApiKeyAuth {
+                    header_name: "x-api-key".to_string(),
+                    keys: vec!["secret-key".to_string()],
+                }),
+            },
+            host: Default::default(),
+            forwarded_headers: Default::default(),
+            protocol: Default::default(),
+        };
+        let headers = [("x-api-key".to_string(), "secret-key".to_string())]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
+        let wrong_lookup = |_: &str| Some("wrong-key".to_string());
+
+        assert!(QUICListener::api_key_is_authorized(&policy, Some(&lookup)));
+        assert!(!QUICListener::api_key_is_authorized(
+            &policy,
+            Some(&wrong_lookup)
+        ));
+        assert!(!QUICListener::api_key_is_authorized(&policy, None));
     }
 
     #[test]

@@ -14,6 +14,7 @@ impl RuntimeUpstream {
             load_balancing: upstream.load_balancing.clone(),
             route: upstream.route.clone(),
             policy: RuntimeUpstreamPolicy {
+                auth: upstream.auth.clone(),
                 host: RuntimeHostPolicy(upstream.host_policy.clone()),
                 forwarded_headers: RuntimeForwardedHeaderPolicy(upstream.forwarded_headers.clone()),
                 protocol: RuntimeProtocolPolicy(config.resilience.protocol.clone()),
@@ -34,6 +35,7 @@ impl RuntimeUpstream {
     pub fn as_config_upstream(&self) -> Upstream {
         Upstream {
             load_balancing: self.load_balancing.clone(),
+            auth: self.policy.auth.clone(),
             host_policy: self.policy.host.0.clone(),
             forwarded_headers: self.policy.forwarded_headers.0.clone(),
             tls: Some(self.effective_tls.clone()),
@@ -238,6 +240,32 @@ fn validate_upstream_policy(
         return Err(RuntimeConfigError::UnsupportedPolicyCombination(format!(
             "upstream '{upstream_name}' routes CONNECT but resilience.protocol.allow_connect=false"
         )));
+    }
+
+    if let Some(api_key) = upstream.auth.api_key.as_ref() {
+        if api_key.header_name.trim().is_empty() {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' auth.api_key.header_name must be non-empty"
+            )));
+        }
+        if http::header::HeaderName::from_bytes(api_key.header_name.trim().as_bytes()).is_err() {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' auth.api_key.header_name must be a valid HTTP header name"
+            )));
+        }
+        if api_key.keys.is_empty() || api_key.keys.iter().any(|value| value.trim().is_empty()) {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' auth.api_key.keys must contain at least one non-empty key"
+            )));
+        }
+        let mut seen_api_keys = std::collections::HashSet::new();
+        for key in &api_key.keys {
+            if !seen_api_keys.insert(key.trim().to_string()) {
+                return Err(RuntimeConfigError::ConfigInvalid(format!(
+                    "upstream '{upstream_name}' auth.api_key.keys contains duplicate values"
+                )));
+            }
+        }
     }
 
     Ok(())

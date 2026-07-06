@@ -244,6 +244,7 @@ fn upstream_pool_from_config() {
             lb_type: "round-robin".to_string(),
             key: None,
         },
+        auth: Default::default(),
         host_policy: Default::default(),
         forwarded_headers: Default::default(),
         tls: None,

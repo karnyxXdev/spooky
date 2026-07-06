@@ -160,6 +160,7 @@ fn make_config(port: u32, backend_addr: String, cert: String, key: String) -> Co
                 lb_type: "random".to_string(),
                 key: None,
             },
+            auth: Default::default(),
             host_policy: Default::default(),
             forwarded_headers: Default::default(),
             tls: None,
@@ -3482,6 +3483,72 @@ fn protocol_policy_denies_blocked_path_prefix() {
         String::from_utf8_lossy(&denied.body).contains("path blocked"),
         "expected policy body in response"
     );
+}
+
+#[test]
+fn upstream_api_key_auth_rejects_missing_key_and_allows_valid_key() {
+    if !local_listener_bind_available() {
+        return;
+    }
+    let dir = tempdir().expect("failed to create temp dir");
+    let (cert, key) = write_test_certs(&dir);
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+    let backend_addr = rt.block_on(start_h2_backend_with_regression_routes());
+    let mut config = make_config(0, backend_addr.to_string(), cert, key);
+    config.upstream.get_mut("test_pool").expect("upstream").auth =
+        spooky_config::config::RouteAuth {
+            api_key: Some(spooky_config::config::ApiKeyAuth {
+                header_name: "x-api-key".to_string(),
+                keys: vec!["edge-key".to_string()],
+            }),
+        };
+
+    let listener = QUICListener::new(config).expect("failed to create listener");
+    let listen_addr = listener.socket.local_addr().unwrap();
+    let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
+
+    let unauthorized = run_h3_client_collect_response(
+        listen_addr,
+        vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/fast"),
+            quiche::h3::Header::new(b"user-agent", b"spooky-auth-test"),
+        ],
+        true,
+        Duration::from_secs(REQUEST_TIMEOUT_SECS + 4),
+    )
+    .expect("unauthorized request should complete");
+    assert_eq!(unauthorized.status, "401");
+    assert!(
+        unauthorized
+            .headers
+            .iter()
+            .any(|(name, value)| name == "www-authenticate" && value == "ApiKey")
+    );
+    assert!(
+        String::from_utf8_lossy(&unauthorized.body).contains("unauthorized"),
+        "expected unauthorized body"
+    );
+
+    let authorized = run_h3_client_collect_response(
+        listen_addr,
+        vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/fast"),
+            quiche::h3::Header::new(b"user-agent", b"spooky-auth-test"),
+            quiche::h3::Header::new(b"x-api-key", b"edge-key"),
+        ],
+        true,
+        Duration::from_secs(REQUEST_TIMEOUT_SECS + 4),
+    )
+    .expect("authorized request should complete");
+    assert_eq!(authorized.status, "200");
+    assert_eq!(authorized.body, b"fast\n");
 }
 
 #[test]

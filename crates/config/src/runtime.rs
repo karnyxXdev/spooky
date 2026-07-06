@@ -4,8 +4,8 @@ use crate::{
     backend_endpoint::BackendEndpoint,
     config::{
         Backend, ClientAuth, Config, ForwardedHeaderPolicy, Listen, LoadBalancing, Observability,
-        Performance, ProtocolPolicy, Resilience, RouteMatch, Security, TlsCertificate, Upstream,
-        UpstreamHostPolicy, UpstreamHostPolicyMode, UpstreamTls,
+        Performance, ProtocolPolicy, Resilience, RouteAuth, RouteMatch, Security,
+        TlsCertificate, Upstream, UpstreamHostPolicy, UpstreamHostPolicyMode, UpstreamTls,
     },
 };
 
@@ -220,6 +220,7 @@ pub struct RuntimeProtocolPolicy(pub ProtocolPolicy);
 
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeUpstreamPolicy {
+    pub auth: RouteAuth,
     pub host: RuntimeHostPolicy,
     pub forwarded_headers: RuntimeForwardedHeaderPolicy,
     pub protocol: RuntimeProtocolPolicy,
@@ -263,6 +264,7 @@ mod tests {
             "api".to_string(),
             Upstream {
                 load_balancing: LoadBalancing::default(),
+                auth: Default::default(),
                 host_policy: UpstreamHostPolicy {
                     mode: UpstreamHostPolicyMode::Rewrite,
                     host: Some("api.internal".to_string()),

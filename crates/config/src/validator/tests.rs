@@ -1,8 +1,9 @@
 use super::validate;
 use crate::config::{
-    Backend, ClientAuth, Config, ControlApi, HealthCheck, Listen, LoadBalancing, Log, LogFormat,
-    MetricsEndpoint, Observability, Performance, Resilience, RouteMatch, ScopedRateLimit,
-    ScopedRateLimitScope, Security, Tls, TlsCertificate, Tracing, Upstream, UpstreamTls,
+    ApiKeyAuth, Backend, ClientAuth, Config, ControlApi, HealthCheck, Listen, LoadBalancing, Log,
+    LogFormat, MetricsEndpoint, Observability, Performance, Resilience, RouteAuth, RouteMatch,
+    ScopedRateLimit, ScopedRateLimitScope, Security, Tls, TlsCertificate, Tracing, Upstream,
+    UpstreamTls,
 };
 use rcgen::{Certificate, CertificateParams, SanType};
 use std::collections::HashMap;
@@ -33,6 +34,7 @@ fn base_config(cert: &str, key: &str) -> Config {
                 lb_type: "round-robin".to_string(),
                 key: None,
             },
+            auth: Default::default(),
             host_policy: Default::default(),
             forwarded_headers: Default::default(),
             tls: None,
@@ -810,6 +812,7 @@ fn rejects_ambiguous_route_matchers_with_same_host_path_and_method() {
             lb_type: "round-robin".to_string(),
             key: None,
         },
+        auth: Default::default(),
         host_policy: Default::default(),
         forwarded_headers: Default::default(),
         tls: None,
@@ -850,6 +853,7 @@ fn allows_same_host_and_path_when_methods_differ() {
             lb_type: "round-robin".to_string(),
             key: None,
         },
+        auth: Default::default(),
         host_policy: Default::default(),
         forwarded_headers: Default::default(),
         tls: None,
@@ -996,6 +1000,62 @@ fn rejects_scoped_rate_limit_with_empty_allowlist_entry() {
         route_allowlist: vec![" ".to_string()],
         idle_ttl_secs: 300,
     });
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn accepts_upstream_api_key_auth_with_default_header() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth
+        .api_key = Some(ApiKeyAuth {
+        header_name: "x-api-key".to_string(),
+        keys: vec!["test-key".to_string()],
+    });
+
+    assert!(validate(&cfg).is_ok());
+}
+
+#[test]
+fn rejects_upstream_api_key_auth_without_keys() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth = RouteAuth {
+        api_key: Some(ApiKeyAuth {
+            header_name: "x-api-key".to_string(),
+            keys: Vec::new(),
+        }),
+    };
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_upstream_api_key_auth_with_invalid_header_name() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth = RouteAuth {
+        api_key: Some(ApiKeyAuth {
+            header_name: "x api key".to_string(),
+            keys: vec!["test-key".to_string()],
+        }),
+    };
 
     assert!(validate(&cfg).is_err());
 }

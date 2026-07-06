@@ -1075,6 +1075,41 @@ fn validate_inner(config: &Config) -> bool {
             return false;
         }
 
+        if let Some(api_key) = upstream.auth.api_key.as_ref() {
+            let header_name = api_key.header_name.trim();
+            if header_name.is_empty() {
+                validation_error!(
+                    "upstream '{}' auth.api_key.header_name must be non-empty",
+                    upstream_name
+                );
+                return false;
+            }
+            if !is_valid_http_token(header_name) {
+                validation_error!(
+                    "upstream '{}' auth.api_key.header_name must be a valid HTTP header name",
+                    upstream_name
+                );
+                return false;
+            }
+            if api_key.keys.is_empty() || api_key.keys.iter().any(|value| value.trim().is_empty()) {
+                validation_error!(
+                    "upstream '{}' auth.api_key.keys must contain at least one non-empty key",
+                    upstream_name
+                );
+                return false;
+            }
+            let mut seen_api_keys = std::collections::HashSet::new();
+            for key in &api_key.keys {
+                if !seen_api_keys.insert(key.trim().to_string()) {
+                    validation_error!(
+                        "upstream '{}' auth.api_key.keys contains duplicate values",
+                        upstream_name
+                    );
+                    return false;
+                }
+            }
+        }
+
         // Validate backends
         if upstream.backends.is_empty() {
             validation_error!("Upstream '{}' has no backends configured", upstream_name);

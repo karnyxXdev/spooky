@@ -1110,6 +1110,38 @@ fn validate_inner(config: &Config) -> bool {
             }
         }
 
+        if let Some(jwt) = upstream.auth.jwt.as_ref() {
+            if jwt.secret.trim().is_empty() {
+                validation_error!(
+                    "upstream '{}' auth.jwt.secret must be non-empty",
+                    upstream_name
+                );
+                return false;
+            }
+            if jwt
+                .issuer
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                validation_error!(
+                    "upstream '{}' auth.jwt.issuer must be non-empty when provided",
+                    upstream_name
+                );
+                return false;
+            }
+            if jwt
+                .audience
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                validation_error!(
+                    "upstream '{}' auth.jwt.audience must be non-empty when provided",
+                    upstream_name
+                );
+                return false;
+            }
+        }
+
         // Validate backends
         if upstream.backends.is_empty() {
             validation_error!("Upstream '{}' has no backends configured", upstream_name);

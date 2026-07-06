@@ -1,9 +1,9 @@
 use super::validate;
 use crate::config::{
-    ApiKeyAuth, Backend, ClientAuth, Config, ControlApi, HealthCheck, Listen, LoadBalancing, Log,
-    LogFormat, MetricsEndpoint, Observability, Performance, Resilience, RouteAuth, RouteMatch,
-    ScopedRateLimit, ScopedRateLimitScope, Security, Tls, TlsCertificate, Tracing, Upstream,
-    UpstreamTls,
+    ApiKeyAuth, Backend, ClientAuth, Config, ControlApi, HealthCheck, JwtAuth, Listen,
+    LoadBalancing, Log, LogFormat, MetricsEndpoint, Observability, Performance, Resilience,
+    RouteAuth, RouteMatch, ScopedRateLimit, ScopedRateLimitScope, Security, Tls, TlsCertificate,
+    Tracing, Upstream, UpstreamTls,
 };
 use rcgen::{Certificate, CertificateParams, SanType};
 use std::collections::HashMap;
@@ -1036,6 +1036,7 @@ fn rejects_upstream_api_key_auth_without_keys() {
             header_name: "x-api-key".to_string(),
             keys: Vec::new(),
         }),
+        jwt: None,
     };
 
     assert!(validate(&cfg).is_err());
@@ -1054,6 +1055,73 @@ fn rejects_upstream_api_key_auth_with_invalid_header_name() {
         api_key: Some(ApiKeyAuth {
             header_name: "x api key".to_string(),
             keys: vec!["test-key".to_string()],
+        }),
+        jwt: None,
+    };
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn accepts_upstream_jwt_auth_with_issuer_and_audience() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth = RouteAuth {
+        api_key: None,
+        jwt: Some(JwtAuth {
+            secret: "jwt-secret".to_string(),
+            issuer: Some("issuer-1".to_string()),
+            audience: Some("aud-1".to_string()),
+            clock_skew_secs: 30,
+        }),
+    };
+
+    assert!(validate(&cfg).is_ok());
+}
+
+#[test]
+fn rejects_upstream_jwt_auth_without_secret() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth = RouteAuth {
+        api_key: None,
+        jwt: Some(JwtAuth {
+            secret: " ".to_string(),
+            issuer: None,
+            audience: None,
+            clock_skew_secs: 30,
+        }),
+    };
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_upstream_jwt_auth_with_empty_issuer() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth = RouteAuth {
+        api_key: None,
+        jwt: Some(JwtAuth {
+            secret: "jwt-secret".to_string(),
+            issuer: Some(" ".to_string()),
+            audience: None,
+            clock_skew_secs: 30,
         }),
     };
 

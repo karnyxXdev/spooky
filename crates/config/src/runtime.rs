@@ -4,8 +4,8 @@ use crate::{
     backend_endpoint::BackendEndpoint,
     config::{
         Backend, ClientAuth, Config, ForwardedHeaderPolicy, Listen, LoadBalancing, Observability,
-        Performance, ProtocolPolicy, Resilience, RouteAuth, RouteMatch, Security,
-        TlsCertificate, Upstream, UpstreamHostPolicy, UpstreamHostPolicyMode, UpstreamTls,
+        Performance, ProtocolPolicy, Resilience, RouteAuth, RouteMatch, Security, TlsCertificate,
+        Upstream, UpstreamHostPolicy, UpstreamHostPolicyMode, UpstreamTls,
     },
 };
 

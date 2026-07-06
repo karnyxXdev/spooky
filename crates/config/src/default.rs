@@ -87,6 +87,10 @@ pub fn auth_default_api_key_header_name() -> String {
     String::from("x-api-key")
 }
 
+pub fn auth_default_jwt_clock_skew_secs() -> u64 {
+    30
+}
+
 pub fn perf_default_worker_threads() -> usize {
     1
 }

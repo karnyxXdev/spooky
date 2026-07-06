@@ -1,6 +1,11 @@
 use super::*;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
+use serde_json::Value;
+use sha2::Sha256;
 use spooky_config::config::{ForwardedHeaderPolicy, ScopedRateLimitScope, UpstreamHostPolicy};
 use std::error::Error as StdError;
+use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
 #[derive(Clone)]
@@ -830,6 +835,7 @@ impl QUICListener {
         quic: &mut quiche::Connection,
         stream_id: u64,
         body: &[u8],
+        challenge: &[u8],
     ) -> Result<(), quiche::h3::Error> {
         let resp_headers = vec![
             quiche::h3::Header::new(
@@ -837,7 +843,7 @@ impl QUICListener {
                 http::StatusCode::UNAUTHORIZED.as_str().as_bytes(),
             ),
             quiche::h3::Header::new(b"content-type", b"text/plain"),
-            quiche::h3::Header::new(b"www-authenticate", b"ApiKey"),
+            quiche::h3::Header::new(b"www-authenticate", challenge),
             quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
         ];
 
@@ -1049,27 +1055,39 @@ impl QUICListener {
                             route_host_specific,
                             route_reason,
                         }) => {
-                            if upstream_policies.get(&upstream_name).is_some_and(|policy| {
-                                !Self::api_key_is_authorized(policy, Some(&lb_header_lookup))
-                            }) {
-                                metrics.inc_failure();
-                                metrics.inc_policy_denied();
-                                metrics.record_route(
-                                    &upstream_name,
-                                    request_start.elapsed(),
-                                    RouteOutcome::Failure,
-                                );
-                                warn!(
-                                    "request_id=unassigned route={} denied by api key policy",
-                                    upstream_name
-                                );
-                                Self::send_unauthorized_response(
-                                    h3,
-                                    &mut connection.quic,
-                                    stream_id,
-                                    b"unauthorized\n",
-                                )?;
-                                continue;
+                            if let Some(policy) = upstream_policies.get(&upstream_name) {
+                                let denied_challenge = if !Self::api_key_is_authorized(
+                                    policy,
+                                    Some(&lb_header_lookup),
+                                ) {
+                                    Some(b"ApiKey".as_slice())
+                                } else if !Self::jwt_is_authorized(policy, Some(&lb_header_lookup))
+                                {
+                                    Some(b"Bearer".as_slice())
+                                } else {
+                                    None
+                                };
+                                if let Some(challenge) = denied_challenge {
+                                    metrics.inc_failure();
+                                    metrics.inc_policy_denied();
+                                    metrics.record_route(
+                                        &upstream_name,
+                                        request_start.elapsed(),
+                                        RouteOutcome::Failure,
+                                    );
+                                    warn!(
+                                        "request_id=unassigned route={} denied by auth policy",
+                                        upstream_name
+                                    );
+                                    Self::send_unauthorized_response(
+                                        h3,
+                                        &mut connection.quic,
+                                        stream_id,
+                                        b"unauthorized\n",
+                                        challenge,
+                                    )?;
+                                    continue;
+                                }
                             }
 
                             resilience.brownout.observe_admission_pressure(
@@ -3285,6 +3303,112 @@ impl QUICListener {
                 .any(|expected| bool::from(provided.as_bytes().ct_eq(expected.as_bytes())))
     }
 
+    fn jwt_is_authorized(
+        policy: &RuntimeUpstreamPolicy,
+        header_lookup: Option<&LbHeaderLookup<'_>>,
+    ) -> bool {
+        let Some(jwt) = policy.auth.jwt.as_ref() else {
+            return true;
+        };
+        let Some(raw) =
+            header_lookup.and_then(|lookup| lookup(http::header::AUTHORIZATION.as_str()))
+        else {
+            return false;
+        };
+        let Some(token) = Self::bearer_token_from_authorization_value(&raw) else {
+            return false;
+        };
+        Self::validate_hs256_jwt(token.as_str(), jwt, SystemTime::now())
+    }
+
+    fn validate_hs256_jwt(
+        token: &str,
+        jwt: &spooky_config::config::JwtAuth,
+        now: SystemTime,
+    ) -> bool {
+        let mut parts = token.split('.');
+        let (Some(header_b64), Some(payload_b64), Some(signature_b64), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        let Ok(header_bytes) = URL_SAFE_NO_PAD.decode(header_b64) else {
+            return false;
+        };
+        let Ok(payload_bytes) = URL_SAFE_NO_PAD.decode(payload_b64) else {
+            return false;
+        };
+        let Ok(signature) = URL_SAFE_NO_PAD.decode(signature_b64) else {
+            return false;
+        };
+        let Ok(header) = serde_json::from_slice::<Value>(&header_bytes) else {
+            return false;
+        };
+        if header.get("alg").and_then(Value::as_str) != Some("HS256") {
+            return false;
+        }
+
+        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(jwt.secret.as_bytes()) else {
+            return false;
+        };
+        mac.update(format!("{header_b64}.{payload_b64}").as_bytes());
+        let expected = mac.finalize().into_bytes();
+        if expected.len() != signature.len()
+            || !bool::from(expected.as_slice().ct_eq(signature.as_slice()))
+        {
+            return false;
+        }
+
+        let Ok(claims) = serde_json::from_slice::<Value>(&payload_bytes) else {
+            return false;
+        };
+        let Ok(now_secs) = now.duration_since(UNIX_EPOCH).map(|value| value.as_secs()) else {
+            return false;
+        };
+        let Some(exp) = claims.get("exp").and_then(Value::as_u64) else {
+            return false;
+        };
+        if now_secs > exp.saturating_add(jwt.clock_skew_secs) {
+            return false;
+        }
+        if claims
+            .get("nbf")
+            .and_then(Value::as_u64)
+            .is_some_and(|nbf| now_secs.saturating_add(jwt.clock_skew_secs) < nbf)
+        {
+            return false;
+        }
+        if claims
+            .get("iat")
+            .and_then(Value::as_u64)
+            .is_some_and(|iat| now_secs.saturating_add(jwt.clock_skew_secs) < iat)
+        {
+            return false;
+        }
+        if jwt
+            .issuer
+            .as_deref()
+            .is_some_and(|issuer| claims.get("iss").and_then(Value::as_str) != Some(issuer))
+        {
+            return false;
+        }
+        if let Some(audience) = jwt.audience.as_deref() {
+            let Some(claim_aud) = claims.get("aud") else {
+                return false;
+            };
+            match claim_aud {
+                Value::String(value) if value == audience => {}
+                Value::Array(values)
+                    if values
+                        .iter()
+                        .any(|value| value.as_str().is_some_and(|value| value == audience)) => {}
+                _ => return false,
+            }
+        }
+
+        true
+    }
+
     fn resolve_scoped_rate_limit_key(
         rule: &crate::resilience::ScopedRateLimitRule,
         route: &str,
@@ -3332,7 +3456,23 @@ impl QUICListener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spooky_config::config::{ApiKeyAuth, RouteAuth, ScopedRateLimit, ScopedRateLimitScope};
+    use spooky_config::config::{
+        ApiKeyAuth, JwtAuth, RouteAuth, ScopedRateLimit, ScopedRateLimitScope,
+    };
+
+    fn test_hs256_jwt(secret: &str, claims: serde_json::Value, alg: &str) -> String {
+        let header = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({ "alg": alg, "typ": "JWT" }))
+                .expect("serialize header"),
+        );
+        let payload =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("serialize claims"));
+        let signing_input = format!("{header}.{payload}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("mac");
+        mac.update(signing_input.as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        format!("{signing_input}.{signature}")
+    }
 
     #[test]
     fn internal_pool_errors_are_classified_as_control_plane_only() {
@@ -3450,6 +3590,7 @@ mod tests {
                     header_name: "x-api-key".to_string(),
                     keys: vec!["secret-key".to_string()],
                 }),
+                jwt: None,
             },
             host: Default::default(),
             forwarded_headers: Default::default(),
@@ -3467,6 +3608,75 @@ mod tests {
             Some(&wrong_lookup)
         ));
         assert!(!QUICListener::api_key_is_authorized(&policy, None));
+    }
+
+    #[test]
+    fn hs256_jwt_validation_enforces_signature_and_claims() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let token = test_hs256_jwt(
+            "jwt-secret",
+            serde_json::json!({
+                "sub": "user-1",
+                "iss": "issuer-1",
+                "aud": "aud-1",
+                "exp": 4_000_000_000u64,
+                "nbf": 1_699_999_900u64,
+            }),
+            "HS256",
+        );
+        let policy = RuntimeUpstreamPolicy {
+            auth: RouteAuth {
+                api_key: None,
+                jwt: Some(JwtAuth {
+                    secret: "jwt-secret".to_string(),
+                    issuer: Some("issuer-1".to_string()),
+                    audience: Some("aud-1".to_string()),
+                    clock_skew_secs: 30,
+                }),
+            },
+            host: Default::default(),
+            forwarded_headers: Default::default(),
+            protocol: Default::default(),
+        };
+        let headers = [("authorization".to_string(), format!("Bearer {token}"))]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
+
+        assert!(QUICListener::jwt_is_authorized(&policy, Some(&lookup)));
+        assert!(QUICListener::validate_hs256_jwt(
+            token.as_str(),
+            policy.auth.jwt.as_ref().expect("jwt policy"),
+            now
+        ));
+
+        let wrong_secret = JwtAuth {
+            secret: "wrong".to_string(),
+            issuer: Some("issuer-1".to_string()),
+            audience: Some("aud-1".to_string()),
+            clock_skew_secs: 30,
+        };
+        assert!(!QUICListener::validate_hs256_jwt(
+            token.as_str(),
+            &wrong_secret,
+            now
+        ));
+
+        let expired = test_hs256_jwt(
+            "jwt-secret",
+            serde_json::json!({ "exp": 1_699_999_900u64 }),
+            "HS256",
+        );
+        assert!(!QUICListener::validate_hs256_jwt(
+            expired.as_str(),
+            &JwtAuth {
+                secret: "jwt-secret".to_string(),
+                issuer: None,
+                audience: None,
+                clock_skew_secs: 0,
+            },
+            now
+        ));
     }
 
     #[test]

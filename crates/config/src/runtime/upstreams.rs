@@ -268,6 +268,32 @@ fn validate_upstream_policy(
         }
     }
 
+    if let Some(jwt) = upstream.auth.jwt.as_ref() {
+        if jwt.secret.trim().is_empty() {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' auth.jwt.secret must be non-empty"
+            )));
+        }
+        if jwt
+            .issuer
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' auth.jwt.issuer must be non-empty when provided"
+            )));
+        }
+        if jwt
+            .audience
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' auth.jwt.audience must be non-empty when provided"
+            )));
+        }
+    }
+
     Ok(())
 }
 

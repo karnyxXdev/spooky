@@ -513,6 +513,28 @@ async fn fetch_json_document(uri: String, timeout: Duration) -> Result<Value, Pr
     serde_json::from_slice(&body).map_err(|err| ProxyError::Transport(err.to_string()))
 }
 
+/// Auth endpoints must use https; http is permitted only to loopback hosts,
+/// which are not reachable by on-path attackers (local development/testing).
+fn auth_uri_scheme_permitted(uri: &http::Uri) -> bool {
+    match uri.scheme_str() {
+        Some("https") => uri.authority().is_some(),
+        Some("http") => uri.host().is_some_and(uri_host_is_loopback),
+        _ => false,
+    }
+}
+
+fn uri_host_is_loopback(host: &str) -> bool {
+    // Accept an IPv6 literal with or without surrounding brackets.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 fn oidc_discovery_url(discovery_url: Option<String>, issuer_url: Option<String>) -> Option<String> {
     discovery_url.or_else(|| {
         issuer_url.map(|issuer| {
@@ -576,6 +598,14 @@ async fn run_oidc_external_auth(
     };
     let discovery = oidc_discovery_url(discovery_url, issuer_url.clone())
         .ok_or_else(|| ProxyError::Transport("oidc auth missing discovery metadata".into()))?;
+    let discovery_uri = discovery
+        .parse::<http::Uri>()
+        .map_err(|err| ProxyError::Transport(err.to_string()))?;
+    if !auth_uri_scheme_permitted(&discovery_uri) {
+        return Err(ProxyError::Transport(
+            "oidc discovery endpoint must use https (http allowed only for loopback)".into(),
+        ));
+    }
     let document = fetch_json_document(discovery, timeout).await?;
     let introspection_endpoint = document
         .get("introspection_endpoint")
@@ -586,9 +616,9 @@ async fn run_oidc_external_auth(
     let introspection_uri = introspection_endpoint
         .parse::<http::Uri>()
         .map_err(|err| ProxyError::Transport(err.to_string()))?;
-    if introspection_uri.scheme_str() != Some("https") || introspection_uri.authority().is_none() {
+    if !auth_uri_scheme_permitted(&introspection_uri) {
         return Err(ProxyError::Transport(
-            "oidc discovery returned non-https introspection endpoint".into(),
+            "oidc introspection endpoint must use https (http allowed only for loopback)".into(),
         ));
     }
 

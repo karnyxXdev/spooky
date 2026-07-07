@@ -444,22 +444,22 @@ fn map_http_external_auth_response(
             "external auth redirect missing location header".into(),
         ));
     }
-    if status == http::StatusCode::UNAUTHORIZED {
-        if let Some(www_authenticate) = challenge {
-            return Ok(ExternalAuthDecision::Challenge(
-                ExternalAuthChallengeResponse {
-                    status,
-                    headers: allowed_headers
-                        .into_iter()
-                        .filter(|(name, _)| {
-                            !name.eq_ignore_ascii_case(http::header::WWW_AUTHENTICATE.as_str())
-                        })
-                        .collect(),
-                    www_authenticate,
-                    body,
-                },
-            ));
-        }
+    if status == http::StatusCode::UNAUTHORIZED
+        && let Some(www_authenticate) = challenge
+    {
+        return Ok(ExternalAuthDecision::Challenge(
+            ExternalAuthChallengeResponse {
+                status,
+                headers: allowed_headers
+                    .into_iter()
+                    .filter(|(name, _)| {
+                        !name.eq_ignore_ascii_case(http::header::WWW_AUTHENTICATE.as_str())
+                    })
+                    .collect(),
+                www_authenticate,
+                body,
+            },
+        ));
     }
     if status.is_client_error() {
         return Ok(ExternalAuthDecision::Deny(ExternalAuthDenyResponse {
@@ -542,6 +542,7 @@ fn oidc_audience_matches(expected: Option<&str>, value: Option<&Value>) -> bool 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_oidc_external_auth(
     pending_forward: Arc<PendingForward>,
     discovery_url: Option<String>,
@@ -1579,6 +1580,7 @@ impl QUICListener {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_upstream_forward_task(
         req: &RequestEnvelope,
         pending_forward: Arc<PendingForward>,
@@ -1809,6 +1811,7 @@ impl QUICListener {
         Ok(result_rx)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn materialize_forward_after_auth(
         stream_id: u64,
         req: &mut RequestEnvelope,
@@ -2238,6 +2241,7 @@ impl QUICListener {
         Ok(true)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn complete_auth_result(
         stream_id: u64,
         req: &mut RequestEnvelope,

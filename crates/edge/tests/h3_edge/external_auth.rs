@@ -47,6 +47,39 @@ fn configure_oidc_external_auth(
     });
 }
 
+fn send_h3_request_and_close(
+    server_addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Result<(), String> {
+    let (socket, _local_addr, mut conn, mut h3) = stress_connect(server_addr)?;
+    let mut req_headers = vec![
+        quiche::h3::Header::new(b":method", method.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", b"localhost"),
+        quiche::h3::Header::new(b":path", path.as_bytes()),
+        quiche::h3::Header::new(b"user-agent", b"spooky-auth-teardown-test"),
+    ];
+    req_headers.extend(
+        headers
+            .iter()
+            .map(|(name, value)| quiche::h3::Header::new(name.as_bytes(), value.as_bytes())),
+    );
+    h3.send_request(&mut conn, &req_headers, true)
+        .map_err(|err| format!("send_request: {err:?}"))?;
+
+    let mut out = [0u8; MAX_UDP_PAYLOAD_BYTES];
+    while let Ok((write, send_info)) = conn.send(&mut out) {
+        socket
+            .send_to(&out[..write], send_info.to)
+            .map_err(|err| format!("send_to: {err}"))?;
+    }
+
+    stress_close_gracefully(&socket, &mut conn);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_auth_allow_injects_headers_and_forwards() {
     if !local_listener_bind_available() {
@@ -149,6 +182,49 @@ async fn external_auth_deny_returns_denial_response_and_headers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_auth_challenge_returns_www_authenticate_and_body() {
+    if !local_listener_bind_available() {
+        return;
+    }
+
+    let backend_addr = start_h2_backend("should not reach backend").await;
+    let auth_addr = start_http_auth_server(|_req| async move {
+        let response = Response::builder()
+            .status(http::StatusCode::UNAUTHORIZED)
+            .header("www-authenticate", "Bearer realm=\"spooky\"")
+            .header("x-auth-reason", "expired")
+            .body(Full::new(Bytes::from("token expired")))
+            .expect("auth challenge response");
+        Ok::<_, Infallible>(response)
+    })
+    .await;
+
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(&dir);
+    let mut config = make_config(0, cert, key, backend_addr.to_string());
+    configure_http_external_auth(
+        &mut config,
+        format!("http://{auth_addr}/check"),
+        250,
+        ExternalAuthFailureMode::FailClosed,
+        vec!["x-auth-reason".to_string()],
+    );
+
+    let listener = QUICListener::new(config).expect("listener");
+    let (addr, stop, handle) = spawn_listener_loop(listener);
+    let response = run_h3_client_request(addr, "GET", "/", &[], None).expect("h3 response");
+    stop_listener_loop(stop, handle);
+
+    assert_eq!(response.status, 401);
+    assert_eq!(
+        response.header("www-authenticate"),
+        Some("Bearer realm=\"spooky\"")
+    );
+    assert_eq!(response.header("x-auth-reason"), Some("expired"));
+    assert!(response.body.contains("token expired"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_auth_redirect_preserves_location() {
     if !local_listener_bind_available() {
         return;
@@ -186,6 +262,38 @@ async fn external_auth_redirect_preserves_location() {
         response.header("location"),
         Some("https://login.example.com/")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_auth_transport_error_fail_closed_returns_unavailable() {
+    if !local_listener_bind_available() {
+        return;
+    }
+
+    let backend_addr = start_h2_backend("should not reach backend").await;
+    let unused_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind unused port");
+    let unused_addr = unused_listener.local_addr().expect("unused addr");
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(&dir);
+    let mut config = make_config(0, cert, key, backend_addr.to_string());
+    configure_http_external_auth(
+        &mut config,
+        format!("http://{unused_addr}/check"),
+        250,
+        ExternalAuthFailureMode::FailClosed,
+        vec![],
+    );
+    drop(unused_listener);
+
+    let listener = QUICListener::new(config).expect("listener");
+    let (addr, stop, handle) = spawn_listener_loop(listener);
+    let response = run_h3_client_request(addr, "GET", "/", &[], None).expect("h3 response");
+    stop_listener_loop(stop, handle);
+
+    assert_eq!(response.status, 503);
+    assert!(response.body.contains("external auth unavailable"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -395,6 +503,80 @@ async fn request_body_is_buffered_while_auth_is_pending() {
 
     assert_eq!(response.status, 200);
     assert_eq!(response.body, "len=20;user=buffered");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_disconnect_during_pending_auth_leaves_no_connection_state() {
+    if !local_listener_bind_available() {
+        return;
+    }
+
+    let auth_seen = Arc::new(AtomicBool::new(false));
+    let auth_seen_flag = Arc::clone(&auth_seen);
+    let backend_addr = start_h2_backend("should not reach backend").await;
+    let auth_addr = start_http_auth_server(move |_req| {
+        let auth_seen_flag = Arc::clone(&auth_seen_flag);
+        async move {
+            auth_seen_flag.store(true, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok::<_, Infallible>(
+                Response::builder()
+                    .status(http::StatusCode::NO_CONTENT)
+                    .body(Full::new(Bytes::new()))
+                    .expect("auth allow response"),
+            )
+        }
+    })
+    .await;
+
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(&dir);
+    let mut config = make_config(0, cert, key, backend_addr.to_string());
+    configure_http_external_auth(
+        &mut config,
+        format!("http://{auth_addr}/check"),
+        500,
+        ExternalAuthFailureMode::FailClosed,
+        vec![],
+    );
+
+    let mut listener = QUICListener::new(config).expect("listener");
+    let server_addr = listener.socket.local_addr().expect("listener addr");
+    let client = thread::spawn(move || {
+        send_h3_request_and_close(server_addr, "GET", "/", &[])
+            .unwrap_or_else(|err| panic!("client request failed: {err}"));
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        listener.poll();
+        if auth_seen.load(Ordering::Relaxed)
+            && listener.connections().is_empty()
+            && listener.cid_routes().is_empty()
+            && listener.peer_routes().is_empty()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    client.join().expect("client join");
+    assert!(
+        auth_seen.load(Ordering::Relaxed),
+        "auth request was never started"
+    );
+    assert!(
+        listener.connections().is_empty(),
+        "connections leaked after client disconnect"
+    );
+    assert!(
+        listener.cid_routes().is_empty(),
+        "cid routes leaked after client disconnect"
+    );
+    assert!(
+        listener.peer_routes().is_empty(),
+        "peer routes leaked after client disconnect"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

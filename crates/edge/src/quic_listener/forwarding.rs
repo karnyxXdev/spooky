@@ -310,37 +310,24 @@ async fn send_auth_request(
         .map_err(|_| ProxyError::Timeout)?
 }
 
-fn header_value(response: &Response<Incoming>, name: http::header::HeaderName) -> Option<String> {
-    response
-        .headers()
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
-}
-
-async fn run_http_external_auth(
-    pending_forward: Arc<PendingForward>,
-    endpoint: String,
-    request_headers: Vec<spooky_config::runtime::RuntimeExternalAuthRequestHeader>,
-    response_header_allowlist: Vec<String>,
-    timeout: Duration,
+fn map_http_external_auth_response(
+    status: http::StatusCode,
+    headers: &http::HeaderMap,
+    body: Vec<u8>,
+    response_header_allowlist: &[String],
 ) -> ExternalAuthResult {
-    let mut builder = Request::builder().method(http::Method::GET).uri(endpoint);
-    append_auth_request_headers(&mut builder, &pending_forward, &request_headers);
-    let request = builder
-        .body(BoxBody::new(Full::new(Bytes::new())))
-        .map_err(|err| ProxyError::Transport(err.to_string()))?;
-    let response = send_auth_request(request, timeout).await?;
-    let status = response.status();
-    let location = header_value(&response, http::header::LOCATION);
-    let challenge = header_value(&response, http::header::WWW_AUTHENTICATE);
-    let allowed_headers = allowed_auth_headers(response.headers(), &response_header_allowlist);
+    let location = headers
+        .get(http::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let challenge = headers
+        .get(http::header::WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let allowed_headers = allowed_auth_headers(headers, response_header_allowlist);
     if status.is_success() {
         return Ok(ExternalAuthDecision::Allow {
-            request_header_mutations: auth_allow_mutations(
-                response.headers(),
-                &response_header_allowlist,
-            ),
+            request_header_mutations: auth_allow_mutations(headers, response_header_allowlist),
         });
     }
     if status.is_redirection() {
@@ -357,7 +344,6 @@ async fn run_http_external_auth(
             "external auth redirect missing location header".into(),
         ));
     }
-    let body = collect_auth_body(response.into_body()).await?;
     if status == http::StatusCode::UNAUTHORIZED {
         if let Some(www_authenticate) = challenge {
             return Ok(ExternalAuthDecision::Challenge(
@@ -380,6 +366,29 @@ async fn run_http_external_auth(
     Err(ProxyError::Transport(format!(
         "external auth endpoint returned {status}"
     )))
+}
+
+async fn run_http_external_auth(
+    pending_forward: Arc<PendingForward>,
+    endpoint: String,
+    request_headers: Vec<spooky_config::runtime::RuntimeExternalAuthRequestHeader>,
+    response_header_allowlist: Vec<String>,
+    timeout: Duration,
+) -> ExternalAuthResult {
+    let mut builder = Request::builder().method(http::Method::GET).uri(endpoint);
+    append_auth_request_headers(&mut builder, &pending_forward, &request_headers);
+    let request = builder
+        .body(BoxBody::new(Full::new(Bytes::new())))
+        .map_err(|err| ProxyError::Transport(err.to_string()))?;
+    let response = send_auth_request(request, timeout).await?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = if status.is_success() || status.is_redirection() {
+        Vec::new()
+    } else {
+        collect_auth_body(response.into_body()).await?
+    };
+    map_http_external_auth_response(status, &headers, body, &response_header_allowlist)
 }
 
 async fn fetch_json_document(uri: String, timeout: Duration) -> Result<Value, ProxyError> {
@@ -5023,6 +5032,75 @@ mod tests {
                 value: b"alice".to_vec(),
             }]
         );
+    }
+
+    #[test]
+    fn http_external_auth_response_mapping_preserves_allowlisted_denial_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-auth-reason", http::HeaderValue::from_static("policy"));
+        headers.insert("x-drop", http::HeaderValue::from_static("secret"));
+
+        let decision = map_http_external_auth_response(
+            http::StatusCode::FORBIDDEN,
+            &headers,
+            b"denied
+"
+            .to_vec(),
+            &["x-auth-reason".to_string()],
+        )
+        .expect("deny decision");
+
+        match decision {
+            ExternalAuthDecision::Deny(response) => {
+                assert_eq!(response.status, http::StatusCode::FORBIDDEN);
+                assert_eq!(response.body, b"denied\n".to_vec());
+                assert_eq!(
+                    response.headers,
+                    vec![("x-auth-reason".to_string(), "policy".to_string())]
+                );
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_external_auth_response_mapping_builds_challenge_from_401() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::WWW_AUTHENTICATE,
+            http::HeaderValue::from_static("Bearer realm=\"spooky\""),
+        );
+        headers.insert("x-auth-reason", http::HeaderValue::from_static("expired"));
+
+        let decision = map_http_external_auth_response(
+            http::StatusCode::UNAUTHORIZED,
+            &headers,
+            b"challenge\n".to_vec(),
+            &["x-auth-reason".to_string()],
+        )
+        .expect("challenge decision");
+
+        match decision {
+            ExternalAuthDecision::Challenge(response) => {
+                assert_eq!(response.status, http::StatusCode::UNAUTHORIZED);
+                assert_eq!(response.www_authenticate, "Bearer realm=\"spooky\"");
+                assert_eq!(response.body, b"challenge\n".to_vec());
+                assert_eq!(
+                    response.headers,
+                    vec![("x-auth-reason".to_string(), "expired".to_string())]
+                );
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_external_auth_response_mapping_requires_redirect_location() {
+        let headers = http::HeaderMap::new();
+        let err =
+            map_http_external_auth_response(http::StatusCode::FOUND, &headers, Vec::new(), &[])
+                .expect_err("redirect without location must fail");
+        assert!(matches!(err, ProxyError::Transport(_)));
     }
 
     #[test]

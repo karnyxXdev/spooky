@@ -2181,8 +2181,9 @@ impl QUICListener {
         } else {
             match pending_forward.build_request(
                 &backend_endpoint,
-                request_body
-                    .expect("request body must exist for non-websocket auth materialization"),
+                // Non-websocket branches above always set a body; fall back to an
+                // empty body rather than panicking if that invariant ever changes.
+                request_body.unwrap_or_else(|| BoxBody::new(Full::new(Bytes::new()))),
                 None,
             ) {
                 Ok(request) => Some(request),

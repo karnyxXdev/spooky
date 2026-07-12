@@ -3,3 +3,4 @@ pub mod latency_aware;
 pub mod least_connections;
 pub mod random;
 pub mod round_robin;
+pub mod sticky_cid;

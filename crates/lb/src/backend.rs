@@ -10,7 +10,7 @@ pub struct BackendState {
     pub weight: u32,
     pub health_check: Option<HealthCheck>,
     pub consecutive_failures: u32,
-    pub health_state: HealthState,
+    health_state: HealthState,
     pub active_requests: Arc<AtomicUsize>,
     pub ewma_latency_ms: Option<f64>,
 }

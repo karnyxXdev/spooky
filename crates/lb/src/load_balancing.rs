@@ -1,3 +1,9 @@
+use crate::algorithms::consistent_hash::ConsistentHash;
+use crate::algorithms::latency_aware::LatencyAware;
+use crate::algorithms::least_connections::LeastConnections;
+use crate::algorithms::random::Random;
+use crate::algorithms::round_robin::RoundRobin;
+use crate::algorithms::sticky_cid::StickyCid;
 use crate::backend_pool::BackendPool;
 use crate::hash::DEFAULT_REPLICAS;
 

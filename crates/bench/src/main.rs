@@ -21,7 +21,7 @@ use crate::markdown::write_markdown;
 use crate::promotion::run_promotion;
 use crate::regression::{RegressionSeverity, compare_reports, format_issue, resolve_gate_config};
 use crate::report::BenchReport;
-use crate::utils::{suite_label, unix_now};
+use crate::utils::{print_summary, suite_label, unix_now};
 
 use clap::Parser;
 

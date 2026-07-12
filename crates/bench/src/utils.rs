@@ -1,4 +1,24 @@
 use crate::cli::BenchSuite;
+use crate::report::BenchReport;
+
+pub fn print_summary(report: &BenchReport) {
+    println!(
+        "{:<8} {:<30} {:>7} {:>12} {:>10} {:>12} {:>9}",
+        "kind", "case", "scale", "ns/op", "cpu%", "ops/s", "p99(ns)"
+    );
+    for case in &report.cases {
+        println!(
+            "{:<8} {:<30} {:>7} {:>12.2} {:>10.2} {:>12.2} {:>9.0}",
+            case.kind,
+            case.name,
+            case.scale,
+            case.latency_ns_per_op,
+            case.cpu_pct,
+            case.throughput_ops_per_sec,
+            case.latency_p99_ns
+        );
+    }
+}
 
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()

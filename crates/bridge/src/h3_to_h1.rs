@@ -9,11 +9,12 @@ use spooky_config::{
     config::{ForwardedHeaderPolicy, UpstreamHostPolicy},
 };
 
-use crate::{
-    BridgeError, ForwardedContext, ForwardedHeaderChains, H3WebsocketRequestKind,
-    build_forwarded_header_values, connection_header_tokens, h3_websocket_request_kind,
-    resolve_upstream_host_value, should_strip_request_header,
-};
+use crate::BridgeError;
+use crate::context::{ForwardedContext, ForwardedHeaderChains};
+use crate::forwarded::build_forwarded_header_values;
+use crate::headers::{connection_header_tokens, should_strip_request_header};
+use crate::host::resolve_upstream_host_value;
+use crate::websocket::{H3WebsocketRequestKind, h3_websocket_request_kind};
 
 /// Build an HTTP/1.1 request forwarded to an `http://` upstream.
 ///

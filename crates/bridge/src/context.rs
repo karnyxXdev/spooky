@@ -1,3 +1,4 @@
+use http::HeaderValue;
 use std::net::SocketAddr;
 
 pub struct ForwardedContext<'a> {

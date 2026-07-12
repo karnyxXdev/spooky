@@ -1,105 +1,12 @@
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-use spooky_config::config::{Backend, HealthCheck, LoadBalancing, RouteMatch, Upstream};
-
 use crate::constants::{
     BENCH_CONN_ALIAS_SUFFIX, BENCH_CONN_MISS_ID_FILL, BENCH_CONN_MISS_ID_LEN_BYTES,
     BENCH_CONN_MISS_PORT, BENCH_CONN_PEER_BASE_PORT, BENCH_CONN_PEER_PORT_SPAN,
     BENCH_CONN_PRIMARY_ID_LEN_BYTES, BENCH_CONN_PRIMARY_ID_PREFIX_BYTES,
 };
-use crate::route_index::{RouteIndex, scan_lookup};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 type PrimaryCid = [u8; BENCH_CONN_PRIMARY_ID_LEN_BYTES];
-
-fn default_health_check() -> HealthCheck {
-    HealthCheck {
-        path: "/health".to_string(),
-        interval: 1_000,
-        timeout_ms: 1_000,
-        failure_threshold: 3,
-        success_threshold: 2,
-        cooldown_ms: 5_000,
-    }
-}
-
-fn build_benchmark_upstream(host: Option<String>, path_prefix: String) -> Upstream {
-    Upstream {
-        load_balancing: LoadBalancing {
-            lb_type: "round-robin".to_string(),
-            key: None,
-        },
-        auth: Default::default(),
-        host_policy: Default::default(),
-        forwarded_headers: Default::default(),
-        tls: None,
-        route: RouteMatch {
-            host,
-            path_prefix: Some(path_prefix),
-            method: None,
-        },
-        // Routing benchmark does not touch backend connectivity.
-        backends: vec![Backend {
-            id: "placeholder".to_string(),
-            address: "127.0.0.1:1".to_string(),
-            weight: 1,
-            health_check: Some(default_health_check()),
-        }],
-    }
-}
-
-pub struct RouteLookupBench {
-    upstreams: HashMap<String, Upstream>,
-    index: RouteIndex,
-    hit_path: String,
-    hit_host: Option<String>,
-    miss_path: String,
-    miss_host: Option<String>,
-}
-
-impl RouteLookupBench {
-    pub fn new(scale: usize) -> Self {
-        let mut upstreams = HashMap::with_capacity(scale.max(1));
-        for i in 0..scale.max(1) {
-            let name = format!("upstream-{i:05}");
-            let path_prefix = format!("/svc/{i:05}");
-            let host = (i % 2 == 1).then_some("bench.example.com".to_string());
-            upstreams.insert(name, build_benchmark_upstream(host, path_prefix));
-        }
-
-        let index = RouteIndex::from_upstreams(&upstreams);
-        let target = scale.max(1) - 1;
-        let hit_path = format!("/svc/{target:05}/resource");
-        let hit_host = (target % 2 == 1).then_some("bench.example.com".to_string());
-        let miss_path = "/not-found/path".to_string();
-        let miss_host = Some("missing.example.com".to_string());
-
-        Self {
-            upstreams,
-            index,
-            hit_path,
-            hit_host,
-            miss_path,
-            miss_host,
-        }
-    }
-
-    pub fn indexed_hit(&self) -> usize {
-        self.index
-            .lookup(&self.hit_path, self.hit_host.as_deref())
-            .map_or(0, str::len)
-    }
-
-    pub fn linear_hit(&self) -> usize {
-        scan_lookup(&self.upstreams, &self.hit_path, self.hit_host.as_deref()).map_or(0, str::len)
-    }
-
-    pub fn indexed_miss(&self) -> usize {
-        self.index
-            .lookup(&self.miss_path, self.miss_host.as_deref())
-            .map_or(0, str::len)
-    }
-}
 
 pub struct ConnectionLookupBench {
     exact_routes: HashMap<PrimaryCid, SocketAddr>,

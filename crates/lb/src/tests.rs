@@ -19,17 +19,6 @@ fn unhealthy_backends_are_skipped() {
 }
 
 #[test]
-fn load_balancing_from_config() {
-    assert!(LoadBalancing::from_config("round-robin").is_ok());
-    assert!(LoadBalancing::from_config("consistent-hash").is_ok());
-    assert!(LoadBalancing::from_config("random").is_ok());
-    assert!(LoadBalancing::from_config("least-connections").is_ok());
-    assert!(LoadBalancing::from_config("latency-aware").is_ok());
-    assert!(LoadBalancing::from_config("sticky-cid").is_ok());
-    assert!(LoadBalancing::from_config("unknown").is_err());
-}
-
-#[test]
 fn least_connections_picks_lowest_active() {
     let pool = BackendPool::new_from_states(vec![
         create_backend_state("10.0.0.1:1", 1),

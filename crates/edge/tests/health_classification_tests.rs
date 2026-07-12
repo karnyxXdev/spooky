@@ -1,7 +1,8 @@
 use http::StatusCode;
 use spooky_config::config::{Backend, HealthCheck};
 use spooky_edge::{HealthClassification, outcome_from_status};
-use spooky_lb::{BackendPool, HealthTransition};
+use spooky_lb::backend::HealthTransition;
+use spooky_lb::backend_pool::BackendPool;
 
 /// Mock setup for backend pool testing
 fn create_test_backend_pool() -> BackendPool {
@@ -18,7 +19,10 @@ fn create_test_backend_pool() -> BackendPool {
             cooldown_ms: 10000,
         }),
     }];
-    let backend_states = backends.iter().map(spooky_lb::BackendState::new).collect();
+    let backend_states = backends
+        .iter()
+        .map(spooky_lb::backend::BackendState::new)
+        .collect();
     BackendPool::new_from_states(backend_states)
 }
 

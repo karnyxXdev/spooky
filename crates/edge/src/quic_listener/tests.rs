@@ -34,7 +34,7 @@ use super::{
     should_strip_bootstrap_response_header, should_strip_h3_response_header,
     sweep_closed_connections,
 };
-use spooky_lb::HealthFailureReason;
+use spooky_lb::health::HealthFailureReason;
 type RoutingMaps = (
     HashMap<Arc<[u8]>, Arc<[u8]>>,
     CidRadix,

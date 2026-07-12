@@ -5,7 +5,7 @@ pub mod constants;
 pub mod hash;
 pub mod metrics;
 pub mod quic_listener;
-mod resilience;
+pub mod resilience;
 mod route_index;
 pub mod types;
 mod watchdog;

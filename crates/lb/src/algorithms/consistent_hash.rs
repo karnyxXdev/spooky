@@ -2,10 +2,10 @@ use crate::backend_pool::BackendPool;
 use crate::hash::{expected_ring_entries, hash_backend_replica, hash64};
 
 pub struct ConsistentHash {
-    replicas: u32,
-    ring: Vec<(u64, usize)>,
-    ring_epoch: Option<u64>,
-    ring_rebuilds: u64,
+    pub replicas: u32,
+    pub ring: Vec<(u64, usize)>,
+    pub ring_epoch: Option<u64>,
+    pub ring_rebuilds: u64,
 }
 
 impl ConsistentHash {

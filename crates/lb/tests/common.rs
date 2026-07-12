@@ -1,5 +1,5 @@
 use spooky_config::config::{Backend, HealthCheck};
-use spooky_lb::BackendState;
+use spooky_lb::backend::BackendState;
 
 pub fn create_backend_state(address: &str, weight: u32) -> BackendState {
     let backend = Backend {

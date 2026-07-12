@@ -1,6 +1,6 @@
+use crate::BridgeError;
 use spooky_config::backend_endpoint::BackendEndpoint;
 use spooky_config::config::{UpstreamHostPolicy, UpstreamHostPolicyMode};
-use spooky_errors::BridgeError;
 
 pub fn resolve_upstream_host_value<'a>(
     endpoint: &'a BackendEndpoint,

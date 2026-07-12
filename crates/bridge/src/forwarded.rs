@@ -1,7 +1,7 @@
+use crate::BridgeError;
 use crate::context::{ForwardedHeaderChains, ForwardedHeaderValues};
 use http::HeaderValue;
 use spooky_config::config::{ForwardedHeaderPolicy, ForwardedHeaderPolicyMode};
-use spooky_errors::BridgeError;
 use std::net::IpAddr;
 
 pub fn build_forwarded_header_values(

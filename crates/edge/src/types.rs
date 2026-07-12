@@ -11,7 +11,7 @@ use spooky_config::{
     },
 };
 use spooky_errors::ProxyError;
-use spooky_lb::UpstreamPool;
+use spooky_lb::upstream_pool::UpstreamPool;
 use spooky_transport::{h2_client::SharedDnsResolver, transport_pool::UpstreamTransportPool};
 use std::{
     collections::{HashMap, HashSet, VecDeque},

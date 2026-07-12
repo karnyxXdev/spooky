@@ -25,7 +25,7 @@ use spooky_config::{
     runtime::{ListenerRuntimeConfig, RuntimeUpstreamPolicy},
 };
 use spooky_errors::ProxyError;
-use spooky_lb::UpstreamPool;
+use spooky_lb::upstream_pool::UpstreamPool;
 use spooky_transport::transport_pool::UpstreamTransportPool;
 
 use crate::{

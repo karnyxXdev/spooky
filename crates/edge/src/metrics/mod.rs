@@ -9,7 +9,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub use spooky_lb::HealthFailureReason;
+pub use spooky_lb::health::HealthFailureReason;
 
 pub struct Metrics {
     pub requests_total: AtomicU64,

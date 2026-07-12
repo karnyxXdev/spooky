@@ -147,7 +147,7 @@ impl BackendPool {
 
     /// Core of [`reconcile_readmit`] with an injectable clock. Recomputes the
     /// next pending expiry; early-returns while the soonest cooldown is unmet.
-    fn reconcile_readmit_at(&mut self, now: Instant) {
+    pub fn reconcile_readmit_at(&mut self, now: Instant) {
         let Some(earliest) = self.earliest_readmit else {
             return;
         };

@@ -1,7 +1,11 @@
 mod cli;
+mod manifest;
 mod report;
 
 use cli::{Args, BenchSuite, FailOn};
+use manifest::{
+    BenchProfile, GateConfig, GateMetric, MacroSuiteConfig, MicroSuiteConfig, load_manifest,
+};
 use report::{BenchCase, BenchReport, ReleaseBaselineEntry, ReleaseBaselineIndex};
 
 use clap::Parser;
@@ -13,7 +17,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use serde::Deserialize;
 use smallvec::SmallVec;
 use spooky_config::config::{Backend, HealthCheck, LoadBalancing, RouteMatch, Upstream};
 use spooky_edge::benchmark::{ConnectionLookupBench, RouteLookupBench};
@@ -44,102 +47,6 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
-
-#[derive(Debug, Deserialize)]
-struct BenchManifest {
-    version: u32,
-    profiles: HashMap<String, BenchProfile>,
-    #[serde(default)]
-    micro: MicroSuiteConfig,
-    #[serde(rename = "macro", default)]
-    macro_suite: MacroSuiteConfig,
-    gates: GateConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct BenchProfile {
-    scales: Vec<usize>,
-    #[serde(default)]
-    macro_scales: Vec<usize>,
-    #[serde(default = "default_macro_traffic_mix_iterations")]
-    macro_traffic_mix_iterations: u64,
-    #[serde(default = "default_macro_stream_iterations")]
-    macro_long_lived_stream_iterations: u64,
-    #[serde(default = "default_macro_stream_chunks")]
-    macro_long_lived_stream_chunks: usize,
-    #[serde(default = "default_macro_stream_chunk_bytes")]
-    macro_long_lived_stream_chunk_bytes: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct MicroSuiteConfig {
-    #[serde(default = "default_true")]
-    include_h3_header_collection: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct MacroSuiteConfig {
-    #[serde(default = "default_true")]
-    include_traffic_mix: bool,
-    #[serde(default = "default_true")]
-    include_long_lived_stream: bool,
-}
-
-impl Default for MicroSuiteConfig {
-    fn default() -> Self {
-        Self {
-            include_h3_header_collection: true,
-        }
-    }
-}
-
-impl Default for MacroSuiteConfig {
-    fn default() -> Self {
-        Self {
-            include_traffic_mix: true,
-            include_long_lived_stream: true,
-        }
-    }
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_macro_traffic_mix_iterations() -> u64 {
-    20_000
-}
-
-fn default_macro_stream_iterations() -> u64 {
-    8_000
-}
-
-fn default_macro_stream_chunks() -> usize {
-    64
-}
-
-fn default_macro_stream_chunk_bytes() -> usize {
-    8 * 1024
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GateMetric {
-    warn_pct: f64,
-    severe_pct: f64,
-    #[serde(default)]
-    zero_baseline_limit: f64,
-    #[serde(default)]
-    min_delta_abs: f64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GateConfig {
-    cpu: GateMetric,
-    memory: GateMetric,
-    alloc_calls: GateMetric,
-    alloc_bytes: GateMetric,
-    tail_p99: GateMetric,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegressionSeverity {
@@ -1256,21 +1163,6 @@ fn load_report(path: &Path) -> Result<BenchReport, String> {
         .map_err(|err| format!("failed to read baseline '{}': {err}", path.display()))?;
     serde_json::from_str(&text)
         .map_err(|err| format!("failed to parse baseline '{}': {err}", path.display()))
-}
-
-fn load_manifest(path: &Path) -> Result<BenchManifest, String> {
-    let text = fs::read_to_string(path)
-        .map_err(|err| format!("failed to read manifest '{}': {err}", path.display()))?;
-    let manifest: BenchManifest = serde_yaml::from_str(&text)
-        .map_err(|err| format!("failed to parse manifest '{}': {err}", path.display()))?;
-
-    if manifest.version != 1 {
-        return Err(format!(
-            "unsupported bench manifest version {} (expected 1)",
-            manifest.version
-        ));
-    }
-    Ok(manifest)
 }
 
 fn load_release_index(path: &Path) -> Result<ReleaseBaselineIndex, String> {

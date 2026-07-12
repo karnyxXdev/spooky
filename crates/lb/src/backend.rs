@@ -6,30 +6,13 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 pub struct BackendState {
-    address: String,
-    weight: u32,
-    health_check: Option<HealthCheck>,
-    consecutive_failures: u32,
-    health_state: HealthState,
-    active_requests: Arc<AtomicUsize>,
-    ewma_latency_ms: Option<f64>,
-}
-
-#[derive(Clone)]
-enum HealthState {
-    Healthy,
-    // `reason` is stored for future introspection; suppressed until wired to metrics
-    #[allow(dead_code)]
-    Unhealthy {
-        until: Instant,
-        successes: u32,
-        reason: HealthFailureReason,
-    },
-}
-
-pub enum HealthTransition {
-    BecameHealthy,
-    BecameUnhealthy,
+    pub address: String,
+    pub weight: u32,
+    pub health_check: Option<HealthCheck>,
+    pub consecutive_failures: u32,
+    pub health_state: HealthState,
+    pub active_requests: Arc<AtomicUsize>,
+    pub ewma_latency_ms: Option<f64>,
 }
 
 impl BackendState {
@@ -129,7 +112,7 @@ impl BackendState {
     }
 
     /// Cooldown expiry, if this backend is currently unhealthy.
-    fn cooldown_until(&self) -> Option<Instant> {
+    pub fn cooldown_until(&self) -> Option<Instant> {
         if let HealthState::Unhealthy { until, .. } = self.health_state {
             Some(until)
         } else {
@@ -139,7 +122,7 @@ impl BackendState {
 
     /// Optimistically re-admit an ejected backend once its cooldown has elapsed
     /// so live traffic can probe it again. Returns true on transition.
-    fn readmit_if_expired(&mut self, now: Instant) -> bool {
+    pub fn readmit_if_expired(&mut self, now: Instant) -> bool {
         if let HealthState::Unhealthy { until, .. } = self.health_state
             && now >= until
         {
@@ -149,4 +132,21 @@ impl BackendState {
         }
         false
     }
+}
+
+#[derive(Clone)]
+enum HealthState {
+    Healthy,
+    // `reason` is stored for future introspection; suppressed until wired to metrics
+    #[allow(dead_code)]
+    Unhealthy {
+        until: Instant,
+        successes: u32,
+        reason: HealthFailureReason,
+    },
+}
+
+pub enum HealthTransition {
+    BecameHealthy,
+    BecameUnhealthy,
 }

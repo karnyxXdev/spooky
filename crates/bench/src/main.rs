@@ -7,18 +7,20 @@ mod markdown;
 mod profiler;
 mod regression;
 mod report;
+mod utils;
 
 use crate::benchmark::macro_bench::run_macro_suite;
 use crate::benchmark::micro_bench::run_micro_suite;
 use crate::cli::{Args, BenchSuite, FailOn};
 use crate::io::{
-    load_release_index, load_report, merge_reports, resolve_baseline_paths, unix_now,
-    write_release_index, write_report,
+    load_release_index, load_report, merge_reports, resolve_baseline_paths, write_release_index,
+    write_report,
 };
 use crate::manifest::load_manifest;
 use crate::markdown::write_markdown;
 use crate::regression::{RegressionSeverity, compare_reports, format_issue, resolve_gate_config};
 use crate::report::{BenchReport, ReleaseBaselineEntry};
+use crate::utils::{suite_label, unix_now};
 
 use clap::Parser;
 use std::fs;
@@ -40,14 +42,6 @@ fn print_summary(report: &BenchReport) {
             case.throughput_ops_per_sec,
             case.latency_p99_ns
         );
-    }
-}
-
-fn suite_label(suite: BenchSuite) -> &'static str {
-    match suite {
-        BenchSuite::Micro => "micro",
-        BenchSuite::Macro => "macro",
-        BenchSuite::All => "all",
     }
 }
 

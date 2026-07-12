@@ -1,3 +1,7 @@
+use crate::utils::{
+    default_macro_stream_chunk_bytes, default_macro_stream_chunks, default_macro_stream_iterations,
+    default_macro_traffic_mix_iterations, default_true,
+};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -29,22 +33,6 @@ pub struct BenchProfile {
     pub macro_long_lived_stream_chunk_bytes: usize,
 }
 
-fn default_macro_traffic_mix_iterations() -> u64 {
-    20_000
-}
-
-fn default_macro_stream_iterations() -> u64 {
-    8_000
-}
-
-fn default_macro_stream_chunks() -> usize {
-    64
-}
-
-fn default_macro_stream_chunk_bytes() -> usize {
-    8 * 1024
-}
-
 #[derive(Debug, Deserialize)]
 pub struct MicroSuiteConfig {
     #[serde(default = "default_true")]
@@ -57,10 +45,6 @@ pub struct MacroSuiteConfig {
     pub include_traffic_mix: bool,
     #[serde(default = "default_true")]
     pub include_long_lived_stream: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl Default for MicroSuiteConfig {

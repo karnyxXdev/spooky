@@ -1,14 +1,8 @@
 use crate::cli::{Args, BenchSuite};
 use crate::report::{BenchReport, ReleaseBaselineIndex};
+use crate::utils::unix_now;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-pub fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 pub fn write_report(path: &Path, report: &BenchReport) -> Result<(), String> {
     if let Some(parent) = path.parent() {

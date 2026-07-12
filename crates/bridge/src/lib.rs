@@ -1,3 +1,4 @@
+pub mod context;
 pub mod h3_to_h1;
 pub mod h3_to_h2;
 
@@ -11,34 +12,8 @@ use spooky_config::{
         UpstreamHostPolicyMode,
     },
 };
-use std::net::SocketAddr;
 
 pub use spooky_errors::BridgeError;
-
-// --- Shared context and header value types ---
-
-pub struct ForwardedContext<'a> {
-    pub client_addr: SocketAddr,
-    pub request_authority: Option<&'a str>,
-    pub request_id: u64,
-    pub traceparent: Option<&'a str>,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ForwardedHeaderChains<'a> {
-    pub forwarded: &'a [Vec<u8>],
-    pub x_forwarded_for: &'a [Vec<u8>],
-    pub x_forwarded_proto: &'a [Vec<u8>],
-    pub x_forwarded_host: &'a [Vec<u8>],
-}
-
-#[derive(Debug, Default)]
-pub struct ForwardedHeaderValues {
-    pub forwarded: Option<HeaderValue>,
-    pub x_forwarded_for: Option<HeaderValue>,
-    pub x_forwarded_proto: Option<HeaderValue>,
-    pub x_forwarded_host: Option<HeaderValue>,
-}
 
 // --- Shared websocket detection ---
 

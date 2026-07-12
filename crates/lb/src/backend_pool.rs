@@ -5,13 +5,13 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 pub struct BackendPool {
-    backends: Vec<BackendState>,
-    healthy: Vec<usize>,
-    healthy_pos: Vec<Option<usize>>,
-    membership_epoch: u64,
+    pub backends: Vec<BackendState>,
+    pub healthy: Vec<usize>,
+    pub healthy_pos: Vec<Option<usize>>,
+    pub membership_epoch: u64,
     // Earliest cooldown expiry among passively-ejected backends (no active
     // health check), driving time-based re-admission. `None` when none pending.
-    earliest_readmit: Option<Instant>,
+    pub earliest_readmit: Option<Instant>,
 }
 
 impl BackendPool {

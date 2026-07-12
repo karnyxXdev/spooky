@@ -1,6 +1,10 @@
+mod cli;
 mod report;
+
+use cli::{Args, BenchSuite, FailOn};
 use report::{BenchCase, BenchReport, ReleaseBaselineEntry, ReleaseBaselineIndex};
 
+use clap::Parser;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
 use std::fs;
@@ -9,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 use smallvec::SmallVec;
 use spooky_config::config::{Backend, HealthCheck, LoadBalancing, RouteMatch, Upstream};
@@ -41,74 +44,6 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum BenchSuite {
-    Micro,
-    Macro,
-    All,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum FailOn {
-    Severe,
-    Any,
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    version,
-    about = "Spooky benchmark suite (micro + macro + regression gates)"
-)]
-struct Args {
-    #[arg(long, default_value = "bench/latest.json")]
-    output: PathBuf,
-
-    #[arg(long)]
-    markdown_out: Option<PathBuf>,
-
-    #[arg(long)]
-    baseline: Option<PathBuf>,
-
-    #[arg(long, default_value_t = false)]
-    check_baseline: bool,
-
-    #[arg(long, value_enum, default_value_t = BenchSuite::Micro)]
-    suite: BenchSuite,
-
-    #[arg(long, default_value = "full")]
-    profile: String,
-
-    #[arg(long, default_value = "bench/manifest.yaml")]
-    manifest: PathBuf,
-
-    #[arg(long, default_value = "bench/baselines/releases.json")]
-    baseline_index: PathBuf,
-
-    #[arg(long)]
-    baseline_release: Option<String>,
-
-    #[arg(long, value_enum, default_value_t = FailOn::Severe)]
-    fail_on: FailOn,
-
-    #[arg(long)]
-    cpu_threshold: Option<f64>,
-
-    #[arg(long)]
-    mem_threshold: Option<f64>,
-
-    #[arg(long)]
-    promote_release: Option<String>,
-
-    #[arg(long, default_value = "bench/latest.json")]
-    promote_micro_report: PathBuf,
-
-    #[arg(long, default_value = "bench/macro/latest.json")]
-    promote_macro_report: PathBuf,
-
-    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
-    set_current_release: bool,
-}
 
 #[derive(Debug, Deserialize)]
 struct BenchManifest {

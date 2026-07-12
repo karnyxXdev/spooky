@@ -1,7 +1,9 @@
+mod allocator;
 mod cli;
 mod manifest;
 mod report;
 
+use allocator::{alloc_snapshot, reset_alloc_counters};
 use cli::{Args, BenchSuite, FailOn};
 use manifest::{
     BenchProfile, GateConfig, GateMetric, MacroSuiteConfig, MicroSuiteConfig, load_manifest,
@@ -9,44 +11,16 @@ use manifest::{
 use report::{BenchCase, BenchReport, ReleaseBaselineEntry, ReleaseBaselineIndex};
 
 use clap::Parser;
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
 use std::fs;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use smallvec::SmallVec;
 use spooky_config::config::{Backend, HealthCheck, LoadBalancing, RouteMatch, Upstream};
 use spooky_edge::benchmark::{ConnectionLookupBench, RouteLookupBench};
 use spooky_lb::UpstreamPool;
-
-struct CountingAllocator;
-
-static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
-static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-        ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-        ALLOC_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegressionSeverity {
@@ -66,18 +40,6 @@ struct RegressionIssue {
     warn_limit: f64,
     severe_limit: f64,
     unit: &'static str,
-}
-
-fn reset_alloc_counters() {
-    ALLOC_CALLS.store(0, Ordering::Relaxed);
-    ALLOC_BYTES.store(0, Ordering::Relaxed);
-}
-
-fn alloc_snapshot() -> (u64, u64) {
-    (
-        ALLOC_CALLS.load(Ordering::Relaxed),
-        ALLOC_BYTES.load(Ordering::Relaxed),
-    )
 }
 
 fn current_rss_kb() -> Option<u64> {

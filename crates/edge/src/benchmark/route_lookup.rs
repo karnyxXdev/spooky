@@ -1,5 +1,6 @@
 use crate::benchmark::helpers::build_benchmark_upstream;
-use crate::route_index::{RouteIndex, scan_lookup};
+use crate::routing::index::RouteIndex;
+use crate::routing::scan::scan_lookup;
 use spooky_config::config::Upstream;
 use std::collections::HashMap;
 

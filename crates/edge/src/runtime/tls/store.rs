@@ -1,0 +1,123 @@
+use crate::runtime::tls::inventory::ListenerTlsInventory;
+use rustls::ServerConfig as RustlsServerConfig;
+use spooky_errors::ProxyError;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+pub struct ListenerTlsReloadState {
+    pub generation: u64,
+    pub inventory: ListenerTlsInventory,
+    pub bootstrap_server_config: Arc<RustlsServerConfig>,
+}
+
+pub struct ListenerTlsReloadStore {
+    listeners: RwLock<HashMap<String, ListenerTlsReloadState>>,
+}
+
+impl ListenerTlsReloadStore {
+    pub fn new(listeners: HashMap<String, ListenerTlsReloadState>) -> Self {
+        Self {
+            listeners: RwLock::new(listeners),
+        }
+    }
+
+    pub fn generation(&self, listener: &str) -> Option<u64> {
+        self.listeners
+            .read()
+            .ok()
+            .and_then(|listeners| listeners.get(listener).map(|state| state.generation))
+    }
+
+    pub fn bootstrap_server_config(&self, listener: &str) -> Option<Arc<RustlsServerConfig>> {
+        self.listeners.read().ok().and_then(|listeners| {
+            listeners
+                .get(listener)
+                .map(|state| Arc::clone(&state.bootstrap_server_config))
+        })
+    }
+
+    pub fn inventory(&self, listener: &str) -> Option<ListenerTlsInventory> {
+        self.listeners
+            .read()
+            .ok()
+            .and_then(|listeners| listeners.get(listener).map(|state| state.inventory.clone()))
+    }
+
+    pub fn replace_listener(
+        &self,
+        listener: &str,
+        inventory: ListenerTlsInventory,
+        bootstrap_server_config: Arc<RustlsServerConfig>,
+    ) -> Result<u64, ProxyError> {
+        let mut listeners = self.listeners.write().map_err(|_| {
+            ProxyError::Transport("listener TLS reload store lock poisoned".to_string())
+        })?;
+        let state = listeners.get_mut(listener).ok_or_else(|| {
+            ProxyError::Transport(format!(
+                "listener TLS reload requested for unknown listener '{}'",
+                listener
+            ))
+        })?;
+        state.generation = state.generation.saturating_add(1);
+        state.inventory = inventory;
+        state.bootstrap_server_config = bootstrap_server_config;
+        Ok(state.generation)
+    }
+
+    pub fn replace_listeners(
+        &self,
+        updates: &[(String, ListenerTlsReloadState)],
+    ) -> Result<HashMap<String, u64>, ProxyError> {
+        let mut listeners = self.listeners.write().map_err(|_| {
+            ProxyError::Transport("listener TLS reload store lock poisoned".to_string())
+        })?;
+
+        for (listener, _) in updates {
+            if !listeners.contains_key(listener) {
+                return Err(ProxyError::Transport(format!(
+                    "listener TLS reload requested for unknown listener '{}'",
+                    listener
+                )));
+            }
+        }
+
+        let mut generations = HashMap::with_capacity(updates.len());
+        for (listener, update) in updates {
+            let state = listeners.get_mut(listener).ok_or_else(|| {
+                ProxyError::Transport(format!(
+                    "listener TLS reload requested for unknown listener '{}'",
+                    listener
+                ))
+            })?;
+            state.generation = state.generation.saturating_add(1);
+            state.inventory = update.inventory.clone();
+            state.bootstrap_server_config = Arc::clone(&update.bootstrap_server_config);
+            generations.insert(listener.clone(), state.generation);
+        }
+        Ok(generations)
+    }
+
+    pub fn snapshot(&self) -> HashMap<String, ListenerTlsInventory> {
+        self.listeners
+            .read()
+            .map(|listeners| {
+                listeners
+                    .iter()
+                    .map(|(listener, state)| (listener.clone(), state.inventory.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn generations(&self) -> HashMap<String, u64> {
+        self.listeners
+            .read()
+            .map(|listeners| {
+                listeners
+                    .iter()
+                    .map(|(listener, state)| (listener.clone(), state.generation))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}

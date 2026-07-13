@@ -10,8 +10,9 @@ use log::{error, info, warn};
 
 use spooky_config::runtime::RuntimeConfig;
 use spooky_config::validator::validate as validate_config;
-use spooky_edge::types::RuntimeBundleHandle;
-use spooky_edge::{QUICListener, configure_async_runtime};
+use spooky_edge::configure_async_runtime;
+use spooky_edge::runtime::bundle::RuntimeBundleHandle;
+use spooky_edge::runtime::listener::QUICListener;
 
 use crate::listener_group::{
     ListenerGroupRuntime, allocate_worker_index_base, collect_finished_listener_groups,

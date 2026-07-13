@@ -5,21 +5,17 @@ pub mod constants;
 pub mod hash;
 pub mod metrics;
 pub mod quic_listener;
-mod resilience;
-mod route_index;
-pub mod types;
-mod watchdog;
+pub mod resilience;
+pub mod routing;
+pub mod runtime;
+pub mod watchdog;
 
 pub use body::ChannelBody;
 pub(crate) use hash::REQUEST_ID_COUNTER;
 pub use hash::{stable_hash_socket_addr, stable_hash64};
 pub use metrics::{HealthFailureReason, Metrics, OverloadShedReason, RetryReason, RouteOutcome};
 pub use quic_listener::configure_async_runtime;
-pub use types::{
-    ForwardResult, HealthClassification, HedgeTelemetry, PendingForward, PendingHeaderMutation,
-    QUICListener, QuicConnection, RequestEnvelope, ResponseChunk, SharedRuntimeState,
-    StreamAdmissionState, StreamPhase, UpstreamResult, outcome_from_status,
-};
+
 #[cfg(test)]
 mod tests {
     use super::*;

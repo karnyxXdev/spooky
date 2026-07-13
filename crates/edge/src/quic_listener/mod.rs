@@ -68,11 +68,9 @@ use spooky_config::{
     },
 };
 
-use crate::types::{ForwardSuccess, TunnelMode};
+use crate::runtime::{connection::response::ForwardSuccess, connection::stream::TunnelMode};
 use crate::{
-    ChannelBody, ForwardResult, HealthClassification, Metrics, OverloadShedReason, QUICListener,
-    QuicConnection, REQUEST_ID_COUNTER, RequestEnvelope, ResponseChunk, RetryReason, RouteOutcome,
-    SharedRuntimeState, StreamAdmissionState, StreamPhase, UpstreamResult,
+    ChannelBody, Metrics, OverloadShedReason, REQUEST_ID_COUNTER, RetryReason, RouteOutcome,
     cid_radix::CidRadix,
     constants::{
         DEFAULT_SCID_LEN_BYTES, MAX_DATAGRAM_SIZE_BYTES, MAX_UDP_PAYLOAD_BYTES, MIN_SCID_LEN_BYTES,
@@ -80,16 +78,33 @@ use crate::{
         RESPONSE_CHUNK_BYTES_LIMIT, RESPONSE_CHUNK_CHANNEL_CAPACITY,
         SCID_ROTATION_PACKET_THRESHOLD, UDP_READ_TIMEOUT_MS, scid_rotation_interval,
     },
-    outcome_from_status,
-    resilience::{RouteQueueRejection, RuntimeResilience},
-    route_index::{RouteDecisionReason, RouteIndex},
-    types::{
-        ListenerTlsInventory, ListenerTlsReloadState, ListenerTlsReloadStore,
-        QuicConnectionErrorSnapshot, RuntimeBackendResolution, RuntimeBackendResolutionStore,
-        RuntimeBundle, RuntimeBundleHandle, RuntimeLoadedClientAuthCa, RuntimeLoadedTlsIdentity,
-        RuntimeTaskRegistration, RuntimeTaskRegistry, RuntimeTlsCertificateMetadata,
+    resilience::route_queue::RouteQueueRejection,
+    resilience::runtime::RuntimeResilience,
+    routing::decision::RouteDecisionReason,
+    routing::index::RouteIndex,
+    runtime::connection::quic::QuicConnection,
+    runtime::connection::request::RequestEnvelope,
+    runtime::connection::response::ForwardResult,
+    runtime::connection::response::ResponseChunk,
+    runtime::connection::response::UpstreamResult,
+    runtime::connection::stream::StreamAdmissionState,
+    runtime::connection::stream::StreamPhase,
+    runtime::health::HealthClassification,
+    runtime::health::outcome_from_status,
+    runtime::listener::QUICListener,
+    runtime::shared_state::SharedRuntimeState,
+    runtime::{
+        backend::resolution::RuntimeBackendResolution,
+        backend::store::RuntimeBackendResolutionStore, bundle::RuntimeBundle,
+        bundle::RuntimeBundleHandle, connection::quic::QuicConnectionErrorSnapshot,
+        tasks::RuntimeTaskRegistration, tasks::RuntimeTaskRegistry,
+        tls::inventory::ListenerTlsInventory, tls::inventory::RuntimeLoadedClientAuthCa,
+        tls::inventory::RuntimeLoadedTlsIdentity, tls::inventory::RuntimeTlsCertificateMetadata,
+        tls::store::ListenerTlsReloadState, tls::store::ListenerTlsReloadStore,
     },
-    watchdog::{WatchdogCoordinator, WatchdogRuntimeConfig, now_millis},
+    watchdog::config::WatchdogRuntimeConfig,
+    watchdog::coordinator::WatchdogCoordinator,
+    watchdog::time::now_millis,
 };
 
 mod backend_resolution;

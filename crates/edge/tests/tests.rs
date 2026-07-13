@@ -1,5 +1,11 @@
-use super::*;
+use spooky_config::config::Upstream;
 use spooky_config::config::{LoadBalancing, RouteMatch};
+use spooky_edge::routing::{
+    decision::RouteDecisionReason,
+    index::RouteIndex,
+    scan::{scan_lookup, scan_lookup_for_method},
+};
+use std::collections::HashMap;
 use std::time::Instant;
 
 fn test_upstream(host: Option<&str>, path_prefix: Option<&str>) -> Upstream {

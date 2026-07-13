@@ -10,10 +10,10 @@ use std::{thread, time::Duration};
 use log::{error, info, warn};
 
 use spooky_config::runtime::{ListenerRuntimeConfig, RuntimeConfig};
-use spooky_edge::types::RuntimeBundleHandle;
-use spooky_edge::{
-    QUICListener, SharedRuntimeState, constants::MAX_DATAGRAM_SIZE_BYTES, stable_hash_socket_addr,
-};
+use spooky_edge::runtime::bundle::RuntimeBundleHandle;
+use spooky_edge::runtime::listener::QUICListener;
+use spooky_edge::runtime::shared_state::SharedRuntimeState;
+use spooky_edge::{constants::MAX_DATAGRAM_SIZE_BYTES, stable_hash_socket_addr};
 
 use crate::runtime_guard;
 

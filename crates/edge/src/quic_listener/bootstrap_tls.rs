@@ -36,9 +36,7 @@ use spooky_transport::transport_pool::UpstreamTransportPool;
 
 use super::{
     BootstrapServiceFuture, BootstrapStreamingBody, QUICListener,
-    admission::{
-        AdmissionPolicyDecision, evaluate_local_auth_policy, evaluate_scoped_rate_limit_policy,
-    },
+    admission::{AdmissionPolicyDecision, evaluate_forwarding_pre_admission_policy},
     bootstrap_resolution_error_response, boxed_full, connection_header_tokens, is_head_method,
     is_websocket_upgrade_request,
     runtime_endpoint::RuntimeConnectionSlotGuard,
@@ -421,10 +419,34 @@ impl QUICListener {
                                     }
                                 };
 
-                                if let Some(policy) = upstream_policies.get(&upstream_name) {
-                                    if let AdmissionPolicyDecision::Unauthorized(decision) =
-                                        evaluate_local_auth_policy(policy, Some(&lb_header_lookup))
-                                    {
+                                let upstream_policy = upstream_policies
+                                    .get(&upstream_name)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let admission = evaluate_forwarding_pre_admission_policy(
+                                    &upstream_policy,
+                                    Some(&lb_header_lookup),
+                                    &resilience.brownout,
+                                    resilience.adaptive_admission.inflight_percent(),
+                                    &upstream_name,
+                                    resilience.shed_retry_after_seconds,
+                                    &resilience.scoped_rate_limits,
+                                    |rule| {
+                                        Self::resolve_scoped_rate_limit_key(
+                                            rule,
+                                            &upstream_name,
+                                            &method,
+                                            &path,
+                                            authority.as_deref(),
+                                            peer,
+                                            Some(&lb_header_lookup),
+                                        )
+                                    },
+                                );
+                                metrics.set_brownout_active(resilience.brownout.is_active());
+                                match admission {
+                                    AdmissionPolicyDecision::AdmitReady => {}
+                                    AdmissionPolicyDecision::Unauthorized(decision) => {
                                         metrics.inc_failure();
                                         metrics.inc_policy_denied();
                                         metrics.record_route(
@@ -450,49 +472,59 @@ impl QUICListener {
                                                 )))
                                             }));
                                     }
-                                }
-
-                                if let AdmissionPolicyDecision::RateLimited(decision) =
-                                    evaluate_scoped_rate_limit_policy(
-                                        &resilience.scoped_rate_limits,
-                                        &upstream_name,
-                                        |rule| {
-                                            Self::resolve_scoped_rate_limit_key(
-                                                rule,
-                                                &upstream_name,
-                                                &method,
-                                                &path,
-                                                authority.as_deref(),
-                                                peer,
-                                                Some(&lb_header_lookup),
+                                    AdmissionPolicyDecision::RateLimited(decision) => {
+                                        metrics.inc_failure();
+                                        metrics.inc_request_rate_limited();
+                                        metrics.record_route(
+                                            &upstream_name,
+                                            Duration::from_millis(0),
+                                            RouteOutcome::RateLimited,
+                                        );
+                                        warn!(
+                                            "Bootstrap request route={} scoped rate limit exceeded by rule={}",
+                                            decision.route, decision.rule_name
+                                        );
+                                        return Ok(Response::builder()
+                                            .status(decision.status)
+                                            .header("alt-svc", &alt)
+                                            .header(
+                                                "retry-after",
+                                                decision.retry_after_seconds.max(1).to_string(),
                                             )
-                                        },
-                                    )
-                                {
-                                    metrics.inc_failure();
-                                    metrics.inc_request_rate_limited();
-                                    metrics.record_route(
-                                        &upstream_name,
-                                        Duration::from_millis(0),
-                                        RouteOutcome::RateLimited,
-                                    );
-                                    warn!(
-                                        "Bootstrap request route={} scoped rate limit exceeded by rule={}",
-                                        decision.route, decision.rule_name
-                                    );
-                                    return Ok(Response::builder()
-                                        .status(decision.status)
-                                        .header("alt-svc", &alt)
-                                        .header(
-                                            "retry-after",
-                                            decision.retry_after_seconds.max(1).to_string(),
-                                        )
-                                        .body(boxed_full(Bytes::from_static(decision.body)))
-                                        .unwrap_or_else(|_| {
-                                            Response::new(boxed_full(Bytes::from_static(
-                                                b"error\n",
-                                            )))
-                                        }));
+                                            .body(boxed_full(Bytes::from_static(decision.body)))
+                                            .unwrap_or_else(|_| {
+                                                Response::new(boxed_full(Bytes::from_static(
+                                                    b"error\n",
+                                                )))
+                                            }));
+                                    }
+                                    AdmissionPolicyDecision::Overloaded(decision) => {
+                                        metrics.inc_failure();
+                                        metrics.inc_overload_shed_reason(
+                                            decision.reason.metrics_reason(),
+                                        );
+                                        metrics.record_route(
+                                            &upstream_name,
+                                            Duration::from_millis(0),
+                                            RouteOutcome::OverloadShed,
+                                        );
+                                        resilience
+                                            .adaptive_admission
+                                            .observe(Duration::from_millis(0), true);
+                                        return Ok(Response::builder()
+                                            .status(decision.status)
+                                            .header("alt-svc", &alt)
+                                            .header(
+                                                "retry-after",
+                                                decision.retry_after_seconds.max(1).to_string(),
+                                            )
+                                            .body(boxed_full(Bytes::from_static(decision.body)))
+                                            .unwrap_or_else(|_| {
+                                                Response::new(boxed_full(Bytes::from_static(
+                                                    b"error\n",
+                                                )))
+                                            }));
+                                    }
                                 }
 
                                 let endpoint = match backend_endpoints.get(&backend_addr) {
@@ -511,10 +543,6 @@ impl QUICListener {
                                 };
 
                                 let request_path = if path.is_empty() { "/" } else { &path };
-                                let upstream_policy = upstream_policies
-                                    .get(&upstream_name)
-                                    .cloned()
-                                    .unwrap_or_default();
                                 if !is_websocket_upgrade
                                     && content_length
                                         .is_some_and(|value| value > max_request_body_bytes)

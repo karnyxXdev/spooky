@@ -8,18 +8,14 @@ mod stream_progress;
 
 use self::prepare::{PreparedRequest, StartedAuthRequest};
 
-use std::{
-    convert::Infallible,
-    error::Error as StdError,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{convert::Infallible, error::Error as StdError};
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use hmac::{Hmac, Mac};
-use serde_json::Value;
-use sha2::Sha256;
 use spooky_config::config::ScopedRateLimitScope;
-use subtle::ConstantTimeEq;
+
+#[cfg(test)]
+use serde_json::Value;
+#[cfg(test)]
+use std::time::SystemTime;
 
 use super::*;
 use crate::runtime::connection::{request::PendingForward, stream::StreamAdmissionState};
@@ -1254,176 +1250,34 @@ impl QUICListener {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn api_key_is_authorized(
         policy: &RuntimeUpstreamPolicy,
         header_lookup: Option<&LbHeaderLookup<'_>>,
     ) -> bool {
-        let Some(api_key) = policy.upstream_auth.api_key.as_ref() else {
-            return true;
-        };
-        let Some(provided) = header_lookup.and_then(|lookup| lookup(api_key.header_name.as_str()))
-        else {
-            return false;
-        };
-        let provided = provided.trim();
-        !provided.is_empty()
-            && api_key
-                .keys
-                .iter()
-                .any(|expected| bool::from(provided.as_bytes().ct_eq(expected.as_bytes())))
+        crate::quic_listener::admission::api_key_is_authorized(policy, header_lookup)
     }
 
+    #[cfg(test)]
     pub(crate) fn jwt_is_authorized(
         policy: &RuntimeUpstreamPolicy,
         header_lookup: Option<&LbHeaderLookup<'_>>,
     ) -> bool {
-        let Some(jwt) = policy.upstream_auth.jwt.as_ref() else {
-            return true;
-        };
-        let Some(raw) =
-            header_lookup.and_then(|lookup| lookup(http::header::AUTHORIZATION.as_str()))
-        else {
-            return false;
-        };
-        let Some(token) = Self::bearer_token_from_authorization_value(&raw) else {
-            return false;
-        };
-        let Some(claims) = Self::validated_hs256_jwt_claims(token.as_str(), jwt, SystemTime::now())
-        else {
-            return false;
-        };
-        Self::jwt_claims_satisfy_rbac(policy, &claims)
+        crate::quic_listener::admission::jwt_is_authorized(policy, header_lookup)
     }
 
+    #[cfg(test)]
     fn validated_hs256_jwt_claims(
         token: &str,
         jwt: &spooky_config::runtime::RuntimeJwtAuth,
         now: SystemTime,
     ) -> Option<Value> {
-        let mut parts = token.split('.');
-        let (Some(header_b64), Some(payload_b64), Some(signature_b64), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return None;
-        };
-        let Ok(header_bytes) = URL_SAFE_NO_PAD.decode(header_b64) else {
-            return None;
-        };
-        let Ok(payload_bytes) = URL_SAFE_NO_PAD.decode(payload_b64) else {
-            return None;
-        };
-        let Ok(signature) = URL_SAFE_NO_PAD.decode(signature_b64) else {
-            return None;
-        };
-        let Ok(header) = serde_json::from_slice::<Value>(&header_bytes) else {
-            return None;
-        };
-        if header.get("alg").and_then(Value::as_str) != Some("HS256") {
-            return None;
-        }
-
-        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(jwt.secret.as_bytes()) else {
-            return None;
-        };
-        mac.update(format!("{header_b64}.{payload_b64}").as_bytes());
-        let expected = mac.finalize().into_bytes();
-        if expected.len() != signature.len()
-            || !bool::from(expected.as_slice().ct_eq(signature.as_slice()))
-        {
-            return None;
-        }
-
-        let Ok(claims) = serde_json::from_slice::<Value>(&payload_bytes) else {
-            return None;
-        };
-        let Ok(now_secs) = now.duration_since(UNIX_EPOCH).map(|value| value.as_secs()) else {
-            return None;
-        };
-        let exp = claims.get("exp").and_then(Value::as_u64)?;
-        if now_secs > exp.saturating_add(jwt.clock_skew_secs) {
-            return None;
-        }
-        if claims
-            .get("nbf")
-            .and_then(Value::as_u64)
-            .is_some_and(|nbf| now_secs.saturating_add(jwt.clock_skew_secs) < nbf)
-        {
-            return None;
-        }
-        if claims
-            .get("iat")
-            .and_then(Value::as_u64)
-            .is_some_and(|iat| now_secs.saturating_add(jwt.clock_skew_secs) < iat)
-        {
-            return None;
-        }
-        if jwt
-            .issuer
-            .as_deref()
-            .is_some_and(|issuer| claims.get("iss").and_then(Value::as_str) != Some(issuer))
-        {
-            return None;
-        }
-        if let Some(audience) = jwt.audience.as_deref() {
-            let claim_aud = claims.get("aud")?;
-            match claim_aud {
-                Value::String(value) if value == audience => {}
-                Value::Array(values)
-                    if values
-                        .iter()
-                        .any(|value| value.as_str().is_some_and(|value| value == audience)) => {}
-                _ => return None,
-            }
-        }
-
-        Some(claims)
+        crate::quic_listener::admission::validated_hs256_jwt_claims(token, jwt, now)
     }
 
+    #[cfg(test)]
     fn jwt_claims_satisfy_rbac(policy: &RuntimeUpstreamPolicy, claims: &Value) -> bool {
-        let scopes = Self::jwt_string_claim_values(claims, &["scope", "scp"]);
-        let roles = Self::jwt_string_claim_values(claims, &["roles", "role"]);
-        policy
-            .upstream_auth
-            .required_scopes
-            .iter()
-            .all(|required| scopes.contains(required))
-            && policy
-                .upstream_auth
-                .required_roles
-                .iter()
-                .all(|required| roles.contains(required))
-    }
-
-    fn jwt_string_claim_values(
-        claims: &Value,
-        claim_names: &[&str],
-    ) -> std::collections::HashSet<String> {
-        let mut values = std::collections::HashSet::new();
-        for claim_name in claim_names {
-            let Some(value) = claims.get(*claim_name) else {
-                continue;
-            };
-            match value {
-                Value::String(value) => {
-                    for item in value.split_whitespace() {
-                        if !item.is_empty() {
-                            values.insert(item.to_string());
-                        }
-                    }
-                }
-                Value::Array(items) => {
-                    for item in items {
-                        if let Some(item) = item.as_str()
-                            && !item.is_empty()
-                        {
-                            values.insert(item.to_string());
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        values
+        crate::quic_listener::admission::jwt_claims_satisfy_rbac(policy, claims)
     }
 
     pub(crate) fn resolve_scoped_rate_limit_key(

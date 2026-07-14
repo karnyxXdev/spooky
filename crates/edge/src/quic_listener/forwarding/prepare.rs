@@ -6,7 +6,10 @@ use tracing::Span;
 use super::auth::{AuthStart, auth_failure_mode, fail_open, start_external_auth_task};
 use super::resolve::ResolvedBackend;
 use super::*;
-use crate::runtime::connection::{auth::PendingHeaderMutation, request::PendingForward};
+use crate::{
+    quic_listener::admission::{AdmissionPolicyDecision, evaluate_local_auth_policy},
+    runtime::connection::{auth::PendingHeaderMutation, request::PendingForward},
+};
 
 pub(super) struct PreparedRequest {
     pub(super) upstream_name: String,
@@ -201,34 +204,30 @@ impl QUICListener {
                     .get(&upstream_name)
                     .cloned()
                     .unwrap_or_default();
-                let denied_challenge =
-                    if !Self::api_key_is_authorized(&upstream_policy, Some(&lb_header_lookup)) {
-                        Some(b"ApiKey".as_slice())
-                    } else if !Self::jwt_is_authorized(&upstream_policy, Some(&lb_header_lookup)) {
-                        Some(b"Bearer".as_slice())
-                    } else {
-                        None
-                    };
-                if let Some(challenge) = denied_challenge {
-                    metrics.inc_failure();
-                    metrics.inc_policy_denied();
-                    metrics.record_route(
-                        &upstream_name,
-                        request_start.elapsed(),
-                        RouteOutcome::Failure,
-                    );
-                    warn!(
-                        "request_id=unassigned route={} denied by local auth policy",
-                        upstream_name
-                    );
-                    Self::send_unauthorized_response(
-                        h3,
-                        quic,
-                        stream_id,
-                        b"unauthorized\n",
-                        challenge,
-                    )?;
-                    return Ok(None);
+                match evaluate_local_auth_policy(&upstream_policy, Some(&lb_header_lookup)) {
+                    AdmissionPolicyDecision::AdmitReady => {}
+                    AdmissionPolicyDecision::Unauthorized(decision) => {
+                        metrics.inc_failure();
+                        metrics.inc_policy_denied();
+                        metrics.record_route(
+                            &upstream_name,
+                            request_start.elapsed(),
+                            RouteOutcome::Failure,
+                        );
+                        warn!(
+                            "request_id=unassigned route={} denied by local auth policy",
+                            upstream_name
+                        );
+                        Self::send_unauthorized_response(
+                            h3,
+                            quic,
+                            stream_id,
+                            decision.body,
+                            decision.challenge.as_www_authenticate().as_bytes(),
+                        )?;
+                        return Ok(None);
+                    }
+                    _ => unreachable!("local auth evaluator only returns admit or unauthorized"),
                 }
 
                 let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);

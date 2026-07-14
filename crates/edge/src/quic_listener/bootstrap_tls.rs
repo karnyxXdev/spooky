@@ -36,9 +36,12 @@ use spooky_transport::transport_pool::UpstreamTransportPool;
 
 use super::{
     BootstrapServiceFuture, BootstrapStreamingBody, QUICListener,
+    admission::{AdmissionPolicyDecision, evaluate_local_auth_policy},
     bootstrap_resolution_error_response, boxed_full, connection_header_tokens, is_head_method,
-    is_websocket_upgrade_request, runtime_endpoint::RuntimeConnectionSlotGuard, runtime_handle,
-    should_strip_bootstrap_response_header, spawn_supervised_async_task, validate_http_request,
+    is_websocket_upgrade_request,
+    runtime_endpoint::RuntimeConnectionSlotGuard,
+    runtime_handle, should_strip_bootstrap_response_header, spawn_supervised_async_task,
+    validate_http_request,
 };
 use crate::{
     Metrics, REQUEST_ID_COUNTER, RouteOutcome,
@@ -417,20 +420,9 @@ impl QUICListener {
                                 };
 
                                 if let Some(policy) = upstream_policies.get(&upstream_name) {
-                                    let denied_challenge = if !Self::api_key_is_authorized(
-                                        policy,
-                                        Some(&lb_header_lookup),
-                                    ) {
-                                        Some("ApiKey")
-                                    } else if !Self::jwt_is_authorized(
-                                        policy,
-                                        Some(&lb_header_lookup),
-                                    ) {
-                                        Some("Bearer")
-                                    } else {
-                                        None
-                                    };
-                                    if let Some(challenge) = denied_challenge {
+                                    if let AdmissionPolicyDecision::Unauthorized(decision) =
+                                        evaluate_local_auth_policy(policy, Some(&lb_header_lookup))
+                                    {
                                         metrics.inc_failure();
                                         metrics.inc_policy_denied();
                                         metrics.record_route(
@@ -443,10 +435,13 @@ impl QUICListener {
                                             upstream_name
                                         );
                                         return Ok(Response::builder()
-                                            .status(StatusCode::UNAUTHORIZED)
+                                            .status(decision.status)
                                             .header("alt-svc", &alt)
-                                            .header("www-authenticate", challenge)
-                                            .body(boxed_full(Bytes::from_static(b"unauthorized\n")))
+                                            .header(
+                                                "www-authenticate",
+                                                decision.challenge.as_www_authenticate(),
+                                            )
+                                            .body(boxed_full(Bytes::from_static(decision.body)))
                                             .unwrap_or_else(|_| {
                                                 Response::new(boxed_full(Bytes::from_static(
                                                     b"error\n",

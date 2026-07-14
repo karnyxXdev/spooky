@@ -103,6 +103,7 @@ use crate::{
     watchdog::{config::WatchdogRuntimeConfig, coordinator::WatchdogCoordinator, time::now_millis},
 };
 
+mod admission;
 mod backend_resolution;
 mod bootstrap_tls;
 mod connection;

@@ -1,3 +1,11 @@
+mod auth;
+mod dispatch;
+mod lb_key;
+mod prepare;
+mod resolve;
+mod response;
+mod stream_progress;
+
 use std::{
     convert::Infallible,
     error::Error as StdError,

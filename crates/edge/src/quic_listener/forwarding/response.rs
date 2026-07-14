@@ -3,18 +3,18 @@ use super::*;
 impl QUICListener {
     /// Handle an already-resolved `ForwardResult`, applying health transitions
     /// and sending the H3 response.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_forward_result(
         h3: &mut quiche::h3::Connection,
         quic: &mut quiche::Connection,
         stream_id: u64,
         req: &RequestEnvelope,
         result: ForwardResult,
-        upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
-        routing_index: &RouteIndex,
-        metrics: &Metrics,
-        overload_retry_after_seconds: u32,
+        shared_ctx: &ForwardingSharedCtx<'_>,
     ) -> Result<(), quiche::h3::Error> {
+        let metrics = shared_ctx.metrics.as_ref();
+        let routing_index = shared_ctx.routing_index;
+        let upstream_pools = shared_ctx.upstream_pools;
+        let overload_retry_after_seconds = shared_ctx.resilience.shed_retry_after_seconds;
         let start = req.start;
         let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
 
@@ -482,17 +482,17 @@ impl QUICListener {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn flush_response_chunks(
         stream_id: u64,
         req: &mut RequestEnvelope,
         quic: &mut quiche::Connection,
         h3: &mut quiche::h3::Connection,
-        upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
-        routing_index: &RouteIndex,
-        metrics: &Metrics,
-        resilience: &RuntimeResilience,
+        shared_ctx: &ForwardingSharedCtx<'_>,
     ) -> bool {
+        let metrics = shared_ctx.metrics.as_ref();
+        let resilience = shared_ctx.resilience;
+        let routing_index = shared_ctx.routing_index;
+        let upstream_pools = shared_ctx.upstream_pools;
         let Some(rx) = &mut req.response_chunk_rx else {
             return false;
         };

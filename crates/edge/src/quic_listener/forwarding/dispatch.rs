@@ -124,26 +124,25 @@ impl QUICListener {
         None
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_upstream_forward_task(
         req: &RequestEnvelope,
         pending_forward: Arc<PendingForward>,
         backend_endpoint: BackendEndpoint,
         request: Option<Request<BoxBody<Bytes, Infallible>>>,
         websocket_tunnel_body_rx: Option<mpsc::Receiver<Bytes>>,
-        transport_pool: Arc<UpstreamTransportPool>,
-        backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
-        backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
-        backend_timeout: Duration,
-        metrics: Arc<Metrics>,
-        resilience: &RuntimeResilience,
+        exec_ctx: &ForwardingExecutionCtx<'_>,
+        shared_ctx: &ForwardingSharedCtx<'_>,
     ) -> Result<oneshot::Receiver<UpstreamResult>, ProxyError> {
+        let metrics = Arc::clone(&shared_ctx.metrics);
+        let resilience = shared_ctx.resilience;
         let fwd_addr = pending_forward.backend_addr.to_string();
         let cb = Arc::clone(&resilience.circuit_breakers);
         let retry_budget = Arc::clone(&resilience.retry_budget);
         let route_name = pending_forward.upstream_name.to_string();
-        let _backend_resolutions = Arc::clone(&backend_resolution_store);
-        let transport = Arc::clone(&transport_pool);
+        let backend_timeout = exec_ctx.backend_timeout;
+        let backend_endpoints = Arc::clone(&exec_ctx.backend_endpoints);
+        let _backend_resolutions = Arc::clone(&exec_ctx.backend_resolution_store);
+        let transport = Arc::clone(&exec_ctx.transport_pool);
         let allow_hedge = req.tunnel_mode == TunnelMode::None
             && req.bodyless_mode
             && resilience.hedging_allowed_for(&req.method, &route_name, true);
@@ -174,12 +173,10 @@ impl QUICListener {
                         if !cb.allow_request(&backend) {
                             return Err(ProxyError::Pool(PoolError::CircuitOpen(backend)));
                         }
-                        let send_result = tokio::time::timeout(
-                            backend_timeout,
-                            transport.send(&backend, req),
-                        )
-                        .await
-                        .map_err(|_| ProxyError::Timeout);
+                        let send_result =
+                            tokio::time::timeout(backend_timeout, transport.send(&backend, req))
+                                .await
+                                .map_err(|_| ProxyError::Timeout);
                         match &send_result {
                             Ok(Ok(_)) => cb.record_success(&backend),
                             _ => cb.record_failure(&backend),

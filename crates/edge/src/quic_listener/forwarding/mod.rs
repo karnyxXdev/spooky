@@ -70,6 +70,32 @@ pub(crate) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> Stre
     phase
 }
 
+struct ForwardingSharedCtx<'a> {
+    metrics: Arc<Metrics>,
+    resilience: &'a RuntimeResilience,
+    routing_index: &'a RouteIndex,
+    upstream_pools: &'a HashMap<String, Arc<RwLock<UpstreamPool>>>,
+}
+
+struct ForwardingExecutionCtx<'a> {
+    transport_pool: Arc<UpstreamTransportPool>,
+    backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+    backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
+    upstream_inflight: &'a HashMap<String, Arc<Semaphore>>,
+    global_inflight: Arc<Semaphore>,
+    backend_timeout: Duration,
+    inflight_acquire_wait: Duration,
+}
+
+struct StreamProgressConfig {
+    backend_body_idle_timeout: Duration,
+    backend_body_total_timeout: Duration,
+    max_response_body_bytes: usize,
+    unknown_length_response_prebuffer_bytes: usize,
+    client_body_idle_timeout: Duration,
+    listen_port: u16,
+}
+
 impl QUICListener {
     pub(super) fn classify_upstream_failure_reason(
         is_connect: bool,
@@ -246,22 +272,16 @@ impl QUICListener {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn materialize_forward_after_auth(
         stream_id: u64,
         req: &mut RequestEnvelope,
         h3: &mut quiche::h3::Connection,
         quic: &mut quiche::Connection,
-        transport_pool: Arc<UpstreamTransportPool>,
-        backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
-        backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
-        upstream_inflight: &HashMap<String, Arc<Semaphore>>,
-        global_inflight: Arc<Semaphore>,
-        backend_timeout: Duration,
-        resilience: &RuntimeResilience,
-        metrics: Arc<Metrics>,
-        inflight_acquire_wait: Duration,
+        exec_ctx: &ForwardingExecutionCtx<'_>,
+        shared_ctx: &ForwardingSharedCtx<'_>,
     ) -> Result<bool, quiche::h3::Error> {
+        let metrics = shared_ctx.metrics.as_ref();
+        let resilience = shared_ctx.resilience;
         let Some(pending_forward) = req.pending_forward.as_ref().cloned() else {
             metrics.inc_failure();
             Self::send_simple_response(
@@ -419,8 +439,8 @@ impl QUICListener {
         };
 
         let global_permit = match Self::try_acquire_owned_with_micro_wait(
-            Arc::clone(&global_inflight),
-            inflight_acquire_wait,
+            Arc::clone(&exec_ctx.global_inflight),
+            exec_ctx.inflight_acquire_wait,
         ) {
             Ok((permit, waited)) => {
                 if waited {
@@ -452,9 +472,12 @@ impl QUICListener {
             }
         };
 
-        let upstream_permit = match upstream_inflight.get(&upstream_name).cloned() {
+        let upstream_permit = match exec_ctx.upstream_inflight.get(&upstream_name).cloned() {
             Some(semaphore) => {
-                match Self::try_acquire_owned_with_micro_wait(semaphore, inflight_acquire_wait) {
+                match Self::try_acquire_owned_with_micro_wait(
+                    semaphore,
+                    exec_ctx.inflight_acquire_wait,
+                ) {
                     Ok((permit, waited)) => {
                         if waited {
                             metrics.inc_inflight_wait_admit_upstream();
@@ -549,7 +572,7 @@ impl QUICListener {
         }
 
         let backend_addr = pending_forward.backend_addr.to_string();
-        let Some(backend_endpoint) = backend_endpoints.get(&backend_addr).cloned() else {
+        let Some(backend_endpoint) = exec_ctx.backend_endpoints.get(&backend_addr).cloned() else {
             if let Ok(mut guard) = upstream_pool.write() {
                 guard.finish_request(backend_index, req.start.elapsed(), Some(503));
             }
@@ -624,12 +647,8 @@ impl QUICListener {
             backend_endpoint,
             request,
             websocket_tunnel_body_rx,
-            transport_pool,
-            backend_endpoints,
-            backend_resolution_store,
-            backend_timeout,
-            Arc::clone(&metrics),
-            resilience,
+            exec_ctx,
+            shared_ctx,
         ) {
             Ok(result_rx) => result_rx,
             Err(err) => {
@@ -762,6 +781,29 @@ impl QUICListener {
         let h3 = match connection.h3.as_mut() {
             Some(h3) => h3,
             None => return Ok(()),
+        };
+        let shared_ctx = ForwardingSharedCtx {
+            metrics: Arc::clone(&metrics),
+            resilience,
+            routing_index,
+            upstream_pools,
+        };
+        let exec_ctx = ForwardingExecutionCtx {
+            transport_pool: Arc::clone(&transport_pool),
+            backend_endpoints: Arc::clone(&backend_endpoints),
+            backend_resolution_store: Arc::clone(&backend_resolution_store),
+            upstream_inflight,
+            global_inflight: Arc::clone(&global_inflight),
+            backend_timeout,
+            inflight_acquire_wait,
+        };
+        let progress_config = StreamProgressConfig {
+            backend_body_idle_timeout,
+            backend_body_total_timeout,
+            max_response_body_bytes,
+            unknown_length_response_prebuffer_bytes,
+            client_body_idle_timeout,
+            listen_port,
         };
 
         loop {
@@ -997,15 +1039,8 @@ impl QUICListener {
                                 req,
                                 h3,
                                 &mut connection.quic,
-                                Arc::clone(&transport_pool),
-                                Arc::clone(&backend_endpoints),
-                                Arc::clone(&backend_resolution_store),
-                                upstream_inflight,
-                                Arc::clone(&global_inflight),
-                                backend_timeout,
-                                resilience,
-                                Arc::clone(&metrics),
-                                inflight_acquire_wait,
+                                &exec_ctx,
+                                &shared_ctx,
                             )?
                         } else {
                             false
@@ -1220,24 +1255,9 @@ impl QUICListener {
             &mut connection.streams,
             &mut connection.quic,
             h3,
-            Arc::clone(&transport_pool),
-            Arc::clone(&backend_endpoints),
-            Arc::clone(&backend_resolution_store),
-            upstream_pools,
-            upstream_inflight,
-            Arc::clone(&global_inflight),
-            backend_timeout,
-            routing_index,
-            backend_body_idle_timeout,
-            backend_body_total_timeout,
-            Arc::clone(&metrics),
-            backend_total_request_timeout,
-            resilience,
-            max_response_body_bytes,
-            unknown_length_response_prebuffer_bytes,
-            client_body_idle_timeout,
-            inflight_acquire_wait,
-            listen_port,
+            &exec_ctx,
+            &shared_ctx,
+            &progress_config,
         )?;
 
         Ok(())

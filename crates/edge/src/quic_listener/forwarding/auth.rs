@@ -655,23 +655,16 @@ pub(super) fn start_external_auth_task(
 }
 
 impl QUICListener {
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn complete_auth_result(
         stream_id: u64,
         req: &mut RequestEnvelope,
         result: ExternalAuthResult,
         h3: &mut quiche::h3::Connection,
         quic: &mut quiche::Connection,
-        transport_pool: Arc<UpstreamTransportPool>,
-        backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
-        backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
-        upstream_inflight: &HashMap<String, Arc<Semaphore>>,
-        global_inflight: Arc<Semaphore>,
-        backend_timeout: Duration,
-        resilience: &RuntimeResilience,
-        metrics: Arc<Metrics>,
-        inflight_acquire_wait: Duration,
+        exec_ctx: &ForwardingExecutionCtx<'_>,
+        shared_ctx: &ForwardingSharedCtx<'_>,
     ) -> Result<bool, quiche::h3::Error> {
+        let metrics = shared_ctx.metrics.as_ref();
         req.auth_result_rx = None;
         if let Some(abort) = req.auth_abort.take() {
             abort.abort();
@@ -687,21 +680,7 @@ impl QUICListener {
                         .auth_header_mutations
                         .extend(request_header_mutations);
                 }
-                Self::materialize_forward_after_auth(
-                    stream_id,
-                    req,
-                    h3,
-                    quic,
-                    transport_pool,
-                    backend_endpoints,
-                    backend_resolution_store,
-                    upstream_inflight,
-                    global_inflight,
-                    backend_timeout,
-                    resilience,
-                    metrics,
-                    inflight_acquire_wait,
-                )
+                Self::materialize_forward_after_auth(stream_id, req, h3, quic, exec_ctx, shared_ctx)
             }
             Ok(decision) => {
                 req.admission_state = StreamAdmissionState::Denied;
@@ -739,21 +718,7 @@ impl QUICListener {
                     req.upstream_name.as_deref().unwrap_or("unrouted"),
                     err
                 );
-                Self::materialize_forward_after_auth(
-                    stream_id,
-                    req,
-                    h3,
-                    quic,
-                    transport_pool,
-                    backend_endpoints,
-                    backend_resolution_store,
-                    upstream_inflight,
-                    global_inflight,
-                    backend_timeout,
-                    resilience,
-                    metrics,
-                    inflight_acquire_wait,
-                )
+                Self::materialize_forward_after_auth(stream_id, req, h3, quic, exec_ctx, shared_ctx)
             }
             Err(err) => {
                 metrics.inc_failure();

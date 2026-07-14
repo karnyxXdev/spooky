@@ -20,30 +20,16 @@ impl QUICListener {
     ///    - `End`      -> `h3.send_body(..., true)`, mark Completed
     ///    - `Error`    -> send 502, mark Failed
     /// 5. Remove streams in terminal phase (Completed / Failed).
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn advance_streams_non_blocking(
         streams: &mut HashMap<u64, RequestEnvelope>,
         quic: &mut quiche::Connection,
         h3: &mut quiche::h3::Connection,
-        transport_pool: Arc<UpstreamTransportPool>,
-        backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
-        backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
-        upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
-        upstream_inflight: &HashMap<String, Arc<Semaphore>>,
-        global_inflight: Arc<Semaphore>,
-        backend_timeout: Duration,
-        routing_index: &RouteIndex,
-        backend_body_idle_timeout: Duration,
-        backend_body_total_timeout: Duration,
-        metrics: Arc<Metrics>,
-        _backend_total_request_timeout: Duration,
-        resilience: &RuntimeResilience,
-        max_response_body_bytes: usize,
-        unknown_length_response_prebuffer_bytes: usize,
-        client_body_idle_timeout: Duration,
-        inflight_acquire_wait: Duration,
-        listen_port: u16,
+        exec_ctx: &ForwardingExecutionCtx<'_>,
+        shared_ctx: &ForwardingSharedCtx<'_>,
+        progress_config: &StreamProgressConfig,
     ) -> Result<(), quiche::h3::Error> {
+        let metrics = shared_ctx.metrics.as_ref();
+        let resilience = shared_ctx.resilience;
         let stream_ids: Vec<u64> = streams.keys().copied().collect();
 
         for stream_id in stream_ids {
@@ -56,10 +42,7 @@ impl QUICListener {
                     stream_id,
                     req,
                     Err(ProxyError::Timeout),
-                    upstream_pools,
-                    routing_index,
-                    &metrics,
-                    resilience.shed_retry_after_seconds,
+                    shared_ctx,
                 ) {
                     error!(
                         "failed to emit timeout response for stream {}: {:?}",
@@ -81,7 +64,7 @@ impl QUICListener {
                 && !req.request_fin_received
                 && !req.bodyless_mode
                 && Instant::now().saturating_duration_since(req.last_body_activity)
-                    >= client_body_idle_timeout
+                    >= progress_config.client_body_idle_timeout
             {
                 metrics.inc_failure();
                 metrics.inc_timeout();
@@ -145,15 +128,8 @@ impl QUICListener {
                         auth_result,
                         h3,
                         quic,
-                        Arc::clone(&transport_pool),
-                        Arc::clone(&backend_endpoints),
-                        Arc::clone(&backend_resolution_store),
-                        upstream_inflight,
-                        Arc::clone(&global_inflight),
-                        backend_timeout,
-                        resilience,
-                        Arc::clone(&metrics),
-                        inflight_acquire_wait,
+                        exec_ctx,
+                        shared_ctx,
                     )?
                 } else {
                     false
@@ -255,7 +231,7 @@ impl QUICListener {
                         if !tunnel_response
                             && !suppress_downstream_body
                             && upstream_content_length
-                                .is_some_and(|len| len > max_response_body_bytes)
+                                .is_some_and(|len| len > progress_config.max_response_body_bytes)
                         {
                             if let Some(req) = streams.get(&stream_id) {
                                 metrics.inc_failure();
@@ -276,7 +252,7 @@ impl QUICListener {
                                     "request_id={} upstream declared content-length over cap ({} > {}) on stream {}",
                                     req.request_id,
                                     upstream_content_length.unwrap_or_default(),
-                                    max_response_body_bytes,
+                                    progress_config.max_response_body_bytes,
                                     stream_id
                                 );
                                 let _ = Self::send_simple_response(
@@ -307,7 +283,8 @@ impl QUICListener {
                         }
                         owned_h3_headers.push((
                             b"alt-svc".to_vec(),
-                            format!("h3=\":{}\"; ma=86400", listen_port).into_bytes(),
+                            format!("h3=\":{}\"; ma=86400", progress_config.listen_port)
+                                .into_bytes(),
                         ));
 
                         let defer_headers_until_body_validated = upstream_content_length.is_none()
@@ -343,10 +320,7 @@ impl QUICListener {
                                         stream_id,
                                         req,
                                         Err(protocol),
-                                        upstream_pools,
-                                        routing_index,
-                                        &metrics,
-                                        resilience.shed_retry_after_seconds,
+                                        shared_ctx,
                                     ) {
                                         error!(
                                             "failed to emit protocol recovery response on stream {}: {:?}",
@@ -389,10 +363,7 @@ impl QUICListener {
                                             stream_id,
                                             req,
                                             Err(protocol),
-                                            upstream_pools,
-                                            routing_index,
-                                            &metrics,
-                                            resilience.shed_retry_after_seconds,
+                                            shared_ctx,
                                         ) {
                                             error!(
                                                 "failed to emit protocol recovery response on stream {}: {:?}",
@@ -429,8 +400,13 @@ impl QUICListener {
                                 let (chunk_tx, chunk_rx) =
                                     mpsc::channel::<ResponseChunk>(RESPONSE_CHUNK_CHANNEL_CAPACITY);
                                 let fail_tx = chunk_tx.clone();
-                                let first_byte_deadline =
-                                    tokio::time::Instant::now() + backend_body_total_timeout;
+                                let body_idle_timeout = progress_config.backend_body_idle_timeout;
+                                let max_response_body_bytes =
+                                    progress_config.max_response_body_bytes;
+                                let unknown_length_response_prebuffer_bytes =
+                                    progress_config.unknown_length_response_prebuffer_bytes;
+                                let first_byte_deadline = tokio::time::Instant::now()
+                                    + progress_config.backend_body_total_timeout;
                                 let deferred_status = status;
                                 let deferred_headers = owned_h3_headers.clone();
                                 let tunnel_mode = tunnel_response;
@@ -460,11 +436,11 @@ impl QUICListener {
                                             return;
                                         }
                                         let wait_timeout = if saw_body_progress {
-                                            backend_body_idle_timeout
+                                            body_idle_timeout
                                         } else {
                                             first_byte_deadline
                                                 .saturating_duration_since(now)
-                                                .min(backend_body_idle_timeout)
+                                                .min(body_idle_timeout)
                                         };
                                         let result =
                                             tokio::time::timeout(wait_timeout, frame_fut).await;
@@ -694,10 +670,7 @@ impl QUICListener {
                                 stream_id,
                                 req,
                                 Err(err),
-                                upstream_pools,
-                                routing_index,
-                                &metrics,
-                                resilience.shed_retry_after_seconds,
+                                shared_ctx,
                             ) {
                                 error!(
                                     "failed to emit recoverable forward error response on stream {}: {:?}",
@@ -718,16 +691,7 @@ impl QUICListener {
             }
 
             let terminal = if let Some(req) = streams.get_mut(&stream_id) {
-                Self::flush_response_chunks(
-                    stream_id,
-                    req,
-                    quic,
-                    h3,
-                    upstream_pools,
-                    routing_index,
-                    &metrics,
-                    resilience,
-                )
+                Self::flush_response_chunks(stream_id, req, quic, h3, shared_ctx)
             } else {
                 false
             };

@@ -14,6 +14,7 @@ use spooky_config::runtime::{RuntimeJwtAuth, RuntimeUpstreamPolicy};
 use subtle::ConstantTimeEq;
 
 use super::LbHeaderLookup;
+use crate::resilience::scoped_rate_limit::{ScopedRateLimitRule, ScopedRateLimiters};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthChallengeKind {
@@ -39,6 +40,8 @@ pub(crate) struct UnauthorizedDecision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RateLimitedDecision {
+    pub(crate) rule_name: String,
+    pub(crate) route: String,
     pub(crate) status: StatusCode,
     pub(crate) body: &'static [u8],
     pub(crate) retry_after_seconds: u32,
@@ -91,6 +94,27 @@ pub(crate) fn evaluate_local_auth_policy(
     }
 
     AdmissionPolicyDecision::AdmitReady
+}
+
+pub(crate) fn evaluate_scoped_rate_limit_policy<F>(
+    scoped_rate_limits: &ScopedRateLimiters,
+    route: &str,
+    key_for_rule: F,
+) -> AdmissionPolicyDecision
+where
+    F: FnMut(&ScopedRateLimitRule) -> Option<String>,
+{
+    let Some(rejection) = scoped_rate_limits.check(route, key_for_rule) else {
+        return AdmissionPolicyDecision::AdmitReady;
+    };
+
+    AdmissionPolicyDecision::RateLimited(RateLimitedDecision {
+        rule_name: rejection.rule_name,
+        route: rejection.route,
+        status: StatusCode::TOO_MANY_REQUESTS,
+        body: b"request rate limited\n",
+        retry_after_seconds: rejection.retry_after_seconds,
+    })
 }
 
 pub(crate) fn api_key_is_authorized(

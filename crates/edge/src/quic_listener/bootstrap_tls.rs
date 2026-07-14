@@ -36,7 +36,9 @@ use spooky_transport::transport_pool::UpstreamTransportPool;
 
 use super::{
     BootstrapServiceFuture, BootstrapStreamingBody, QUICListener,
-    admission::{AdmissionPolicyDecision, evaluate_local_auth_policy},
+    admission::{
+        AdmissionPolicyDecision, evaluate_local_auth_policy, evaluate_scoped_rate_limit_policy,
+    },
     bootstrap_resolution_error_response, boxed_full, connection_header_tokens, is_head_method,
     is_websocket_upgrade_request,
     runtime_endpoint::RuntimeConnectionSlotGuard,
@@ -450,18 +452,22 @@ impl QUICListener {
                                     }
                                 }
 
-                                if let Some(rejection) =
-                                    resilience.scoped_rate_limits.check(&upstream_name, |rule| {
-                                        Self::resolve_scoped_rate_limit_key(
-                                            rule,
-                                            &upstream_name,
-                                            &method,
-                                            &path,
-                                            authority.as_deref(),
-                                            peer,
-                                            Some(&lb_header_lookup),
-                                        )
-                                    })
+                                if let AdmissionPolicyDecision::RateLimited(decision) =
+                                    evaluate_scoped_rate_limit_policy(
+                                        &resilience.scoped_rate_limits,
+                                        &upstream_name,
+                                        |rule| {
+                                            Self::resolve_scoped_rate_limit_key(
+                                                rule,
+                                                &upstream_name,
+                                                &method,
+                                                &path,
+                                                authority.as_deref(),
+                                                peer,
+                                                Some(&lb_header_lookup),
+                                            )
+                                        },
+                                    )
                                 {
                                     metrics.inc_failure();
                                     metrics.inc_request_rate_limited();
@@ -472,18 +478,16 @@ impl QUICListener {
                                     );
                                     warn!(
                                         "Bootstrap request route={} scoped rate limit exceeded by rule={}",
-                                        rejection.route, rejection.rule_name
+                                        decision.route, decision.rule_name
                                     );
                                     return Ok(Response::builder()
-                                        .status(StatusCode::TOO_MANY_REQUESTS)
+                                        .status(decision.status)
                                         .header("alt-svc", &alt)
                                         .header(
                                             "retry-after",
-                                            rejection.retry_after_seconds.max(1).to_string(),
+                                            decision.retry_after_seconds.max(1).to_string(),
                                         )
-                                        .body(boxed_full(Bytes::from_static(
-                                            b"request rate limited\n",
-                                        )))
+                                        .body(boxed_full(Bytes::from_static(decision.body)))
                                         .unwrap_or_else(|_| {
                                             Response::new(boxed_full(Bytes::from_static(
                                                 b"error\n",

@@ -325,17 +325,23 @@ impl QUICListener {
             return Ok(false);
         }
 
-        if let Some(rejection) = resilience.scoped_rate_limits.check(&upstream_name, |rule| {
-            Self::resolve_scoped_rate_limit_key(
-                rule,
+        if let crate::quic_listener::admission::AdmissionPolicyDecision::RateLimited(decision) =
+            crate::quic_listener::admission::evaluate_scoped_rate_limit_policy(
+                &resilience.scoped_rate_limits,
                 &upstream_name,
-                &req.method,
-                &req.path,
-                req.authority.as_deref(),
-                pending_forward.client_addr,
-                Some(&header_lookup),
+                |rule| {
+                    Self::resolve_scoped_rate_limit_key(
+                        rule,
+                        &upstream_name,
+                        &req.method,
+                        &req.path,
+                        req.authority.as_deref(),
+                        pending_forward.client_addr,
+                        Some(&header_lookup),
+                    )
+                },
             )
-        }) {
+        {
             metrics.inc_failure();
             metrics.inc_request_rate_limited();
             metrics.record_route(
@@ -345,14 +351,14 @@ impl QUICListener {
             );
             warn!(
                 "request_id={} route={} scoped rate limit exceeded by rule={}",
-                req.request_id, rejection.route, rejection.rule_name
+                req.request_id, decision.route, decision.rule_name
             );
             Self::send_rate_limited_response(
                 h3,
                 quic,
                 stream_id,
-                b"request rate limited\n",
-                rejection.retry_after_seconds,
+                decision.body,
+                decision.retry_after_seconds,
             )?;
             return Ok(false);
         }

@@ -6,7 +6,7 @@ mod resolve;
 mod response;
 mod stream_progress;
 
-use self::prepare::{PreAuthRequest, PreparedRequest, StartedAuthRequest};
+use self::prepare::{PreparedRequest, StartedAuthRequest};
 
 use std::{
     convert::Infallible,
@@ -61,34 +61,34 @@ pub(super) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> Stre
 }
 
 // Shared forwarding dependencies passed through extracted submodules.
-struct ForwardingSharedCtx<'a> {
-    metrics: Arc<Metrics>,
-    resilience: &'a RuntimeResilience,
-    routing_index: &'a RouteIndex,
-    upstream_pools: &'a HashMap<String, Arc<RwLock<UpstreamPool>>>,
+pub(crate) struct ForwardingSharedCtx<'a> {
+    pub(crate) metrics: Arc<Metrics>,
+    pub(crate) resilience: &'a RuntimeResilience,
+    pub(crate) routing_index: &'a RouteIndex,
+    pub(crate) upstream_pools: &'a HashMap<String, Arc<RwLock<UpstreamPool>>>,
 }
 
-struct ForwardingExecutionCtx<'a> {
-    transport_pool: Arc<UpstreamTransportPool>,
-    backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
-    backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
-    upstream_inflight: &'a HashMap<String, Arc<Semaphore>>,
-    global_inflight: Arc<Semaphore>,
-    backend_timeout: Duration,
-    inflight_acquire_wait: Duration,
+pub(crate) struct ForwardingExecutionCtx<'a> {
+    pub(crate) transport_pool: Arc<UpstreamTransportPool>,
+    pub(crate) backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+    pub(crate) backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
+    pub(crate) upstream_inflight: &'a HashMap<String, Arc<Semaphore>>,
+    pub(crate) global_inflight: Arc<Semaphore>,
+    pub(crate) backend_timeout: Duration,
+    pub(crate) inflight_acquire_wait: Duration,
 }
 
-struct StreamProgressConfig {
-    backend_body_idle_timeout: Duration,
-    backend_body_total_timeout: Duration,
-    max_response_body_bytes: usize,
-    unknown_length_response_prebuffer_bytes: usize,
-    client_body_idle_timeout: Duration,
-    listen_port: u16,
+pub(crate) struct StreamProgressConfig {
+    pub(crate) backend_body_idle_timeout: Duration,
+    pub(crate) backend_body_total_timeout: Duration,
+    pub(crate) max_response_body_bytes: usize,
+    pub(crate) unknown_length_response_prebuffer_bytes: usize,
+    pub(crate) client_body_idle_timeout: Duration,
+    pub(crate) listen_port: u16,
 }
 
 impl QUICListener {
-    fn classify_upstream_failure_reason(
+    pub fn classify_upstream_failure_reason(
         is_connect: bool,
         detail: &str,
     ) -> (HealthFailureReason, &'static str) {
@@ -131,14 +131,14 @@ impl QUICListener {
         (HealthFailureReason::Transport, "transport")
     }
 
-    fn send_error_health_failure_reason(
+    pub(crate) fn send_error_health_failure_reason(
         err: &hyper_util::client::legacy::Error,
     ) -> (HealthFailureReason, &'static str) {
         let detail = Self::format_error_chain(err);
         Self::classify_upstream_failure_reason(err.is_connect(), &detail)
     }
 
-    fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
+    pub(crate) fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
         let mut detail = err.to_string();
         let mut source = err.source();
         while let Some(cause) = source {
@@ -718,7 +718,7 @@ impl QUICListener {
         }
     }
 
-    fn log_health_transition(addr: &str, transition: HealthTransition) {
+    pub(crate) fn log_health_transition(addr: &str, transition: HealthTransition) {
         match transition {
             HealthTransition::BecameHealthy => {
                 info!("Backend {} became healthy", addr);
@@ -1254,7 +1254,7 @@ impl QUICListener {
         Ok(())
     }
 
-    fn api_key_is_authorized(
+    pub(crate) fn api_key_is_authorized(
         policy: &RuntimeUpstreamPolicy,
         header_lookup: Option<&LbHeaderLookup<'_>>,
     ) -> bool {
@@ -1273,7 +1273,7 @@ impl QUICListener {
                 .any(|expected| bool::from(provided.as_bytes().ct_eq(expected.as_bytes())))
     }
 
-    fn jwt_is_authorized(
+    pub(crate) fn jwt_is_authorized(
         policy: &RuntimeUpstreamPolicy,
         header_lookup: Option<&LbHeaderLookup<'_>>,
     ) -> bool {
@@ -1426,7 +1426,7 @@ impl QUICListener {
         values
     }
 
-    fn resolve_scoped_rate_limit_key(
+    pub(crate) fn resolve_scoped_rate_limit_key(
         rule: &crate::resilience::scoped_rate_limit::ScopedRateLimitRule,
         route: &str,
         method: &str,

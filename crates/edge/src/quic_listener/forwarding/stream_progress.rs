@@ -21,7 +21,7 @@ impl QUICListener {
     ///    - `End`      -> `h3.send_body(..., true)`, mark Completed
     ///    - `Error`    -> send 502, mark Failed
     /// 5. Remove streams in terminal phase (Completed / Failed).
-    pub(super) fn advance_streams_non_blocking(
+    pub(crate) fn advance_streams_non_blocking(
         streams: &mut HashMap<u64, RequestEnvelope>,
         quic: &mut quiche::Connection,
         h3: &mut quiche::h3::Connection,

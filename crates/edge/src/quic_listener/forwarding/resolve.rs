@@ -1,14 +1,14 @@
 use super::*;
 
-pub(super) struct ResolvedBackend {
-    pub(super) upstream_name: String,
-    pub(super) backend_addr: String,
-    pub(super) backend_index: usize,
-    pub(super) upstream_pool: Arc<RwLock<UpstreamPool>>,
-    pub(super) backend_lb: String,
-    pub(super) route_path_len: usize,
-    pub(super) route_host_specific: bool,
-    pub(super) route_reason: RouteDecisionReason,
+pub(crate) struct ResolvedBackend {
+    pub(crate) upstream_name: String,
+    pub(crate) backend_addr: String,
+    pub(crate) backend_index: usize,
+    pub(crate) upstream_pool: Arc<RwLock<UpstreamPool>>,
+    pub(crate) backend_lb: String,
+    pub(crate) route_path_len: usize,
+    pub(crate) route_host_specific: bool,
+    pub(crate) route_reason: RouteDecisionReason,
 }
 
 impl QUICListener {
@@ -191,7 +191,7 @@ impl QUICListener {
     }
 
     /// Resolve routing + LB for a request, returning `(backend_addr, backend_index, pool)`.
-    pub(super) fn resolve_backend(
+    pub(crate) fn resolve_backend(
         method: &str,
         path: &str,
         authority: Option<&str>,

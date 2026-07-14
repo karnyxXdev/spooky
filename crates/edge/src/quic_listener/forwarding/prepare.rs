@@ -1,16 +1,9 @@
 use std::convert::Infallible;
 
-use tokio::task::AbortHandle;
 use tracing::Span;
 
+use super::auth::{AuthStart, auth_failure_mode, fail_open, start_external_auth_task};
 use super::*;
-
-pub(super) struct AuthStart {
-    pub(super) rx: oneshot::Receiver<ExternalAuthResult>,
-    pub(super) abort: AbortHandle,
-    pub(super) deadline: Instant,
-    pub(super) fail_open: bool,
-}
 
 pub(super) struct PreparedRequest {
     pub(super) upstream_name: String,
@@ -44,7 +37,7 @@ pub(super) struct StartedAuthRequest {
 }
 
 impl PendingForward {
-    fn request_headers(&self) -> Vec<quiche::h3::Header> {
+    pub(super) fn request_headers(&self) -> Vec<quiche::h3::Header> {
         let mut headers = self.headers.as_ref().clone();
         for mutation in &self.auth_header_mutations {
             match mutation {
@@ -69,7 +62,7 @@ impl PendingForward {
         }
     }
 
-    fn build_request(
+    pub(super) fn build_request(
         &self,
         endpoint: &BackendEndpoint,
         body: BoxBody<Bytes, Infallible>,

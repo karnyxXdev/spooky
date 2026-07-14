@@ -3,6 +3,7 @@ use std::convert::Infallible;
 use tracing::Span;
 
 use super::auth::{AuthStart, auth_failure_mode, fail_open, start_external_auth_task};
+use super::resolve::ResolvedBackend;
 use super::*;
 
 pub(super) struct PreparedRequest {

@@ -446,17 +446,6 @@ fn boxed_full(body: Bytes) -> http_body_util::combinators::BoxBody<Bytes, Infall
     Full::new(body).map_err(|never| match never {}).boxed()
 }
 
-struct ResolvedBackend {
-    upstream_name: String,
-    backend_addr: String,
-    backend_index: usize,
-    upstream_pool: Arc<RwLock<UpstreamPool>>,
-    backend_lb: String,
-    route_path_len: usize,
-    route_host_specific: bool,
-    route_reason: RouteDecisionReason,
-}
-
 impl QUICListener {
     pub fn new(config: spooky_config::config::Config) -> Result<Self, ProxyError> {
         let runtime_config = RuntimeConfig::from_config(&config)

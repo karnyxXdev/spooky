@@ -312,39 +312,6 @@ fn is_websocket_upgrade_request(req: &Request<Incoming>, use_h2: bool) -> bool {
         .unwrap_or(false)
 }
 
-fn extract_cookie_value(cookie_header: &str, cookie_name: &str) -> Option<String> {
-    for pair in cookie_header.split(';') {
-        let part = pair.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let (name, value) = part.split_once('=')?;
-        if name.trim().eq_ignore_ascii_case(cookie_name) {
-            let value = value.trim();
-            if value.is_empty() {
-                return None;
-            }
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
-fn extract_query_param(path: &str, param: &str) -> Option<String> {
-    let (_, query) = path.split_once('?')?;
-    for pair in query.split('&') {
-        let entry = pair.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let (name, value) = entry.split_once('=')?;
-        if name.eq_ignore_ascii_case(param) && !value.is_empty() {
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
 fn bootstrap_resolution_error_response(reason: &str) -> (StatusCode, &'static [u8]) {
     if reason.starts_with("no route for ") {
         return (StatusCode::BAD_GATEWAY, b"no route\n");

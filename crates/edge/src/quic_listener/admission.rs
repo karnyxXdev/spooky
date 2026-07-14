@@ -104,6 +104,33 @@ pub(crate) enum AdmissionPolicyDecision {
     Overloaded(OverloadDecision),
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_forwarding_pre_admission_policy<F>(
+    policy: &RuntimeUpstreamPolicy,
+    header_lookup: Option<&LbHeaderLookup<'_>>,
+    brownout: &BrownoutController,
+    inflight_percent: u8,
+    route: &str,
+    retry_after_seconds: u32,
+    scoped_rate_limits: &ScopedRateLimiters,
+    key_for_rule: F,
+) -> AdmissionPolicyDecision
+where
+    F: FnMut(&ScopedRateLimitRule) -> Option<String>,
+{
+    let auth = evaluate_local_auth_policy(policy, header_lookup);
+    if auth != AdmissionPolicyDecision::AdmitReady {
+        return auth;
+    }
+
+    let brownout = evaluate_brownout_policy(brownout, inflight_percent, route, retry_after_seconds);
+    if brownout != AdmissionPolicyDecision::AdmitReady {
+        return brownout;
+    }
+
+    evaluate_scoped_rate_limit_policy(scoped_rate_limits, route, key_for_rule)
+}
+
 pub(crate) fn evaluate_local_auth_policy(
     policy: &RuntimeUpstreamPolicy,
     header_lookup: Option<&LbHeaderLookup<'_>>,

@@ -7,7 +7,7 @@ use super::auth::{AuthStart, auth_failure_mode, fail_open, start_external_auth_t
 use super::resolve::ResolvedBackend;
 use super::*;
 use crate::{
-    quic_listener::admission::{AdmissionPolicyDecision, evaluate_local_auth_policy},
+    quic_listener::admission::{AdmissionPolicyDecision, evaluate_forwarding_pre_admission_policy},
     runtime::connection::{auth::PendingHeaderMutation, request::PendingForward},
 };
 
@@ -204,7 +204,28 @@ impl QUICListener {
                     .get(&upstream_name)
                     .cloned()
                     .unwrap_or_default();
-                match evaluate_local_auth_policy(&upstream_policy, Some(&lb_header_lookup)) {
+                let admission = evaluate_forwarding_pre_admission_policy(
+                    &upstream_policy,
+                    Some(&lb_header_lookup),
+                    &resilience.brownout,
+                    resilience.adaptive_admission.inflight_percent(),
+                    &upstream_name,
+                    resilience.shed_retry_after_seconds,
+                    &resilience.scoped_rate_limits,
+                    |rule| {
+                        Self::resolve_scoped_rate_limit_key(
+                            rule,
+                            &upstream_name,
+                            method,
+                            path,
+                            authority,
+                            peer_address,
+                            Some(&lb_header_lookup),
+                        )
+                    },
+                );
+                metrics.set_brownout_active(resilience.brownout.is_active());
+                match admission {
                     AdmissionPolicyDecision::AdmitReady => {}
                     AdmissionPolicyDecision::Unauthorized(decision) => {
                         metrics.inc_failure();
@@ -227,7 +248,47 @@ impl QUICListener {
                         )?;
                         return Ok(None);
                     }
-                    _ => unreachable!("local auth evaluator only returns admit or unauthorized"),
+                    AdmissionPolicyDecision::RateLimited(decision) => {
+                        metrics.inc_failure();
+                        metrics.inc_request_rate_limited();
+                        metrics.record_route(
+                            &upstream_name,
+                            request_start.elapsed(),
+                            RouteOutcome::RateLimited,
+                        );
+                        warn!(
+                            "request_id=unassigned route={} scoped rate limit exceeded by rule={}",
+                            decision.route, decision.rule_name
+                        );
+                        Self::send_rate_limited_response(
+                            h3,
+                            quic,
+                            stream_id,
+                            decision.body,
+                            decision.retry_after_seconds,
+                        )?;
+                        return Ok(None);
+                    }
+                    AdmissionPolicyDecision::Overloaded(decision) => {
+                        metrics.inc_failure();
+                        metrics.inc_overload_shed_reason(decision.reason.metrics_reason());
+                        metrics.record_route(
+                            &upstream_name,
+                            request_start.elapsed(),
+                            RouteOutcome::OverloadShed,
+                        );
+                        Self::send_overload_response(
+                            h3,
+                            quic,
+                            stream_id,
+                            decision.body,
+                            decision.retry_after_seconds,
+                        )?;
+                        resilience
+                            .adaptive_admission
+                            .observe(request_start.elapsed(), true);
+                        return Ok(None);
+                    }
                 }
 
                 let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);

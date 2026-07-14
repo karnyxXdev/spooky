@@ -62,11 +62,7 @@ use spooky_transport::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     runtime::Handle,
-    sync::{
-        Semaphore, mpsc,
-        mpsc::error::{TryRecvError, TrySendError},
-        oneshot,
-    },
+    sync::{Semaphore, mpsc, mpsc::error::TrySendError, oneshot},
 };
 #[cfg(test)]
 use tokio_rustls::TlsAcceptor;
@@ -123,7 +119,7 @@ mod validation;
 use bootstrap_tls::BootstrapStartupState;
 use connection::resolve_primary_from_radix_prefix;
 pub(crate) use connection::{ConnectionRoutes, purge_connection_routes, sweep_closed_connections};
-use forwarding::abort_stream;
+use forwarding::{ForwardingExecutionCtx, ForwardingSharedCtx, StreamProgressConfig, abort_stream};
 #[cfg(test)]
 use health_check::classify_active_health_check_response;
 pub(crate) use token_bucket::TokenBucket;
@@ -312,39 +308,6 @@ fn is_websocket_upgrade_request(req: &Request<Incoming>, use_h2: bool) -> bool {
         .unwrap_or(false)
 }
 
-fn extract_cookie_value(cookie_header: &str, cookie_name: &str) -> Option<String> {
-    for pair in cookie_header.split(';') {
-        let part = pair.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let (name, value) = part.split_once('=')?;
-        if name.trim().eq_ignore_ascii_case(cookie_name) {
-            let value = value.trim();
-            if value.is_empty() {
-                return None;
-            }
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
-fn extract_query_param(path: &str, param: &str) -> Option<String> {
-    let (_, query) = path.split_once('?')?;
-    for pair in query.split('&') {
-        let entry = pair.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let (name, value) = entry.split_once('=')?;
-        if name.eq_ignore_ascii_case(param) && !value.is_empty() {
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
 fn bootstrap_resolution_error_response(reason: &str) -> (StatusCode, &'static [u8]) {
     if reason.starts_with("no route for ") {
         return (StatusCode::BAD_GATEWAY, b"no route\n");
@@ -444,17 +407,6 @@ impl Body for BootstrapStreamingBody {
 
 fn boxed_full(body: Bytes) -> http_body_util::combinators::BoxBody<Bytes, Infallible> {
     Full::new(body).map_err(|never| match never {}).boxed()
-}
-
-struct ResolvedBackend {
-    upstream_name: String,
-    backend_addr: String,
-    backend_index: usize,
-    upstream_pool: Arc<RwLock<UpstreamPool>>,
-    backend_lb: String,
-    route_path_len: usize,
-    route_host_specific: bool,
-    route_reason: RouteDecisionReason,
 }
 
 impl QUICListener {
@@ -1785,28 +1737,37 @@ impl QUICListener {
 
             // Advance in-flight streams independent of inbound packets.
             if let Some(mut h3) = connection.h3.take() {
+                let shared_ctx = ForwardingSharedCtx {
+                    metrics: Arc::clone(&self.metrics),
+                    resilience: &self.resilience,
+                    routing_index: &self.routing_index,
+                    upstream_pools: &self.upstream_pools,
+                };
+                let exec_ctx = ForwardingExecutionCtx {
+                    transport_pool: Arc::clone(&self.transport_pool),
+                    backend_endpoints: Arc::clone(&self.backend_endpoints),
+                    backend_resolution_store: Arc::clone(&self.backend_resolution_store),
+                    upstream_inflight: &self.upstream_inflight,
+                    global_inflight: Arc::clone(&self.global_inflight),
+                    backend_timeout: self.backend_timeout,
+                    inflight_acquire_wait: self.inflight_acquire_wait,
+                };
+                let progress_config = StreamProgressConfig {
+                    backend_body_idle_timeout: self.backend_body_idle_timeout,
+                    backend_body_total_timeout: self.backend_body_total_timeout,
+                    max_response_body_bytes: self.max_response_body_bytes,
+                    unknown_length_response_prebuffer_bytes: self
+                        .unknown_length_response_prebuffer_bytes,
+                    client_body_idle_timeout: self.client_body_idle_timeout,
+                    listen_port: self.config.listen.listen.port,
+                };
                 if let Err(e) = Self::advance_streams_non_blocking(
                     &mut connection.streams,
                     &mut connection.quic,
                     &mut h3,
-                    Arc::clone(&self.transport_pool),
-                    Arc::clone(&self.backend_endpoints),
-                    Arc::clone(&self.backend_resolution_store),
-                    &self.upstream_pools,
-                    &self.upstream_inflight,
-                    Arc::clone(&self.global_inflight),
-                    self.backend_timeout,
-                    &self.routing_index,
-                    self.backend_body_idle_timeout,
-                    self.backend_body_total_timeout,
-                    Arc::clone(&self.metrics),
-                    self.backend_total_request_timeout,
-                    &self.resilience,
-                    self.max_response_body_bytes,
-                    self.unknown_length_response_prebuffer_bytes,
-                    self.client_body_idle_timeout,
-                    self.inflight_acquire_wait,
-                    self.config.listen.listen.port,
+                    &exec_ctx,
+                    &shared_ctx,
+                    &progress_config,
                 ) {
                     error!("advance_streams_non_blocking in timeout path: {:?}", e);
                 }

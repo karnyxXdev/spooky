@@ -47,6 +47,18 @@ pub(crate) struct ResolvedBackend {
     pub(crate) backend: SelectedBackend,
 }
 
+pub(super) struct ForwardingResolvedTarget {
+    pub(super) upstream_name: String,
+    pub(super) upstream_pool: Arc<RwLock<UpstreamPool>>,
+    pub(super) upstream_policy: RuntimeUpstreamPolicy,
+    pub(super) route_path_len: usize,
+    pub(super) route_host_specific: bool,
+    pub(super) route_reason: String,
+    pub(super) backend_addr: String,
+    pub(super) backend_index: usize,
+    pub(super) backend_lb: String,
+}
+
 struct BackendSelectionPlan {
     lb_type: String,
     lb_key: String,
@@ -144,6 +156,77 @@ impl QUICListener {
                 b"route/backend resolution failed\n",
             ),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn resolve_forwarding_target(
+        method: &str,
+        path: &str,
+        authority: Option<&str>,
+        tunnel_mode: TunnelMode,
+        sticky_cid_key: &str,
+        header_lookup: Option<&LbHeaderLookup<'_>>,
+        routing_index: &RouteIndex,
+        upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        upstream_policies: &HashMap<String, RuntimeUpstreamPolicy>,
+        metrics: &Metrics,
+        elapsed: Duration,
+    ) -> Result<ForwardingResolvedTarget, ProxyError> {
+        let route_method = if matches!(tunnel_mode, TunnelMode::Websocket) {
+            "GET"
+        } else {
+            method
+        };
+        let resolution_request = RouteResolutionRequest::new(
+            route_method,
+            path,
+            authority,
+            Some(sticky_cid_key),
+            header_lookup,
+        );
+        let ResolvedBackend { route, backend } =
+            match Self::resolve_backend_without_inflight_request(
+                &resolution_request,
+                upstream_pools,
+                upstream_policies,
+                routing_index,
+            ) {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    Self::observe_route_resolution_failure(
+                        &resolution_request,
+                        &err,
+                        metrics,
+                        elapsed,
+                    );
+                    return Err(err);
+                }
+            };
+        let ResolvedRoute {
+            upstream_name,
+            upstream_pool,
+            upstream_policy,
+            route_path_len,
+            route_host_specific,
+            route_reason,
+        } = route;
+        let SelectedBackend {
+            backend_addr,
+            backend_index,
+            backend_lb,
+        } = backend;
+
+        Ok(ForwardingResolvedTarget {
+            upstream_name,
+            upstream_pool,
+            upstream_policy,
+            route_path_len,
+            route_host_specific,
+            route_reason: format!("{route_reason:?}"),
+            backend_addr,
+            backend_index,
+            backend_lb,
+        })
     }
 
     #[allow(clippy::type_complexity)]

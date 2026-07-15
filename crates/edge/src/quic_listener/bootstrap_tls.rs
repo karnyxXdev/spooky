@@ -389,7 +389,7 @@ impl QUICListener {
                                         .and_then(|value| value.to_str().ok())
                                         .map(str::to_string)
                                 };
-                                let (backend_addr, upstream_name) = match {
+                                let (backend_addr, upstream_name, upstream_policy) = match {
                                     let resolution_request =
                                         super::forwarding::SharedRouteResolutionRequest::new(
                                             &method,
@@ -401,12 +401,15 @@ impl QUICListener {
                                     Self::resolve_backend_request(
                                         &resolution_request,
                                         &upstream_pools,
+                                        &upstream_policies,
                                         &routing_index,
                                     )
                                 } {
-                                    Ok(value) => {
-                                        (value.backend.backend_addr, value.route.upstream_name)
-                                    }
+                                    Ok(value) => (
+                                        value.backend.backend_addr,
+                                        value.route.upstream_name,
+                                        value.route.upstream_policy,
+                                    ),
                                     Err(ProxyError::Transport(reason)) => {
                                         let (status, body) =
                                             bootstrap_resolution_error_response(&reason);
@@ -429,10 +432,6 @@ impl QUICListener {
                                     }
                                 };
 
-                                let upstream_policy = upstream_policies
-                                    .get(&upstream_name)
-                                    .cloned()
-                                    .unwrap_or_default();
                                 let admission = evaluate_forwarding_pre_admission_policy(
                                     &upstream_policy,
                                     Some(&lb_header_lookup),

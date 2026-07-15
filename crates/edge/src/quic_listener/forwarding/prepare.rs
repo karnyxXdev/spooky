@@ -194,6 +194,7 @@ impl QUICListener {
         let resolved = Self::resolve_backend_without_inflight_request(
             &resolution_request,
             upstream_pools,
+            upstream_policies,
             routing_index,
         );
 
@@ -202,6 +203,7 @@ impl QUICListener {
                 let ResolvedRoute {
                     upstream_name,
                     upstream_pool,
+                    upstream_policy,
                     route_path_len,
                     route_host_specific,
                     route_reason,
@@ -211,10 +213,6 @@ impl QUICListener {
                     backend_index,
                     backend_lb,
                 } = backend;
-                let upstream_policy = upstream_policies
-                    .get(&upstream_name)
-                    .cloned()
-                    .unwrap_or_default();
                 let admission = evaluate_forwarding_pre_admission_policy(
                     &upstream_policy,
                     Some(&lb_header_lookup),

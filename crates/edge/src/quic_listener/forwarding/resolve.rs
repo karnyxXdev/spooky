@@ -1,4 +1,5 @@
 use super::*;
+use spooky_config::runtime::RuntimeUpstreamPolicy;
 
 pub(in crate::quic_listener) struct RouteResolutionRequest<'a> {
     pub(in crate::quic_listener) method: &'a str,
@@ -29,6 +30,7 @@ impl<'a> RouteResolutionRequest<'a> {
 pub(crate) struct ResolvedRoute {
     pub(crate) upstream_name: String,
     pub(crate) upstream_pool: Arc<RwLock<UpstreamPool>>,
+    pub(crate) upstream_policy: RuntimeUpstreamPolicy,
     pub(crate) route_path_len: usize,
     pub(crate) route_host_specific: bool,
     pub(crate) route_reason: RouteDecisionReason,
@@ -50,6 +52,7 @@ impl QUICListener {
     fn resolve_route_target(
         request: &RouteResolutionRequest<'_>,
         upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        upstream_policies: &HashMap<String, RuntimeUpstreamPolicy>,
         routing_index: &RouteIndex,
     ) -> Result<ResolvedRoute, ProxyError> {
         if request.method.is_empty() || request.path.is_empty() {
@@ -64,10 +67,15 @@ impl QUICListener {
             .get(route_decision.upstream)
             .ok_or_else(|| ProxyError::Transport(format!("pool not found: {upstream_name}")))?
             .clone();
+        let upstream_policy = upstream_policies
+            .get(route_decision.upstream)
+            .cloned()
+            .unwrap_or_default();
 
         Ok(ResolvedRoute {
             upstream_name,
             upstream_pool,
+            upstream_policy,
             route_path_len: route_decision.matched_path_len,
             route_host_specific: route_decision.host_specific,
             route_reason: route_decision.reason,
@@ -176,10 +184,12 @@ impl QUICListener {
     fn resolve_backend_internal(
         request: &RouteResolutionRequest<'_>,
         upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        upstream_policies: &HashMap<String, RuntimeUpstreamPolicy>,
         routing_index: &RouteIndex,
         begin_request: bool,
     ) -> Result<ResolvedBackend, ProxyError> {
-        let route = Self::resolve_route_target(request, upstream_pools, routing_index)?;
+        let route =
+            Self::resolve_route_target(request, upstream_pools, upstream_policies, routing_index)?;
         let backend = Self::select_backend_from_pool(request, &route.upstream_pool, begin_request)?;
 
         Self::log_backend_selection(
@@ -196,17 +206,31 @@ impl QUICListener {
     pub(super) fn resolve_backend_without_inflight_request(
         request: &RouteResolutionRequest<'_>,
         upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        upstream_policies: &HashMap<String, RuntimeUpstreamPolicy>,
         routing_index: &RouteIndex,
     ) -> Result<ResolvedBackend, ProxyError> {
-        Self::resolve_backend_internal(request, upstream_pools, routing_index, false)
+        Self::resolve_backend_internal(
+            request,
+            upstream_pools,
+            upstream_policies,
+            routing_index,
+            false,
+        )
     }
 
     /// Resolve routing + LB for a request, returning `(backend_addr, backend_index, pool)`.
     pub(in crate::quic_listener) fn resolve_backend_request(
         request: &RouteResolutionRequest<'_>,
         upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        upstream_policies: &HashMap<String, RuntimeUpstreamPolicy>,
         routing_index: &RouteIndex,
     ) -> Result<ResolvedBackend, ProxyError> {
-        Self::resolve_backend_internal(request, upstream_pools, routing_index, true)
+        Self::resolve_backend_internal(
+            request,
+            upstream_pools,
+            upstream_policies,
+            routing_index,
+            true,
+        )
     }
 }

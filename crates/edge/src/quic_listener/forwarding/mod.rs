@@ -9,6 +9,9 @@ mod stream_progress;
 use std::{convert::Infallible, error::Error as StdError};
 
 use spooky_config::config::ScopedRateLimitScope;
+use spooky_errors::{
+    UpstreamErrorCategory, UpstreamErrorClassification, UpstreamErrorDetails, UpstreamTlsReason,
+};
 
 use self::prepare::{PreparedRequest, StartedAuthRequest};
 pub(in crate::quic_listener) use self::resolve::BootstrapResolutionInput;
@@ -84,31 +87,31 @@ impl QUICListener {
     pub fn classify_upstream_failure_reason(
         is_connect: bool,
         detail: &str,
-    ) -> (HealthFailureReason, &'static str) {
+    ) -> UpstreamErrorClassification {
         let normalized = detail.to_ascii_lowercase();
         if normalized.contains("timeout") || normalized.contains("timed out") {
-            return (HealthFailureReason::Timeout, "timeout");
+            return UpstreamErrorClassification::timeout();
         }
 
         if is_connect {
             if normalized.contains("unknownissuer") || normalized.contains("unknown issuer") {
-                return (HealthFailureReason::Tls, "unknown_issuer");
+                return UpstreamErrorClassification::tls(UpstreamTlsReason::UnknownIssuer);
             }
             if normalized.contains("expired")
                 || normalized.contains("not yet valid")
                 || normalized.contains("validity")
             {
-                return (HealthFailureReason::Tls, "expired_certificate");
+                return UpstreamErrorClassification::tls(UpstreamTlsReason::ExpiredCertificate);
             }
             if normalized.contains("hostname")
                 || normalized.contains("dns name")
                 || normalized.contains("subjectaltname")
                 || normalized.contains("not valid for")
             {
-                return (HealthFailureReason::Tls, "hostname_mismatch");
+                return UpstreamErrorClassification::tls(UpstreamTlsReason::HostnameMismatch);
             }
             if normalized.contains("alpn") {
-                return (HealthFailureReason::Tls, "alpn");
+                return UpstreamErrorClassification::tls(UpstreamTlsReason::Alpn);
             }
             if normalized.contains("invalidcertificate")
                 || normalized.contains("certificate")
@@ -117,18 +120,45 @@ impl QUICListener {
                 || normalized.contains("webpki")
                 || normalized.contains("tls")
             {
-                return (HealthFailureReason::Tls, "handshake");
+                return UpstreamErrorClassification::tls(UpstreamTlsReason::Handshake);
             }
         }
 
-        (HealthFailureReason::Transport, "transport")
+        UpstreamErrorClassification::transport()
     }
 
-    pub(crate) fn send_error_health_failure_reason(
+    pub(crate) fn classify_send_error(
         err: &hyper_util::client::legacy::Error,
+    ) -> (UpstreamErrorDetails, UpstreamErrorClassification) {
+        let details = UpstreamErrorDetails::new(Self::format_error_chain(err), err.is_connect());
+        let classification =
+            Self::classify_upstream_failure_reason(details.is_connect, &details.detail);
+        (details, classification)
+    }
+
+    pub(crate) fn upstream_error_health_failure_reason(
+        classification: UpstreamErrorClassification,
     ) -> (HealthFailureReason, &'static str) {
-        let detail = Self::format_error_chain(err);
-        Self::classify_upstream_failure_reason(err.is_connect(), &detail)
+        match classification.category {
+            UpstreamErrorCategory::Timeout => (HealthFailureReason::Timeout, "timeout"),
+            UpstreamErrorCategory::Transport => (HealthFailureReason::Transport, "transport"),
+            UpstreamErrorCategory::Tls => (
+                HealthFailureReason::Tls,
+                match classification
+                    .tls_reason
+                    .unwrap_or(UpstreamTlsReason::Handshake)
+                {
+                    UpstreamTlsReason::UnknownIssuer => "unknown_issuer",
+                    UpstreamTlsReason::ExpiredCertificate => "expired_certificate",
+                    UpstreamTlsReason::HostnameMismatch => "hostname_mismatch",
+                    UpstreamTlsReason::Alpn => "alpn",
+                    UpstreamTlsReason::Handshake => "handshake",
+                },
+            ),
+            UpstreamErrorCategory::Protocol | UpstreamErrorCategory::Internal => {
+                (HealthFailureReason::Transport, "transport")
+            }
+        }
     }
 
     pub(crate) fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
@@ -1204,7 +1234,9 @@ mod tests {
                 true,
                 "client error (Connect): tls handshake failed: invalid certificate"
             ),
-            (HealthFailureReason::Tls, "handshake")
+            spooky_errors::UpstreamErrorClassification::tls(
+                spooky_errors::UpstreamTlsReason::Handshake,
+            )
         );
     }
 
@@ -1215,7 +1247,7 @@ mod tests {
                 true,
                 "client error (Connect): connection refused"
             ),
-            (HealthFailureReason::Transport, "transport")
+            spooky_errors::UpstreamErrorClassification::transport()
         );
     }
 
@@ -1223,7 +1255,7 @@ mod tests {
     fn send_error_with_timeout_detail_maps_to_timeout_health_failure() {
         assert_eq!(
             QUICListener::classify_upstream_failure_reason(false, "request timed out"),
-            (HealthFailureReason::Timeout, "timeout")
+            spooky_errors::UpstreamErrorClassification::timeout()
         );
     }
 

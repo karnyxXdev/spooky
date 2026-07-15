@@ -141,11 +141,12 @@ impl QUICListener {
                 )
             }
             Err(ProxyError::Pool(PoolError::Send(ref send_err))) => {
-                let send_err_detail = Self::format_error_chain(send_err);
-                let (failure_reason, tls_reason) = Self::send_error_health_failure_reason(send_err);
+                let (send_err_details, classification) = Self::classify_send_error(send_err);
+                let (failure_reason, tls_reason) =
+                    Self::upstream_error_health_failure_reason(classification);
                 error!(
                     "Upstream send failed for {} (health_reason={:?}, tls_reason={}): {}",
-                    backend_addr, failure_reason, tls_reason, send_err_detail
+                    backend_addr, failure_reason, tls_reason, send_err_details.detail
                 );
                 metrics.inc_health_failure(failure_reason);
                 if failure_reason == HealthFailureReason::Tls {

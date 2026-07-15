@@ -127,9 +127,10 @@ impl QUICListener {
                                     classify_active_health_check_response(response.status())
                                 }
                                 Ok(Err(PoolError::Send(send_err))) => {
-                                    let send_err_detail = Self::format_error_chain(&send_err);
+                                    let (send_err_details, classification) =
+                                        Self::classify_send_error(&send_err);
                                     let (failure_reason, tls_reason) =
-                                        Self::send_error_health_failure_reason(&send_err);
+                                        Self::upstream_error_health_failure_reason(classification);
                                     if failure_reason == HealthFailureReason::Tls {
                                         task_metrics.record_upstream_tls_failure(
                                             &job.backend_identity,
@@ -138,7 +139,9 @@ impl QUICListener {
                                         );
                                         error!(
                                             "Health check upstream TLS failure for {} (tls_reason={}): {}",
-                                            job.backend_identity, tls_reason, send_err_detail
+                                            job.backend_identity,
+                                            tls_reason,
+                                            send_err_details.detail
                                         );
                                     }
                                     task_metrics.inc_health_failure(failure_reason);

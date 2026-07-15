@@ -16,7 +16,7 @@ use spooky_config::{
     },
     runtime::{ListenerRuntimeConfig, RuntimeConfig},
 };
-use spooky_lb::health::HealthFailureReason;
+use spooky_errors::{UpstreamErrorCategory, UpstreamErrorClassification, UpstreamTlsReason};
 use tempfile::tempdir;
 
 use super::{
@@ -661,29 +661,36 @@ fn classify_upstream_failure_reason_distinguishes_tls_causes() {
             true,
             "tls handshake failed: UnknownIssuer"
         ),
-        (HealthFailureReason::Tls, "unknown_issuer")
+        UpstreamErrorClassification::tls(UpstreamTlsReason::UnknownIssuer)
     );
     assert_eq!(
         super::QUICListener::classify_upstream_failure_reason(
             true,
             "certificate expired while verifying backend"
         ),
-        (HealthFailureReason::Tls, "expired_certificate")
+        UpstreamErrorClassification::tls(UpstreamTlsReason::ExpiredCertificate)
     );
     assert_eq!(
         super::QUICListener::classify_upstream_failure_reason(
             true,
             "certificate not valid for dns name api.example.com"
         ),
-        (HealthFailureReason::Tls, "hostname_mismatch")
+        UpstreamErrorClassification::tls(UpstreamTlsReason::HostnameMismatch)
     );
     assert_eq!(
         super::QUICListener::classify_upstream_failure_reason(true, "ALPN negotiation failed"),
-        (HealthFailureReason::Tls, "alpn")
+        UpstreamErrorClassification::tls(UpstreamTlsReason::Alpn)
     );
     assert_eq!(
         super::QUICListener::classify_upstream_failure_reason(false, "backend timed out"),
-        (HealthFailureReason::Timeout, "timeout")
+        UpstreamErrorClassification::timeout()
+    );
+    assert_eq!(
+        super::QUICListener::classify_upstream_failure_reason(false, "connection reset"),
+        UpstreamErrorClassification {
+            category: UpstreamErrorCategory::Transport,
+            tls_reason: None,
+        }
     );
 }
 

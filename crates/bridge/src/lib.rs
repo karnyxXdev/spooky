@@ -4,6 +4,7 @@ pub mod h3_to_h2;
 mod headers;
 mod host;
 pub mod request;
+pub mod response;
 pub mod websocket;
 
 pub use spooky_errors::BridgeError;

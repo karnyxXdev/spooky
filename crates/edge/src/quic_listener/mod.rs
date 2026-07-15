@@ -39,6 +39,10 @@ use rustls::{
 use rustls_pki_types::pem::PemObject;
 use serde_json::json;
 use socket2::{Domain, Protocol, Socket, Type};
+use spooky_bridge::response::{
+    ResponseNormalizationProtocol, ResponseProtocolConstraints, normalize_response_trailers,
+    should_strip_response_header,
+};
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
     config::{ClientAuth, UpstreamTls},
@@ -126,21 +130,6 @@ use validation::{
 };
 use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
-fn is_hop_header(name: &str) -> bool {
-    matches!(
-        name,
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "transfer-encoding"
-            | "upgrade"
-            | "te"
-            | "trailer"
-    )
-}
-
 fn connection_header_tokens(headers: &http::HeaderMap) -> HashSet<String> {
     let mut tokens = HashSet::new();
     for value in headers.get_all(http::header::CONNECTION) {
@@ -195,30 +184,52 @@ fn should_strip_h3_response_header(
     name: &http::header::HeaderName,
     connection_tokens: &HashSet<String>,
 ) -> bool {
-    connection_tokens.contains(name.as_str())
-        || is_hop_header(name.as_str())
-        || name == http::header::CONTENT_LENGTH
+    should_strip_response_header(
+        name,
+        connection_tokens,
+        ResponseProtocolConstraints {
+            protocol: ResponseNormalizationProtocol::Http3,
+            strip_connection_headers: true,
+            allow_trailers: true,
+            preserve_upgrade: false,
+        },
+    )
 }
 
 fn collect_h3_trailers(trailers: &http::HeaderMap) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let connection_tokens = connection_header_tokens(trailers);
-    let mut out = Vec::with_capacity(trailers.len());
-    for (name, value) in trailers.iter() {
-        if should_strip_h3_response_header(name, &connection_tokens) {
-            continue;
-        }
-        out.push((name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()));
-    }
-    out
+    normalize_response_trailers(
+        trailers,
+        ResponseProtocolConstraints {
+            protocol: ResponseNormalizationProtocol::Http3,
+            strip_connection_headers: true,
+            allow_trailers: true,
+            preserve_upgrade: false,
+        },
+    )
+    .into_iter()
+    .map(|header| {
+        (
+            header.name.as_str().as_bytes().to_vec(),
+            header.value.as_bytes().to_vec(),
+        )
+    })
+    .collect()
 }
 
 fn should_strip_bootstrap_response_header(
     name: &http::header::HeaderName,
     connection_tokens: &HashSet<String>,
 ) -> bool {
-    connection_tokens.contains(name.as_str())
-        || is_hop_header(name.as_str())
-        || name.as_str().eq_ignore_ascii_case("alt-svc")
+    should_strip_response_header(
+        name,
+        connection_tokens,
+        ResponseProtocolConstraints {
+            protocol: ResponseNormalizationProtocol::Http1,
+            strip_connection_headers: true,
+            allow_trailers: false,
+            preserve_upgrade: false,
+        },
+    )
 }
 
 fn response_size_exceeded_after_chunk(

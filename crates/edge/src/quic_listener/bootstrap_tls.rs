@@ -40,8 +40,7 @@ use super::{
         AdmissionPolicyDecision, admission_rejection_response,
         evaluate_forwarding_pre_admission_policy,
     },
-    bootstrap_resolution_error_response, boxed_full, connection_header_tokens, is_head_method,
-    is_websocket_upgrade_request,
+    boxed_full, connection_header_tokens, is_head_method, is_websocket_upgrade_request,
     runtime_endpoint::RuntimeConnectionSlotGuard,
     runtime_handle, should_strip_bootstrap_response_header, spawn_supervised_async_task,
     validate_http_request,
@@ -389,7 +388,7 @@ impl QUICListener {
                                         .and_then(|value| value.to_str().ok())
                                         .map(str::to_string)
                                 };
-                                let (backend_addr, upstream_name, upstream_policy) = match {
+                                let (backend_addr, upstream_name, upstream_policy) = {
                                     let resolution_request =
                                         super::forwarding::SharedRouteResolutionRequest::new(
                                             &method,
@@ -398,37 +397,30 @@ impl QUICListener {
                                             None,
                                             Some(&lb_header_lookup),
                                         );
-                                    Self::resolve_backend_request(
+                                    match Self::resolve_backend_request(
                                         &resolution_request,
                                         &upstream_pools,
                                         &upstream_policies,
                                         &routing_index,
-                                    )
-                                } {
-                                    Ok(value) => (
-                                        value.backend.backend_addr,
-                                        value.route.upstream_name,
-                                        value.route.upstream_policy,
-                                    ),
-                                    Err(ProxyError::Transport(reason)) => {
-                                        let (status, body) =
-                                            bootstrap_resolution_error_response(&reason);
-                                        if status == StatusCode::BAD_GATEWAY
-                                            && body == b"route/backend resolution failed\n"
-                                        {
-                                            warn!(
-                                                "Bootstrap route/backend resolution failed: {}",
-                                                reason
+                                    ) {
+                                        Ok(value) => (
+                                            value.backend.backend_addr,
+                                            value.route.upstream_name,
+                                            value.route.upstream_policy,
+                                        ),
+                                        Err(err) => {
+                                            Self::observe_route_resolution_failure(
+                                                &resolution_request,
+                                                &err,
+                                                &metrics,
+                                                Duration::from_millis(0),
                                             );
+                                            let (status, body) =
+                                                Self::bootstrap_route_resolution_error_response(
+                                                    &err,
+                                                );
+                                            return bootstrap_error(status, body);
                                         }
-                                        return bootstrap_error(status, body);
-                                    }
-                                    Err(err) => {
-                                        warn!("Bootstrap route/backend resolution failed: {}", err);
-                                        return bootstrap_error(
-                                            StatusCode::BAD_GATEWAY,
-                                            b"route/backend resolution failed\n",
-                                        );
                                     }
                                 };
 

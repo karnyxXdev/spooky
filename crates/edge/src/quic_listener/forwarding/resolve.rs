@@ -52,7 +52,100 @@ struct BackendSelectionPlan {
     lb_key: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RouteResolutionFailureKind {
+    NoRoute,
+    MissingPool,
+    PoolLockPoisoned,
+    NoServers,
+    NoHealthyServers,
+    InvalidServerAddress,
+    OtherTransport,
+    Other,
+}
+
 impl QUICListener {
+    fn classify_route_resolution_transport_reason(reason: &str) -> RouteResolutionFailureKind {
+        if reason.starts_with("no route for ") {
+            return RouteResolutionFailureKind::NoRoute;
+        }
+        if reason.starts_with("pool not found:") {
+            return RouteResolutionFailureKind::MissingPool;
+        }
+        if reason == "upstream pool lock poisoned" {
+            return RouteResolutionFailureKind::PoolLockPoisoned;
+        }
+        if reason == "no servers in upstream" {
+            return RouteResolutionFailureKind::NoServers;
+        }
+        if reason == "no healthy servers" {
+            return RouteResolutionFailureKind::NoHealthyServers;
+        }
+        if reason == "invalid server address" {
+            return RouteResolutionFailureKind::InvalidServerAddress;
+        }
+        RouteResolutionFailureKind::OtherTransport
+    }
+
+    fn classify_route_resolution_failure(err: &ProxyError) -> RouteResolutionFailureKind {
+        match err {
+            ProxyError::Transport(reason) => {
+                Self::classify_route_resolution_transport_reason(reason)
+            }
+            _ => RouteResolutionFailureKind::Other,
+        }
+    }
+
+    fn log_route_resolution_failure(request: &RouteResolutionRequest<'_>, err: &ProxyError) {
+        let authority = request.authority.unwrap_or("-");
+        let failure_kind = Self::classify_route_resolution_failure(err);
+        let message = format!(
+            "route/backend resolution failed method={} path={} authority={} kind={:?}: {}",
+            request.method, request.path, authority, failure_kind, err
+        );
+        match failure_kind {
+            RouteResolutionFailureKind::NoRoute => debug!("{}", message),
+            _ => warn!("{}", message),
+        }
+    }
+
+    pub(in crate::quic_listener) fn observe_route_resolution_failure(
+        request: &RouteResolutionRequest<'_>,
+        err: &ProxyError,
+        metrics: &Metrics,
+        elapsed: Duration,
+    ) {
+        metrics.inc_failure();
+        metrics.record_route("unrouted", elapsed, RouteOutcome::Failure);
+        Self::log_route_resolution_failure(request, err);
+    }
+
+    pub(in crate::quic_listener) fn bootstrap_route_resolution_error_response(
+        err: &ProxyError,
+    ) -> (http::StatusCode, &'static [u8]) {
+        match Self::classify_route_resolution_failure(err) {
+            RouteResolutionFailureKind::NoRoute => (http::StatusCode::BAD_GATEWAY, b"no route\n"),
+            RouteResolutionFailureKind::MissingPool => {
+                (http::StatusCode::BAD_GATEWAY, b"no pool\n")
+            }
+            RouteResolutionFailureKind::PoolLockPoisoned => {
+                (http::StatusCode::BAD_GATEWAY, b"pool error\n")
+            }
+            RouteResolutionFailureKind::NoServers
+            | RouteResolutionFailureKind::InvalidServerAddress => {
+                (http::StatusCode::SERVICE_UNAVAILABLE, b"no backends\n")
+            }
+            RouteResolutionFailureKind::NoHealthyServers => (
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                b"no healthy backends\n",
+            ),
+            RouteResolutionFailureKind::OtherTransport | RouteResolutionFailureKind::Other => (
+                http::StatusCode::BAD_GATEWAY,
+                b"route/backend resolution failed\n",
+            ),
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     fn resolve_route_target(
         request: &RouteResolutionRequest<'_>,
@@ -190,6 +283,7 @@ impl QUICListener {
     }
 
     fn log_backend_selection(
+        request: &RouteResolutionRequest<'_>,
         backend_addr: &str,
         lb_type: &str,
         upstream_name: &str,
@@ -198,8 +292,16 @@ impl QUICListener {
         route_reason: &RouteDecisionReason,
     ) {
         debug!(
-            "Selected backend {} via {} route={} path_len={} host_specific={} reason={:?}",
-            backend_addr, lb_type, upstream_name, route_path_len, route_host_specific, route_reason
+            "Resolved backend method={} path={} authority={} route={} backend={} via={} path_len={} host_specific={} reason={:?}",
+            request.method,
+            request.path,
+            request.authority.unwrap_or("-"),
+            upstream_name,
+            backend_addr,
+            lb_type,
+            route_path_len,
+            route_host_specific,
+            route_reason
         );
     }
 
@@ -215,6 +317,7 @@ impl QUICListener {
         let backend = Self::select_backend_from_pool(request, &route.upstream_pool, begin_request)?;
 
         Self::log_backend_selection(
+            request,
             &backend.backend_addr,
             &backend.backend_lb,
             &route.upstream_name,

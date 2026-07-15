@@ -408,8 +408,12 @@ impl QUICListener {
                 })
             }
             Err(err) => {
-                metrics.inc_failure();
-                metrics.record_route("unrouted", request_start.elapsed(), RouteOutcome::Failure);
+                Self::observe_route_resolution_failure(
+                    &resolution_request,
+                    &err,
+                    metrics,
+                    request_start.elapsed(),
+                );
                 let (status, body): (http::StatusCode, &[u8]) = match err {
                     ProxyError::Transport(_) => (
                         http::StatusCode::SERVICE_UNAVAILABLE,

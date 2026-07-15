@@ -183,9 +183,12 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
 
 #[cfg(test)]
 mod tests {
+    use std::{convert::Infallible, net::SocketAddr};
+
     use bytes::Bytes;
     use http::header::HOST;
-    use http_body_util::{BodyExt, Empty};
+    use http_body_util::{BodyExt, Empty, combinators::BoxBody};
+    use hyper::ext::Protocol;
     use quiche::h3::Header;
     use spooky_config::{
         backend_endpoint::BackendEndpoint,
@@ -197,8 +200,57 @@ mod tests {
 
     use super::{
         BridgeError, ForwardedContext, build_h2_request,
-        build_h2_request_for_endpoint_with_host_policy,
+        build_h2_request_for_endpoint_with_host_policy, build_h2_request_for_target,
     };
+    use crate::{
+        h3_to_h1::build_h1_request,
+        request::{
+            RequestBuildInput, RequestBuildPolicies, RequestBuildTarget, RequestForwardedContext,
+            RequestTraceContext,
+        },
+    };
+
+    fn request_target<'a>(
+        endpoint: &'a BackendEndpoint,
+        host_policy: &'a UpstreamHostPolicy,
+        forwarded_header_policy: &'a ForwardedHeaderPolicy,
+    ) -> RequestBuildTarget<'a> {
+        RequestBuildTarget {
+            endpoint,
+            policies: RequestBuildPolicies {
+                host_policy,
+                forwarded_header_policy,
+            },
+        }
+    }
+
+    fn request_input<'a>(
+        method: &'a str,
+        path: &'a str,
+        authority: Option<&'a str>,
+        headers: &'a [Header],
+        content_length: Option<usize>,
+        request_id: u64,
+        traceparent: Option<&'a str>,
+        client_addr: SocketAddr,
+    ) -> RequestBuildInput<'a, BoxBody<Bytes, Infallible>> {
+        RequestBuildInput {
+            method,
+            path,
+            authority,
+            headers,
+            body: Empty::<Bytes>::new().boxed(),
+            content_length,
+            body_mode: RequestBuildInput::<BoxBody<Bytes, Infallible>>::body_mode_for_length(
+                content_length,
+            ),
+            trace: RequestTraceContext {
+                request_id,
+                traceparent,
+            },
+            forwarded: RequestForwardedContext { client_addr },
+        }
+    }
 
     #[test]
     fn defaults_to_https_origin_for_host_port_backend() {
@@ -547,5 +599,124 @@ mod tests {
             req.headers().get(HOST).and_then(|h| h.to_str().ok()),
             Some("target.example.com:443")
         );
+    }
+
+    #[test]
+    fn websocket_requests_are_shaped_as_extended_connect() {
+        let endpoint = BackendEndpoint::parse("backend.internal:443").expect("endpoint");
+        let headers = vec![
+            Header::new(b"connection", b"upgrade"),
+            Header::new(b"upgrade", b"websocket"),
+            Header::new(b"sec-websocket-key", b"dGhlIHNhbXBsZSBub25jZQ=="),
+        ];
+
+        let req = build_h2_request_for_target(
+            request_target(
+                &endpoint,
+                &UpstreamHostPolicy::default(),
+                &ForwardedHeaderPolicy::default(),
+            ),
+            request_input(
+                "GET",
+                "/ws",
+                Some("socket.example.com"),
+                &headers,
+                None,
+                11,
+                None,
+                "203.0.113.33:6000".parse().expect("client"),
+            ),
+        )
+        .expect("request");
+
+        assert_eq!(req.method(), http::Method::CONNECT);
+        assert_eq!(req.version(), http::Version::HTTP_2);
+        assert_eq!(req.uri().to_string(), "https://backend.internal:443/ws");
+        assert!(req.extensions().get::<Protocol>().is_some());
+        assert!(req.headers().get(HOST).is_none());
+        assert!(req.headers().get(http::header::CONTENT_LENGTH).is_none());
+        assert!(req.headers().get("connection").is_none());
+        assert!(req.headers().get("upgrade").is_none());
+        assert_eq!(
+            req.headers()
+                .get("sec-websocket-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("dGhlIHNhbXBsZSBub25jZQ==")
+        );
+        assert_eq!(
+            req.headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("11")
+        );
+    }
+
+    #[test]
+    fn h1_and_h2_share_canonical_policy_outputs() {
+        let endpoint = BackendEndpoint::parse("backend.internal:443").expect("endpoint");
+        let headers = vec![
+            Header::new(b"host", b"spoofed.example.com"),
+            Header::new(b"x-forwarded-for", b"1.2.3.4"),
+            Header::new(b"forwarded", b"for=1.2.3.4"),
+            Header::new(b"connection", b"keep-alive, x-secret"),
+            Header::new(b"x-secret", b"drop-me"),
+            Header::new(b"x-keep", b"ok"),
+        ];
+        let host_policy = UpstreamHostPolicy::default();
+        let forwarded_policy = ForwardedHeaderPolicy::default();
+
+        let h1 = build_h1_request(
+            request_target(&endpoint, &host_policy, &forwarded_policy),
+            request_input(
+                "GET",
+                "/shared",
+                Some("api.example.com"),
+                &headers,
+                None,
+                55,
+                Some("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"),
+                "198.51.100.44:7000".parse().expect("client"),
+            ),
+        )
+        .expect("h1 request");
+        let h2 = build_h2_request_for_target(
+            request_target(&endpoint, &host_policy, &forwarded_policy),
+            request_input(
+                "GET",
+                "/shared",
+                Some("api.example.com"),
+                &headers,
+                None,
+                55,
+                Some("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"),
+                "198.51.100.44:7000".parse().expect("client"),
+            ),
+        )
+        .expect("h2 request");
+
+        assert_eq!(h1.uri(), h2.uri());
+        for name in [
+            HOST.as_str(),
+            "x-keep",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-forwarded-host",
+            "forwarded",
+            "x-request-id",
+            "traceparent",
+        ] {
+            assert_eq!(
+                h1.headers().get(name).and_then(|value| value.to_str().ok()),
+                h2.headers().get(name).and_then(|value| value.to_str().ok()),
+                "header mismatch for {name}"
+            );
+        }
+        assert!(h1.headers().get("x-secret").is_none());
+        assert!(h2.headers().get("x-secret").is_none());
+        assert_eq!(
+            h1.headers().get("te").and_then(|value| value.to_str().ok()),
+            Some("trailers")
+        );
+        assert!(h2.headers().get("te").is_none());
     }
 }

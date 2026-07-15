@@ -39,13 +39,13 @@ use rustls::{
 use rustls_pki_types::pem::PemObject;
 use serde_json::json;
 use socket2::{Domain, Protocol, Socket, Type};
+#[cfg(test)]
+use spooky_bridge::response::should_strip_response_header;
 use spooky_bridge::response::{
     ResponseBodyMode, ResponseBodyPolicy, ResponseNormalizationInput,
     ResponseNormalizationProtocol, ResponseProtocolConstraints, normalize_response_trailers,
     normalize_upstream_response,
 };
-#[cfg(test)]
-use spooky_bridge::response::should_strip_response_header;
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
     config::{ClientAuth, UpstreamTls},

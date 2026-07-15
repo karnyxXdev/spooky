@@ -40,8 +40,7 @@ use super::{
         AdmissionPolicyDecision, admission_rejection_response,
         evaluate_forwarding_pre_admission_policy,
     },
-    bootstrap_resolution_error_response, boxed_full, connection_header_tokens, is_head_method,
-    is_websocket_upgrade_request,
+    boxed_full, connection_header_tokens, is_head_method, is_websocket_upgrade_request,
     runtime_endpoint::RuntimeConnectionSlotGuard,
     runtime_handle, should_strip_bootstrap_response_header, spawn_supervised_async_task,
     validate_http_request,
@@ -389,43 +388,34 @@ impl QUICListener {
                                         .and_then(|value| value.to_str().ok())
                                         .map(str::to_string)
                                 };
-                                let resolved = Self::resolve_backend(
-                                    &method,
-                                    &path,
-                                    authority.as_deref(),
-                                    None,
-                                    &upstream_pools,
-                                    &routing_index,
-                                    Some(&lb_header_lookup),
-                                );
-                                let (backend_addr, upstream_name) = match resolved {
-                                    Ok(value) => (value.backend_addr, value.upstream_name),
-                                    Err(ProxyError::Transport(reason)) => {
-                                        let (status, body) =
-                                            bootstrap_resolution_error_response(&reason);
-                                        if status == StatusCode::BAD_GATEWAY
-                                            && body == b"route/backend resolution failed\n"
-                                        {
-                                            warn!(
-                                                "Bootstrap route/backend resolution failed: {}",
-                                                reason
-                                            );
+                                let (backend_addr, upstream_name, upstream_policy) =
+                                    match Self::resolve_bootstrap_target(
+                                        super::forwarding::BootstrapResolutionInput {
+                                            method: &method,
+                                            path: &path,
+                                            authority: authority.as_deref(),
+                                            header_lookup: Some(&lb_header_lookup),
+                                            routing_index: &routing_index,
+                                            upstream_pools: &upstream_pools,
+                                            upstream_policies: &upstream_policies,
+                                            metrics: &metrics,
+                                            elapsed: Duration::from_millis(0),
+                                        },
+                                    ) {
+                                        Ok(value) => (
+                                            value.backend_addr,
+                                            value.upstream_name,
+                                            value.upstream_policy,
+                                        ),
+                                        Err(err) => {
+                                            let (status, body) =
+                                                Self::bootstrap_route_resolution_error_response(
+                                                    &err,
+                                                );
+                                            return bootstrap_error(status, body);
                                         }
-                                        return bootstrap_error(status, body);
-                                    }
-                                    Err(err) => {
-                                        warn!("Bootstrap route/backend resolution failed: {}", err);
-                                        return bootstrap_error(
-                                            StatusCode::BAD_GATEWAY,
-                                            b"route/backend resolution failed\n",
-                                        );
-                                    }
-                                };
+                                    };
 
-                                let upstream_policy = upstream_policies
-                                    .get(&upstream_name)
-                                    .cloned()
-                                    .unwrap_or_default();
                                 let admission = evaluate_forwarding_pre_admission_policy(
                                     &upstream_policy,
                                     Some(&lb_header_lookup),

@@ -5,7 +5,7 @@ use tracing::Span;
 
 use super::{
     auth::{AuthStart, auth_failure_mode, fail_open, start_external_auth_task},
-    resolve::ResolvedBackend,
+    resolve::ForwardingResolvedTarget,
     *,
 };
 use crate::{
@@ -179,36 +179,32 @@ impl QUICListener {
                 .and_then(|header| std::str::from_utf8(header.value()).ok())
                 .map(str::to_string)
         };
-        let route_method = if matches!(tunnel_mode, TunnelMode::Websocket) {
-            "GET"
-        } else {
-            method
-        };
-        let resolved = Self::resolve_backend_without_inflight(
-            route_method,
+        let resolved = Self::resolve_forwarding_target(
+            method,
             path,
             authority,
-            Some(sticky_cid_key),
-            upstream_pools,
-            routing_index,
+            tunnel_mode,
+            sticky_cid_key,
             Some(&lb_header_lookup),
+            routing_index,
+            upstream_pools,
+            upstream_policies,
+            metrics,
+            request_start.elapsed(),
         );
 
         let prepared = match resolved {
-            Ok(ResolvedBackend {
+            Ok(ForwardingResolvedTarget {
                 upstream_name,
-                backend_addr,
-                backend_index,
                 upstream_pool,
-                backend_lb,
+                upstream_policy,
                 route_path_len,
                 route_host_specific,
                 route_reason,
+                backend_addr,
+                backend_index,
+                backend_lb,
             }) => {
-                let upstream_policy = upstream_policies
-                    .get(&upstream_name)
-                    .cloned()
-                    .unwrap_or_default();
                 let admission = evaluate_forwarding_pre_admission_policy(
                     &upstream_policy,
                     Some(&lb_header_lookup),
@@ -352,7 +348,6 @@ impl QUICListener {
                 let bodyless_mode = !is_tunnel_mode(tunnel_mode)
                     && is_bodyless_request_mode(method, content_length);
                 let request_fin_received = bodyless_mode;
-                let route_reason = format!("{route_reason:?}");
                 let external_auth = upstream_policy.upstream_auth.external_auth.clone();
                 let auth_fail_open = external_auth
                     .as_ref()
@@ -404,8 +399,6 @@ impl QUICListener {
                 })
             }
             Err(err) => {
-                metrics.inc_failure();
-                metrics.record_route("unrouted", request_start.elapsed(), RouteOutcome::Failure);
                 let (status, body): (http::StatusCode, &[u8]) = match err {
                     ProxyError::Transport(_) => (
                         http::StatusCode::SERVICE_UNAVAILABLE,

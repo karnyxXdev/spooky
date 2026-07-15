@@ -1,142 +1,428 @@
+use spooky_config::runtime::RuntimeUpstreamPolicy;
+
 use super::*;
 
-pub(crate) struct ResolvedBackend {
-    pub(crate) upstream_name: String,
-    pub(crate) backend_addr: String,
-    pub(crate) backend_index: usize,
-    pub(crate) upstream_pool: Arc<RwLock<UpstreamPool>>,
-    pub(crate) backend_lb: String,
-    pub(crate) route_path_len: usize,
-    pub(crate) route_host_specific: bool,
-    pub(crate) route_reason: RouteDecisionReason,
+pub(in crate::quic_listener) struct RouteResolutionRequest<'a> {
+    pub(in crate::quic_listener) method: &'a str,
+    pub(in crate::quic_listener) path: &'a str,
+    pub(in crate::quic_listener) authority: Option<&'a str>,
+    pub(in crate::quic_listener) cid_key: Option<&'a str>,
+    pub(in crate::quic_listener) header_lookup: Option<&'a LbHeaderLookup<'a>>,
+}
+
+impl<'a> RouteResolutionRequest<'a> {
+    pub(in crate::quic_listener) fn new(
+        method: &'a str,
+        path: &'a str,
+        authority: Option<&'a str>,
+        cid_key: Option<&'a str>,
+        header_lookup: Option<&'a LbHeaderLookup<'a>>,
+    ) -> Self {
+        Self {
+            method,
+            path,
+            authority,
+            cid_key,
+            header_lookup,
+        }
+    }
+}
+
+pub(in crate::quic_listener) struct ResolvedRoute {
+    pub(in crate::quic_listener) upstream_name: String,
+    pub(in crate::quic_listener) upstream_pool: Arc<RwLock<UpstreamPool>>,
+    pub(in crate::quic_listener) upstream_policy: RuntimeUpstreamPolicy,
+    pub(in crate::quic_listener) route_path_len: usize,
+    pub(in crate::quic_listener) route_host_specific: bool,
+    pub(in crate::quic_listener) route_reason: RouteDecisionReason,
+}
+
+pub(in crate::quic_listener) struct SelectedBackend {
+    pub(in crate::quic_listener) backend_addr: String,
+    pub(in crate::quic_listener) backend_index: usize,
+    pub(in crate::quic_listener) backend_lb: String,
+}
+
+pub(in crate::quic_listener) struct ResolvedBackend {
+    pub(in crate::quic_listener) route: ResolvedRoute,
+    pub(in crate::quic_listener) backend: SelectedBackend,
+}
+
+pub(super) struct ForwardingResolvedTarget {
+    pub(super) upstream_name: String,
+    pub(super) upstream_pool: Arc<RwLock<UpstreamPool>>,
+    pub(super) upstream_policy: RuntimeUpstreamPolicy,
+    pub(super) route_path_len: usize,
+    pub(super) route_host_specific: bool,
+    pub(super) route_reason: String,
+    pub(super) backend_addr: String,
+    pub(super) backend_index: usize,
+    pub(super) backend_lb: String,
+}
+
+pub(in crate::quic_listener) struct BootstrapResolvedTarget {
+    pub(in crate::quic_listener) upstream_name: String,
+    pub(in crate::quic_listener) upstream_policy: RuntimeUpstreamPolicy,
+    pub(in crate::quic_listener) backend_addr: String,
+}
+
+pub(in crate::quic_listener) struct BootstrapResolutionInput<'a> {
+    pub(in crate::quic_listener) method: &'a str,
+    pub(in crate::quic_listener) path: &'a str,
+    pub(in crate::quic_listener) authority: Option<&'a str>,
+    pub(in crate::quic_listener) header_lookup: Option<&'a LbHeaderLookup<'a>>,
+    pub(in crate::quic_listener) routing_index: &'a RouteIndex,
+    pub(in crate::quic_listener) upstream_pools: &'a HashMap<String, Arc<RwLock<UpstreamPool>>>,
+    pub(in crate::quic_listener) upstream_policies: &'a HashMap<String, RuntimeUpstreamPolicy>,
+    pub(in crate::quic_listener) metrics: &'a Metrics,
+    pub(in crate::quic_listener) elapsed: Duration,
+}
+
+struct BackendSelectionPlan {
+    lb_type: String,
+    lb_key: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RouteResolutionFailureKind {
+    NoRoute,
+    MissingPool,
+    PoolLockPoisoned,
+    NoServers,
+    NoHealthyServers,
+    InvalidServerAddress,
+    OtherTransport,
+    Other,
 }
 
 impl QUICListener {
-    #[allow(clippy::type_complexity)]
-    fn resolve_route_target(
+    fn classify_route_resolution_transport_reason(reason: &str) -> RouteResolutionFailureKind {
+        if reason.starts_with("no route for ") {
+            return RouteResolutionFailureKind::NoRoute;
+        }
+        if reason.starts_with("pool not found:") {
+            return RouteResolutionFailureKind::MissingPool;
+        }
+        if reason == "upstream pool lock poisoned" {
+            return RouteResolutionFailureKind::PoolLockPoisoned;
+        }
+        if reason == "no servers in upstream" {
+            return RouteResolutionFailureKind::NoServers;
+        }
+        if reason == "no healthy servers" {
+            return RouteResolutionFailureKind::NoHealthyServers;
+        }
+        if reason == "invalid server address" {
+            return RouteResolutionFailureKind::InvalidServerAddress;
+        }
+        RouteResolutionFailureKind::OtherTransport
+    }
+
+    fn classify_route_resolution_failure(err: &ProxyError) -> RouteResolutionFailureKind {
+        match err {
+            ProxyError::Transport(reason) => {
+                Self::classify_route_resolution_transport_reason(reason)
+            }
+            _ => RouteResolutionFailureKind::Other,
+        }
+    }
+
+    fn log_route_resolution_failure(request: &RouteResolutionRequest<'_>, err: &ProxyError) {
+        let authority = request.authority.unwrap_or("-");
+        let failure_kind = Self::classify_route_resolution_failure(err);
+        let message = format!(
+            "route/backend resolution failed method={} path={} authority={} kind={:?}: {}",
+            request.method, request.path, authority, failure_kind, err
+        );
+        match failure_kind {
+            RouteResolutionFailureKind::NoRoute => debug!("{}", message),
+            _ => warn!("{}", message),
+        }
+    }
+
+    fn observe_route_resolution_failure(
+        request: &RouteResolutionRequest<'_>,
+        err: &ProxyError,
+        metrics: &Metrics,
+        elapsed: Duration,
+    ) {
+        metrics.inc_failure();
+        metrics.record_route("unrouted", elapsed, RouteOutcome::Failure);
+        Self::log_route_resolution_failure(request, err);
+    }
+
+    pub(in crate::quic_listener) fn bootstrap_route_resolution_error_response(
+        err: &ProxyError,
+    ) -> (http::StatusCode, &'static [u8]) {
+        match Self::classify_route_resolution_failure(err) {
+            RouteResolutionFailureKind::NoRoute => (http::StatusCode::BAD_GATEWAY, b"no route\n"),
+            RouteResolutionFailureKind::MissingPool => {
+                (http::StatusCode::BAD_GATEWAY, b"no pool\n")
+            }
+            RouteResolutionFailureKind::PoolLockPoisoned => {
+                (http::StatusCode::BAD_GATEWAY, b"pool error\n")
+            }
+            RouteResolutionFailureKind::NoServers
+            | RouteResolutionFailureKind::InvalidServerAddress => {
+                (http::StatusCode::SERVICE_UNAVAILABLE, b"no backends\n")
+            }
+            RouteResolutionFailureKind::NoHealthyServers => (
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                b"no healthy backends\n",
+            ),
+            RouteResolutionFailureKind::OtherTransport | RouteResolutionFailureKind::Other => (
+                http::StatusCode::BAD_GATEWAY,
+                b"route/backend resolution failed\n",
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn resolve_forwarding_target(
         method: &str,
         path: &str,
         authority: Option<&str>,
-        upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        tunnel_mode: TunnelMode,
+        sticky_cid_key: &str,
+        header_lookup: Option<&LbHeaderLookup<'_>>,
         routing_index: &RouteIndex,
-    ) -> Result<
-        (
-            String,
-            Arc<RwLock<UpstreamPool>>,
-            usize,
-            bool,
-            RouteDecisionReason,
-        ),
-        ProxyError,
-    > {
-        if method.is_empty() || path.is_empty() {
+        upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        upstream_policies: &HashMap<String, RuntimeUpstreamPolicy>,
+        metrics: &Metrics,
+        elapsed: Duration,
+    ) -> Result<ForwardingResolvedTarget, ProxyError> {
+        let route_method = if matches!(tunnel_mode, TunnelMode::Websocket) {
+            "GET"
+        } else {
+            method
+        };
+        let resolution_request = RouteResolutionRequest::new(
+            route_method,
+            path,
+            authority,
+            Some(sticky_cid_key),
+            header_lookup,
+        );
+        let ResolvedBackend { route, backend } =
+            match Self::resolve_backend_without_inflight_request(
+                &resolution_request,
+                upstream_pools,
+                upstream_policies,
+                routing_index,
+            ) {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    Self::observe_route_resolution_failure(
+                        &resolution_request,
+                        &err,
+                        metrics,
+                        elapsed,
+                    );
+                    return Err(err);
+                }
+            };
+        let ResolvedRoute {
+            upstream_name,
+            upstream_pool,
+            upstream_policy,
+            route_path_len,
+            route_host_specific,
+            route_reason,
+        } = route;
+        let SelectedBackend {
+            backend_addr,
+            backend_index,
+            backend_lb,
+        } = backend;
+
+        Ok(ForwardingResolvedTarget {
+            upstream_name,
+            upstream_pool,
+            upstream_policy,
+            route_path_len,
+            route_host_specific,
+            route_reason: format!("{route_reason:?}"),
+            backend_addr,
+            backend_index,
+            backend_lb,
+        })
+    }
+
+    pub(in crate::quic_listener) fn resolve_bootstrap_target(
+        input: BootstrapResolutionInput<'_>,
+    ) -> Result<BootstrapResolvedTarget, ProxyError> {
+        let BootstrapResolutionInput {
+            method,
+            path,
+            authority,
+            header_lookup,
+            routing_index,
+            upstream_pools,
+            upstream_policies,
+            metrics,
+            elapsed,
+        } = input;
+        let resolution_request =
+            RouteResolutionRequest::new(method, path, authority, None, header_lookup);
+        let ResolvedBackend { route, backend } = match Self::resolve_backend_internal(
+            &resolution_request,
+            upstream_pools,
+            upstream_policies,
+            routing_index,
+            true,
+        ) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                Self::observe_route_resolution_failure(&resolution_request, &err, metrics, elapsed);
+                return Err(err);
+            }
+        };
+
+        Ok(BootstrapResolvedTarget {
+            upstream_name: route.upstream_name,
+            upstream_policy: route.upstream_policy,
+            backend_addr: backend.backend_addr,
+        })
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn resolve_route_target(
+        request: &RouteResolutionRequest<'_>,
+        upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        upstream_policies: &HashMap<String, RuntimeUpstreamPolicy>,
+        routing_index: &RouteIndex,
+    ) -> Result<ResolvedRoute, ProxyError> {
+        if request.method.is_empty() || request.path.is_empty() {
             return Err(ProxyError::Transport("empty method or path".into()));
         }
 
         let route_decision = routing_index
-            .lookup_with_decision_for_method(path, authority, Some(method))
-            .ok_or_else(|| ProxyError::Transport(format!("no route for {path}")))?;
+            .lookup_with_decision_for_method(request.path, request.authority, Some(request.method))
+            .ok_or_else(|| ProxyError::Transport(format!("no route for {}", request.path)))?;
         let upstream_name = route_decision.upstream.to_string();
         let upstream_pool = upstream_pools
             .get(route_decision.upstream)
             .ok_or_else(|| ProxyError::Transport(format!("pool not found: {upstream_name}")))?
             .clone();
+        let upstream_policy = upstream_policies
+            .get(route_decision.upstream)
+            .cloned()
+            .unwrap_or_default();
 
-        Ok((
+        Ok(ResolvedRoute {
             upstream_name,
             upstream_pool,
-            route_decision.matched_path_len,
-            route_decision.host_specific,
-            route_decision.reason,
-        ))
+            upstream_policy,
+            route_path_len: route_decision.matched_path_len,
+            route_host_specific: route_decision.host_specific,
+            route_reason: route_decision.reason,
+        })
+    }
+
+    fn build_backend_selection_plan(
+        request: &RouteResolutionRequest<'_>,
+        pool: &UpstreamPool,
+    ) -> BackendSelectionPlan {
+        let lb_type = pool.lb_name().to_string();
+        let lb_key = Self::resolve_lb_request_key(
+            &lb_type,
+            pool.lb_key(),
+            request.method,
+            request.path,
+            request.authority,
+            request.cid_key,
+            request.header_lookup,
+        );
+        BackendSelectionPlan { lb_type, lb_key }
+    }
+
+    fn no_servers_in_upstream_error() -> ProxyError {
+        ProxyError::Transport("no servers in upstream".into())
+    }
+
+    fn no_healthy_servers_error(pool: &UpstreamPool) -> ProxyError {
+        let total = pool.pool.len();
+        let healthy = pool.pool.healthy_len();
+        error!(
+            "no healthy backends available: {}/{} backends healthy",
+            healthy, total
+        );
+        ProxyError::Transport("no healthy servers".into())
+    }
+
+    fn select_backend_readonly(
+        pool: &UpstreamPool,
+        plan: &BackendSelectionPlan,
+        begin_request: bool,
+    ) -> Option<SelectedBackend> {
+        if pool.pool.readmit_due() {
+            return None;
+        }
+
+        pool.pick_readonly(plan.lb_key.as_str())
+            .and_then(|idx| pool.pool.address(idx).map(|addr| (idx, addr.to_string())))
+            .and_then(|(idx, addr)| {
+                (!begin_request || pool.begin_request_if_healthy(idx)).then_some(SelectedBackend {
+                    backend_addr: addr,
+                    backend_index: idx,
+                    backend_lb: plan.lb_type.clone(),
+                })
+            })
+    }
+
+    fn select_backend_with_write_lock(
+        pool: &mut UpstreamPool,
+        plan: &BackendSelectionPlan,
+        begin_request: bool,
+    ) -> Result<SelectedBackend, ProxyError> {
+        let idx = if begin_request {
+            pool.pick(plan.lb_key.as_str())
+        } else {
+            pool.pick_without_begin(plan.lb_key.as_str())
+        }
+        .ok_or_else(|| Self::no_healthy_servers_error(pool))?;
+        let backend_addr = pool
+            .pool
+            .address(idx)
+            .map(str::to_string)
+            .ok_or_else(|| ProxyError::Transport("invalid server address".into()))?;
+        Ok(SelectedBackend {
+            backend_addr,
+            backend_index: idx,
+            backend_lb: plan.lb_type.clone(),
+        })
     }
 
     fn select_backend_from_pool(
-        method: &str,
-        path: &str,
-        authority: Option<&str>,
-        cid_key: Option<&str>,
+        request: &RouteResolutionRequest<'_>,
         upstream_pool: &Arc<RwLock<UpstreamPool>>,
-        header_lookup: Option<&LbHeaderLookup<'_>>,
         begin_request: bool,
-    ) -> Result<(usize, String, String), ProxyError> {
-        let (backend_index, lb_type, backend_addr) = {
-            let (read_lb_type, read_fast_selected) = {
-                let pool = upstream_pool
-                    .read()
-                    .map_err(|_| ProxyError::Transport("upstream pool lock poisoned".into()))?;
-                if pool.pool.is_empty() {
-                    return Err(ProxyError::Transport("no servers in upstream".into()));
-                }
-                let lb_type = pool.lb_name();
-                let key = Self::resolve_lb_request_key(
-                    lb_type,
-                    pool.lb_key(),
-                    method,
-                    path,
-                    authority,
-                    cid_key,
-                    header_lookup,
-                );
-                let fast_selected = if pool.pool.readmit_due() {
-                    None
-                } else {
-                    pool.pick_readonly(key.as_str())
-                        .and_then(|idx| pool.pool.address(idx).map(|addr| (idx, addr.to_string())))
-                        .and_then(|(idx, addr)| {
-                            (!begin_request || pool.begin_request_if_healthy(idx))
-                                .then_some((idx, addr))
-                        })
-                };
-                (lb_type, fast_selected)
-            };
-
-            if let Some((idx, addr)) = read_fast_selected {
-                (idx, read_lb_type, addr)
-            } else {
-                let mut pool = upstream_pool
-                    .write()
-                    .map_err(|_| ProxyError::Transport("upstream pool lock poisoned".into()))?;
-                if pool.pool.is_empty() {
-                    return Err(ProxyError::Transport("no servers in upstream".into()));
-                }
-                let lb_type = pool.lb_name();
-                let key = Self::resolve_lb_request_key(
-                    lb_type,
-                    pool.lb_key(),
-                    method,
-                    path,
-                    authority,
-                    cid_key,
-                    header_lookup,
-                );
-                let idx = if begin_request {
-                    pool.pick(key.as_str())
-                } else {
-                    pool.pick_without_begin(key.as_str())
-                }
-                .ok_or_else(|| {
-                    let total = pool.pool.len();
-                    let healthy = pool.pool.healthy_len();
-                    error!(
-                        "no healthy backends available: {}/{} backends healthy",
-                        healthy, total
-                    );
-                    ProxyError::Transport("no healthy servers".into())
-                })?;
-                let backend_addr = pool
-                    .pool
-                    .address(idx)
-                    .map(str::to_string)
-                    .ok_or_else(|| ProxyError::Transport("invalid server address".into()))?;
-                (idx, lb_type, backend_addr)
+    ) -> Result<SelectedBackend, ProxyError> {
+        {
+            let pool = upstream_pool
+                .read()
+                .map_err(|_| ProxyError::Transport("upstream pool lock poisoned".into()))?;
+            if pool.pool.is_empty() {
+                return Err(Self::no_servers_in_upstream_error());
             }
-        };
+            let plan = Self::build_backend_selection_plan(request, &pool);
+            if let Some(selected) = Self::select_backend_readonly(&pool, &plan, begin_request) {
+                return Ok(selected);
+            }
+        }
 
-        Ok((backend_index, lb_type.to_string(), backend_addr))
+        let mut pool = upstream_pool
+            .write()
+            .map_err(|_| ProxyError::Transport("upstream pool lock poisoned".into()))?;
+        if pool.pool.is_empty() {
+            return Err(Self::no_servers_in_upstream_error());
+        }
+        let plan = Self::build_backend_selection_plan(request, &pool);
+        Self::select_backend_with_write_lock(&mut pool, &plan, begin_request)
     }
 
     fn log_backend_selection(
+        request: &RouteResolutionRequest<'_>,
         backend_addr: &str,
         lb_type: &str,
         upstream_name: &str,
@@ -145,91 +431,70 @@ impl QUICListener {
         route_reason: &RouteDecisionReason,
     ) {
         debug!(
-            "Selected backend {} via {} route={} path_len={} host_specific={} reason={:?}",
-            backend_addr, lb_type, upstream_name, route_path_len, route_host_specific, route_reason
+            "Resolved backend method={} path={} authority={} route={} backend={} via={} path_len={} host_specific={} reason={:?}",
+            request.method,
+            request.path,
+            request.authority.unwrap_or("-"),
+            upstream_name,
+            backend_addr,
+            lb_type,
+            route_path_len,
+            route_host_specific,
+            route_reason
         );
     }
 
-    pub(super) fn resolve_backend_without_inflight(
-        method: &str,
-        path: &str,
-        authority: Option<&str>,
-        cid_key: Option<&str>,
+    fn resolve_backend_internal(
+        request: &RouteResolutionRequest<'_>,
         upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        upstream_policies: &HashMap<String, RuntimeUpstreamPolicy>,
         routing_index: &RouteIndex,
-        header_lookup: Option<&LbHeaderLookup<'_>>,
+        begin_request: bool,
     ) -> Result<ResolvedBackend, ProxyError> {
-        let (upstream_name, upstream_pool, route_path_len, route_host_specific, route_reason) =
-            Self::resolve_route_target(method, path, authority, upstream_pools, routing_index)?;
-        let (backend_index, backend_lb, backend_addr) = Self::select_backend_from_pool(
-            method,
-            path,
-            authority,
-            cid_key,
-            &upstream_pool,
-            header_lookup,
+        let route =
+            Self::resolve_route_target(request, upstream_pools, upstream_policies, routing_index)?;
+        let backend = Self::select_backend_from_pool(request, &route.upstream_pool, begin_request)?;
+
+        Self::log_backend_selection(
+            request,
+            &backend.backend_addr,
+            &backend.backend_lb,
+            &route.upstream_name,
+            route.route_path_len,
+            route.route_host_specific,
+            &route.route_reason,
+        );
+        Ok(ResolvedBackend { route, backend })
+    }
+
+    fn resolve_backend_without_inflight_request(
+        request: &RouteResolutionRequest<'_>,
+        upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        upstream_policies: &HashMap<String, RuntimeUpstreamPolicy>,
+        routing_index: &RouteIndex,
+    ) -> Result<ResolvedBackend, ProxyError> {
+        Self::resolve_backend_internal(
+            request,
+            upstream_pools,
+            upstream_policies,
+            routing_index,
             false,
-        )?;
-
-        Self::log_backend_selection(
-            &backend_addr,
-            &backend_lb,
-            &upstream_name,
-            route_path_len,
-            route_host_specific,
-            &route_reason,
-        );
-        Ok(ResolvedBackend {
-            upstream_name,
-            backend_addr,
-            backend_index,
-            upstream_pool,
-            backend_lb,
-            route_path_len,
-            route_host_specific,
-            route_reason,
-        })
+        )
     }
 
-    /// Resolve routing + LB for a request, returning `(backend_addr, backend_index, pool)`.
-    pub(crate) fn resolve_backend(
-        method: &str,
-        path: &str,
-        authority: Option<&str>,
-        cid_key: Option<&str>,
+    #[cfg(test)]
+    pub(in crate::quic_listener) fn resolve_backend_request_for_test(
+        request: &RouteResolutionRequest<'_>,
         upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        upstream_policies: &HashMap<String, RuntimeUpstreamPolicy>,
         routing_index: &RouteIndex,
-        header_lookup: Option<&LbHeaderLookup<'_>>,
     ) -> Result<ResolvedBackend, ProxyError> {
-        let (upstream_name, upstream_pool, route_path_len, route_host_specific, route_reason) =
-            Self::resolve_route_target(method, path, authority, upstream_pools, routing_index)?;
-        let (backend_index, backend_lb, backend_addr) = Self::select_backend_from_pool(
-            method,
-            path,
-            authority,
-            cid_key,
-            &upstream_pool,
-            header_lookup,
+        Self::resolve_backend_internal(
+            request,
+            upstream_pools,
+            upstream_policies,
+            routing_index,
             true,
-        )?;
-
-        Self::log_backend_selection(
-            &backend_addr,
-            &backend_lb,
-            &upstream_name,
-            route_path_len,
-            route_host_specific,
-            &route_reason,
-        );
-        Ok(ResolvedBackend {
-            upstream_name,
-            backend_addr,
-            backend_index,
-            upstream_pool,
-            backend_lb,
-            route_path_len,
-            route_host_specific,
-            route_reason,
-        })
+        )
     }
 }

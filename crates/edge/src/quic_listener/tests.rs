@@ -740,6 +740,7 @@ fn build_shared_state_separates_backend_identity_from_resolution_state() {
 
 type TestRoutingContext = (
     HashMap<String, Arc<RwLock<super::UpstreamPool>>>,
+    HashMap<String, spooky_config::runtime::RuntimeUpstreamPolicy>,
     super::RouteIndex,
     Arc<RwLock<super::UpstreamPool>>,
 );
@@ -753,26 +754,36 @@ fn test_routing_context(lb_type: &str) -> TestRoutingContext {
     let pool = Arc::new(RwLock::new(pool));
     let mut upstream_pools = HashMap::new();
     upstream_pools.insert("api_pool".to_string(), Arc::clone(&pool));
-    (upstream_pools, routing_index, pool)
+    let mut upstream_policies = HashMap::new();
+    upstream_policies.insert(
+        "api_pool".to_string(),
+        spooky_config::runtime::RuntimeUpstreamPolicy::default(),
+    );
+    (upstream_pools, upstream_policies, routing_index, pool)
 }
 
 #[test]
 fn resolve_backend_round_robin_is_not_pinned_to_first_backend() {
-    let (upstream_pools, routing_index, _pool) = test_routing_context("round-robin");
+    let (upstream_pools, upstream_policies, routing_index, _pool) =
+        test_routing_context("round-robin");
 
     let mut picks = Vec::new();
     for _ in 0..4 {
-        let resolved = super::QUICListener::resolve_backend(
+        let request = super::forwarding::TestRouteResolutionRequest::new(
             "GET",
             "/api/items",
             None,
             None,
-            &upstream_pools,
-            &routing_index,
             None,
+        );
+        let resolved = super::QUICListener::resolve_backend_request_for_test(
+            &request,
+            &upstream_pools,
+            &upstream_policies,
+            &routing_index,
         )
         .expect("resolve backend");
-        picks.push(resolved.backend_addr);
+        picks.push(resolved.backend.backend_addr);
     }
 
     assert!(
@@ -785,7 +796,8 @@ fn resolve_backend_round_robin_is_not_pinned_to_first_backend() {
 
 #[test]
 fn resolve_backend_skips_unhealthy_backends() {
-    let (upstream_pools, routing_index, pool) = test_routing_context("round-robin");
+    let (upstream_pools, upstream_policies, routing_index, pool) =
+        test_routing_context("round-robin");
     {
         let mut guard = pool.write().expect("pool write");
         guard.pool.mark_failure(0);
@@ -793,45 +805,44 @@ fn resolve_backend_skips_unhealthy_backends() {
         guard.pool.mark_failure(0);
     }
 
-    let resolved = super::QUICListener::resolve_backend(
-        "GET",
-        "/api/items",
-        None,
-        None,
+    let request =
+        super::forwarding::TestRouteResolutionRequest::new("GET", "/api/items", None, None, None);
+    let resolved = super::QUICListener::resolve_backend_request_for_test(
+        &request,
         &upstream_pools,
+        &upstream_policies,
         &routing_index,
-        None,
     )
     .expect("resolve backend");
 
     assert_eq!(
-        resolved.backend_addr, "127.0.0.1:7002",
+        resolved.backend.backend_addr, "127.0.0.1:7002",
         "unhealthy backend must be excluded from bootstrap backend selection"
     );
 }
 
 #[test]
 fn resolve_backend_respects_least_connections_strategy() {
-    let (upstream_pools, routing_index, pool) = test_routing_context("least-connections");
+    let (upstream_pools, upstream_policies, routing_index, pool) =
+        test_routing_context("least-connections");
     {
         let guard = pool.read().expect("pool read");
         guard.pool.begin_request(0);
         guard.pool.begin_request(0);
     }
 
-    let resolved = super::QUICListener::resolve_backend(
-        "GET",
-        "/api/items",
-        None,
-        None,
+    let request =
+        super::forwarding::TestRouteResolutionRequest::new("GET", "/api/items", None, None, None);
+    let resolved = super::QUICListener::resolve_backend_request_for_test(
+        &request,
         &upstream_pools,
+        &upstream_policies,
         &routing_index,
-        None,
     )
     .expect("resolve backend");
 
     assert_eq!(
-        resolved.backend_addr, "127.0.0.1:7002",
+        resolved.backend.backend_addr, "127.0.0.1:7002",
         "least-connections should prefer lower in-flight backend in bootstrap selection"
     );
 }
@@ -854,40 +865,43 @@ fn resolve_backend_prefers_method_specific_route() {
 
     let routing_index = super::RouteIndex::from_upstreams(&upstreams);
     let mut upstream_pools = HashMap::new();
+    let mut upstream_policies = HashMap::new();
     for (name, upstream) in &upstreams {
         let pool = super::UpstreamPool::from_upstream(upstream).expect("pool");
         upstream_pools.insert(name.clone(), Arc::new(RwLock::new(pool)));
+        upstream_policies.insert(
+            name.clone(),
+            spooky_config::runtime::RuntimeUpstreamPolicy::default(),
+        );
     }
 
-    let resolved = super::QUICListener::resolve_backend(
-        "GET",
-        "/api/items",
-        None,
-        None,
+    let request =
+        super::forwarding::TestRouteResolutionRequest::new("GET", "/api/items", None, None, None);
+    let resolved = super::QUICListener::resolve_backend_request_for_test(
+        &request,
         &upstream_pools,
+        &upstream_policies,
         &routing_index,
-        None,
     )
     .expect("GET resolve");
-    assert_eq!(resolved.upstream_name, "all_methods");
+    assert_eq!(resolved.route.upstream_name, "all_methods");
 
-    let resolved = super::QUICListener::resolve_backend(
-        "POST",
-        "/api/items",
-        None,
-        None,
+    let request =
+        super::forwarding::TestRouteResolutionRequest::new("POST", "/api/items", None, None, None);
+    let resolved = super::QUICListener::resolve_backend_request_for_test(
+        &request,
         &upstream_pools,
+        &upstream_policies,
         &routing_index,
-        None,
     )
     .expect("POST resolve");
-    assert_eq!(resolved.upstream_name, "post_only");
-    assert_eq!(resolved.backend_addr, "127.0.0.1:7010");
+    assert_eq!(resolved.route.upstream_name, "post_only");
+    assert_eq!(resolved.backend.backend_addr, "127.0.0.1:7010");
 }
 
 #[test]
 fn resolve_backend_uses_configured_header_lb_key() {
-    let (upstream_pools, routing_index, _pool) = {
+    let (upstream_pools, upstream_policies, routing_index, _pool) = {
         let mut upstreams = HashMap::new();
         upstreams.insert(
             "api_pool".to_string(),
@@ -899,7 +913,12 @@ fn resolve_backend_uses_configured_header_lb_key() {
         let pool = Arc::new(RwLock::new(pool));
         let mut upstream_pools = HashMap::new();
         upstream_pools.insert("api_pool".to_string(), Arc::clone(&pool));
-        (upstream_pools, routing_index, pool)
+        let mut upstream_policies = HashMap::new();
+        upstream_policies.insert(
+            "api_pool".to_string(),
+            spooky_config::runtime::RuntimeUpstreamPolicy::default(),
+        );
+        (upstream_pools, upstream_policies, routing_index, pool)
     };
 
     let header_lookup = |name: &str| {
@@ -910,29 +929,37 @@ fn resolve_backend_uses_configured_header_lb_key() {
         }
     };
 
-    let first = super::QUICListener::resolve_backend(
+    let first_request = super::forwarding::TestRouteResolutionRequest::new(
         "GET",
         "/api/items",
         None,
         None,
-        &upstream_pools,
-        &routing_index,
         Some(&header_lookup),
+    );
+    let first = super::QUICListener::resolve_backend_request_for_test(
+        &first_request,
+        &upstream_pools,
+        &upstream_policies,
+        &routing_index,
     )
     .expect("first resolve");
-    let second = super::QUICListener::resolve_backend(
+    let second_request = super::forwarding::TestRouteResolutionRequest::new(
         "GET",
         "/api/items",
         None,
         None,
-        &upstream_pools,
-        &routing_index,
         Some(&header_lookup),
+    );
+    let second = super::QUICListener::resolve_backend_request_for_test(
+        &second_request,
+        &upstream_pools,
+        &upstream_policies,
+        &routing_index,
     )
     .expect("second resolve");
 
     assert_eq!(
-        first.backend_addr, second.backend_addr,
+        first.backend.backend_addr, second.backend.backend_addr,
         "consistent-hash should remain stable when configured header key is constant"
     );
 }

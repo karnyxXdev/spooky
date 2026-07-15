@@ -1,6 +1,6 @@
 use spooky_config::runtime::RuntimeUpstreamPolicy;
 
-use super::*;
+use super::{lb_key::ResolvedLbKey, *};
 
 pub(in crate::quic_listener) struct RouteResolutionRequest<'a> {
     pub(in crate::quic_listener) method: &'a str,
@@ -324,15 +324,10 @@ impl QUICListener {
         pool: &UpstreamPool,
     ) -> BackendSelectionPlan {
         let lb_type = pool.lb_name().to_string();
-        let lb_key = Self::resolve_lb_request_key(
-            &lb_type,
-            pool.lb_key(),
-            request.method,
-            request.path,
-            request.authority,
-            request.cid_key,
-            request.header_lookup,
-        );
+        let ResolvedLbKey {
+            value: lb_key,
+            source: _lb_key_source,
+        } = Self::resolve_lb_key_for_route_request(&lb_type, pool.lb_key(), request);
         BackendSelectionPlan { lb_type, lb_key }
     }
 

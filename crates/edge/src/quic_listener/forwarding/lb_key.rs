@@ -1,5 +1,62 @@
 use super::*;
 
+struct LbKeyRequestParts<'a> {
+    method: &'a str,
+    path: &'a str,
+    authority: Option<&'a str>,
+    cid_key: Option<&'a str>,
+    client_addr: Option<SocketAddr>,
+    header_lookup: Option<&'a LbHeaderLookup<'a>>,
+}
+
+impl<'a> LbKeyRequestParts<'a> {
+    fn new(
+        method: &'a str,
+        path: &'a str,
+        authority: Option<&'a str>,
+        cid_key: Option<&'a str>,
+        client_addr: Option<SocketAddr>,
+        header_lookup: Option<&'a LbHeaderLookup<'a>>,
+    ) -> Self {
+        Self {
+            method,
+            path,
+            authority,
+            cid_key,
+            client_addr,
+            header_lookup,
+        }
+    }
+}
+
+struct LbKeyResolutionInput<'a> {
+    lb_type: &'a str,
+    lb_key_spec: Option<&'a str>,
+    request: LbKeyRequestParts<'a>,
+}
+
+impl<'a> LbKeyResolutionInput<'a> {
+    fn new(lb_type: &'a str, lb_key_spec: Option<&'a str>, request: LbKeyRequestParts<'a>) -> Self {
+        Self {
+            lb_type,
+            lb_key_spec,
+            request,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LbKeySource {
+    ConfiguredSpec,
+    StickyCidFallback,
+    DefaultFallback,
+}
+
+pub(super) struct ResolvedLbKey {
+    pub(super) value: String,
+    pub(super) source: LbKeySource,
+}
+
 fn extract_cookie_value(cookie_header: &str, cookie_name: &str) -> Option<String> {
     for pair in cookie_header.split(';') {
         let part = pair.trim();
@@ -34,14 +91,42 @@ fn extract_query_param(path: &str, param: &str) -> Option<String> {
 }
 
 impl QUICListener {
-    pub(super) fn resolve_lb_key_from_spec(
-        lb_key_spec: &str,
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::quic_listener::forwarding) fn resolve_lb_key(
+        lb_type: &str,
+        lb_key_spec: Option<&str>,
         method: &str,
         path: &str,
         authority: Option<&str>,
         cid_key: Option<&str>,
         client_addr: Option<SocketAddr>,
         header_lookup: Option<&LbHeaderLookup<'_>>,
+    ) -> ResolvedLbKey {
+        let request =
+            LbKeyRequestParts::new(method, path, authority, cid_key, client_addr, header_lookup);
+        Self::resolve_lb_key_for_input(&LbKeyResolutionInput::new(lb_type, lb_key_spec, request))
+    }
+
+    pub(in crate::quic_listener::forwarding) fn resolve_lb_key_for_route_request(
+        lb_type: &str,
+        lb_key_spec: Option<&str>,
+        request: &super::resolve::RouteResolutionRequest<'_>,
+    ) -> ResolvedLbKey {
+        Self::resolve_lb_key(
+            lb_type,
+            lb_key_spec,
+            request.method,
+            request.path,
+            request.authority,
+            request.cid_key,
+            None,
+            request.header_lookup,
+        )
+    }
+
+    fn resolve_lb_key_from_parts(
+        lb_key_spec: &str,
+        request: &LbKeyRequestParts<'_>,
     ) -> Option<String> {
         let spec = lb_key_spec.trim();
         if spec.is_empty() {
@@ -49,24 +134,29 @@ impl QUICListener {
         }
 
         if spec.eq_ignore_ascii_case("path") {
-            let path_only = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+            let path_only = request
+                .path
+                .split_once('?')
+                .map(|(p, _)| p)
+                .unwrap_or(request.path);
             return Some(path_only.to_string());
         }
         if spec.eq_ignore_ascii_case("authority") {
-            return authority.map(str::to_string);
+            return request.authority.map(str::to_string);
         }
         if spec.eq_ignore_ascii_case("method") {
-            return Some(method.to_string());
+            return Some(request.method.to_string());
         }
         if spec.eq_ignore_ascii_case("cid") || spec.eq_ignore_ascii_case("sticky-cid") {
-            return cid_key.map(str::to_string);
+            return request.cid_key.map(str::to_string);
         }
         if spec.eq_ignore_ascii_case("peer_ip") || spec.eq_ignore_ascii_case("client_ip") {
-            return client_addr.map(|addr| addr.ip().to_string());
+            return request.client_addr.map(|addr| addr.ip().to_string());
         }
         if spec.eq_ignore_ascii_case("bearer_token") {
-            let raw =
-                header_lookup.and_then(|lookup| lookup(http::header::AUTHORIZATION.as_str()))?;
+            let raw = request
+                .header_lookup
+                .and_then(|lookup| lookup(http::header::AUTHORIZATION.as_str()))?;
             return Self::bearer_token_from_authorization_value(&raw);
         }
 
@@ -77,68 +167,65 @@ impl QUICListener {
         }
 
         if source.eq_ignore_ascii_case("header") {
-            return header_lookup.and_then(|lookup| lookup(key_name));
+            return request.header_lookup.and_then(|lookup| lookup(key_name));
         }
 
         if source.eq_ignore_ascii_case("cookie") {
-            let cookie_header =
-                header_lookup.and_then(|lookup| lookup(http::header::COOKIE.as_str()))?;
+            let cookie_header = request
+                .header_lookup
+                .and_then(|lookup| lookup(http::header::COOKIE.as_str()))?;
             return extract_cookie_value(cookie_header.as_str(), key_name);
         }
 
         if source.eq_ignore_ascii_case("query") {
-            return extract_query_param(path, key_name);
+            return extract_query_param(request.path, key_name);
         }
 
         None
     }
 
-    pub(super) fn default_lb_request_key(
-        method: &str,
-        path: &str,
-        authority: Option<&str>,
-    ) -> String {
-        authority
-            .unwrap_or(if !path.is_empty() { path } else { method })
+    fn default_lb_request_key_for_parts(request: &LbKeyRequestParts<'_>) -> String {
+        request
+            .authority
+            .unwrap_or(if !request.path.is_empty() {
+                request.path
+            } else {
+                request.method
+            })
             .to_string()
     }
 
-    pub(super) fn resolve_lb_request_key(
-        lb_type: &str,
-        lb_key_spec: Option<&str>,
-        method: &str,
-        path: &str,
-        authority: Option<&str>,
-        cid_key: Option<&str>,
-        header_lookup: Option<&LbHeaderLookup<'_>>,
-    ) -> String {
-        let default_key = Self::default_lb_request_key(method, path, authority);
+    fn resolve_lb_key_for_input(input: &LbKeyResolutionInput<'_>) -> ResolvedLbKey {
+        let default_key = Self::default_lb_request_key_for_parts(&input.request);
 
-        if let Some(spec) = lb_key_spec
-            && let Some(value) = Self::resolve_lb_key_from_spec(
-                spec,
-                method,
-                path,
-                authority,
-                cid_key,
-                None,
-                header_lookup,
-            )
+        if let Some(spec) = input.lb_key_spec
+            && let Some(value) = Self::resolve_lb_key_from_parts(spec, &input.request)
             && !value.is_empty()
         {
-            return value;
+            return ResolvedLbKey {
+                value,
+                source: LbKeySource::ConfiguredSpec,
+            };
         }
 
-        if lb_type == "sticky-cid"
-            && let Some(cid_key) = cid_key
+        if input.lb_type == "sticky-cid"
+            && let Some(cid_key) = input.request.cid_key
         {
-            return cid_key.to_string();
+            return ResolvedLbKey {
+                value: cid_key.to_string(),
+                source: LbKeySource::StickyCidFallback,
+            };
         }
 
-        default_key
+        ResolvedLbKey {
+            value: default_key,
+            source: LbKeySource::DefaultFallback,
+        }
     }
 
-    pub(super) fn bearer_token_from_authorization_value(raw: &str) -> Option<String> {
+    pub(in crate::quic_listener) fn bearer_token_from_authorization_value(
+        raw: &str,
+    ) -> Option<String> {
         let raw = raw.trim();
         let split = raw.find(char::is_whitespace)?;
         let (scheme, rest) = raw.split_at(split);

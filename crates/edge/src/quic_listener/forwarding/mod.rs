@@ -9,9 +9,7 @@ mod stream_progress;
 use std::convert::Infallible;
 
 use spooky_config::config::ScopedRateLimitScope;
-use spooky_errors::{
-    UpstreamErrorCategory, UpstreamErrorClassification, UpstreamErrorDetails, UpstreamTlsReason,
-};
+use spooky_errors::{UpstreamErrorClassification, UpstreamErrorDetails};
 
 use self::prepare::{PreparedRequest, StartedAuthRequest};
 pub(in crate::quic_listener) use self::resolve::BootstrapResolutionInput;
@@ -99,31 +97,6 @@ impl QUICListener {
         let details = UpstreamErrorDetails::from_error_chain(err, err.is_connect());
         let classification = details.classify();
         (details, classification)
-    }
-
-    pub(crate) fn upstream_error_health_failure_reason(
-        classification: UpstreamErrorClassification,
-    ) -> (HealthFailureReason, &'static str) {
-        match classification.category {
-            UpstreamErrorCategory::Timeout => (HealthFailureReason::Timeout, "timeout"),
-            UpstreamErrorCategory::Transport => (HealthFailureReason::Transport, "transport"),
-            UpstreamErrorCategory::Tls => (
-                HealthFailureReason::Tls,
-                match classification
-                    .tls_reason
-                    .unwrap_or(UpstreamTlsReason::Handshake)
-                {
-                    UpstreamTlsReason::UnknownIssuer => "unknown_issuer",
-                    UpstreamTlsReason::ExpiredCertificate => "expired_certificate",
-                    UpstreamTlsReason::HostnameMismatch => "hostname_mismatch",
-                    UpstreamTlsReason::Alpn => "alpn",
-                    UpstreamTlsReason::Handshake => "handshake",
-                },
-            ),
-            UpstreamErrorCategory::Protocol | UpstreamErrorCategory::Internal => {
-                (HealthFailureReason::Transport, "transport")
-            }
-        }
     }
 
     fn is_internal_pool_control_error(error: &PoolError) -> bool {

@@ -1,5 +1,7 @@
 use std::error::Error as StdError;
 
+use spooky_lb::health::HealthFailureReason;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpstreamErrorDetails {
     pub detail: String,
@@ -91,6 +93,12 @@ pub struct UpstreamErrorClassification {
     pub tls_reason: Option<UpstreamTlsReason>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UpstreamHealthFailureMapping {
+    pub failure_reason: HealthFailureReason,
+    pub metrics_reason: &'static str,
+}
+
 impl UpstreamErrorClassification {
     pub const fn timeout() -> Self {
         Self {
@@ -125,5 +133,67 @@ impl UpstreamErrorClassification {
             category: UpstreamErrorCategory::Internal,
             tls_reason: None,
         }
+    }
+
+    pub fn health_failure_mapping(self) -> UpstreamHealthFailureMapping {
+        match self.category {
+            UpstreamErrorCategory::Timeout => UpstreamHealthFailureMapping {
+                failure_reason: HealthFailureReason::Timeout,
+                metrics_reason: "timeout",
+            },
+            UpstreamErrorCategory::Transport => UpstreamHealthFailureMapping {
+                failure_reason: HealthFailureReason::Transport,
+                metrics_reason: "transport",
+            },
+            UpstreamErrorCategory::Tls => UpstreamHealthFailureMapping {
+                failure_reason: HealthFailureReason::Tls,
+                metrics_reason: match self.tls_reason.unwrap_or(UpstreamTlsReason::Handshake) {
+                    UpstreamTlsReason::UnknownIssuer => "unknown_issuer",
+                    UpstreamTlsReason::ExpiredCertificate => "expired_certificate",
+                    UpstreamTlsReason::HostnameMismatch => "hostname_mismatch",
+                    UpstreamTlsReason::Alpn => "alpn",
+                    UpstreamTlsReason::Handshake => "handshake",
+                },
+            },
+            UpstreamErrorCategory::Protocol | UpstreamErrorCategory::Internal => {
+                UpstreamHealthFailureMapping {
+                    failure_reason: HealthFailureReason::Transport,
+                    metrics_reason: "transport",
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use spooky_lb::health::HealthFailureReason;
+
+    use super::{UpstreamErrorClassification, UpstreamHealthFailureMapping, UpstreamTlsReason};
+
+    #[test]
+    fn health_failure_mapping_preserves_tls_and_transport_reasoning() {
+        assert_eq!(
+            UpstreamErrorClassification::timeout().health_failure_mapping(),
+            UpstreamHealthFailureMapping {
+                failure_reason: HealthFailureReason::Timeout,
+                metrics_reason: "timeout",
+            }
+        );
+        assert_eq!(
+            UpstreamErrorClassification::tls(UpstreamTlsReason::UnknownIssuer)
+                .health_failure_mapping(),
+            UpstreamHealthFailureMapping {
+                failure_reason: HealthFailureReason::Tls,
+                metrics_reason: "unknown_issuer",
+            }
+        );
+        assert_eq!(
+            UpstreamErrorClassification::protocol().health_failure_mapping(),
+            UpstreamHealthFailureMapping {
+                failure_reason: HealthFailureReason::Transport,
+                metrics_reason: "transport",
+            }
+        );
     }
 }

@@ -9,6 +9,6 @@ pub use pool::PoolError;
 pub use proxy::ProxyError;
 pub use retry::is_retryable;
 pub use upstream::{
-    UpstreamErrorCategory, UpstreamErrorClassification, UpstreamErrorDetails, UpstreamTlsReason,
-    format_error_chain,
+    UpstreamErrorCategory, UpstreamErrorClassification, UpstreamErrorDetails,
+    UpstreamHealthFailureMapping, UpstreamTlsReason, format_error_chain,
 };

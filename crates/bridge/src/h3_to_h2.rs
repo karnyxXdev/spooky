@@ -114,6 +114,15 @@ mod tests {
         },
     };
 
+    #[derive(Clone, Copy)]
+    struct RequestInputMeta<'a> {
+        authority: Option<&'a str>,
+        content_length: Option<usize>,
+        request_id: u64,
+        traceparent: Option<&'a str>,
+        client_addr: SocketAddr,
+    }
+
     fn request_target<'a>(
         endpoint: &'a BackendEndpoint,
         host_policy: &'a UpstreamHostPolicy,
@@ -131,28 +140,26 @@ mod tests {
     fn request_input<'a>(
         method: &'a str,
         path: &'a str,
-        authority: Option<&'a str>,
         headers: &'a [Header],
-        content_length: Option<usize>,
-        request_id: u64,
-        traceparent: Option<&'a str>,
-        client_addr: SocketAddr,
+        meta: RequestInputMeta<'a>,
     ) -> RequestBuildInput<'a, BoxBody<Bytes, Infallible>> {
         RequestBuildInput {
             method,
             path,
-            authority,
+            authority: meta.authority,
             headers,
             body: Empty::<Bytes>::new().boxed(),
-            content_length,
+            content_length: meta.content_length,
             body_mode: RequestBuildInput::<BoxBody<Bytes, Infallible>>::body_mode_for_length(
-                content_length,
+                meta.content_length,
             ),
             trace: RequestTraceContext {
-                request_id,
-                traceparent,
+                request_id: meta.request_id,
+                traceparent: meta.traceparent,
             },
-            forwarded: RequestForwardedContext { client_addr },
+            forwarded: RequestForwardedContext {
+                client_addr: meta.client_addr,
+            },
         }
     }
 
@@ -161,8 +168,7 @@ mod tests {
         method: &str,
         path: &str,
         headers: &[Header],
-        authority: Option<&str>,
-        client_addr: SocketAddr,
+        meta: RequestInputMeta<'_>,
     ) -> Result<http::Request<BoxBody<Bytes, Infallible>>, BridgeError> {
         let endpoint = BackendEndpoint::parse(backend).map_err(|_| BridgeError::InvalidUri)?;
         build_h2_request_for_target(
@@ -171,7 +177,7 @@ mod tests {
                 &UpstreamHostPolicy::default(),
                 &ForwardedHeaderPolicy::default(),
             ),
-            request_input(method, path, authority, headers, None, 0, None, client_addr),
+            request_input(method, path, headers, meta),
         )
     }
 
@@ -182,12 +188,11 @@ mod tests {
         method: &str,
         path: &str,
         headers: &[Header],
-        authority: Option<&str>,
-        client_addr: SocketAddr,
+        meta: RequestInputMeta<'_>,
     ) -> Result<http::Request<BoxBody<Bytes, Infallible>>, BridgeError> {
         build_h2_request_for_target(
             request_target(endpoint, host_policy, forwarded_policy),
-            request_input(method, path, authority, headers, None, 0, None, client_addr),
+            request_input(method, path, headers, meta),
         )
     }
 
@@ -198,8 +203,13 @@ mod tests {
             "GET",
             "/health",
             &[],
-            Some("api.example.com"),
-            "203.0.113.10:44321".parse().expect("client"),
+            RequestInputMeta {
+                authority: Some("api.example.com"),
+                content_length: None,
+                request_id: 0,
+                traceparent: None,
+                client_addr: "203.0.113.10:44321".parse().expect("client"),
+            },
         )
         .expect("request");
 
@@ -223,8 +233,13 @@ mod tests {
             "GET",
             "/",
             &[],
-            None,
-            "198.51.100.3:5555".parse().expect("client"),
+            RequestInputMeta {
+                authority: None,
+                content_length: None,
+                request_id: 0,
+                traceparent: None,
+                client_addr: "198.51.100.3:5555".parse().expect("client"),
+            },
         )
         .expect("request");
 
@@ -242,8 +257,13 @@ mod tests {
             "GET",
             "/",
             &[],
-            None,
-            "127.0.0.1:12345".parse().expect("client"),
+            RequestInputMeta {
+                authority: None,
+                content_length: None,
+                request_id: 0,
+                traceparent: None,
+                client_addr: "127.0.0.1:12345".parse().expect("client"),
+            },
         )
         .expect_err("invalid backend endpoint should fail");
 
@@ -268,8 +288,13 @@ mod tests {
             "GET",
             "/",
             &headers,
-            Some("api.example.com"),
-            "203.0.113.55:43210".parse().expect("client"),
+            RequestInputMeta {
+                authority: Some("api.example.com"),
+                content_length: None,
+                request_id: 0,
+                traceparent: None,
+                client_addr: "203.0.113.55:43210".parse().expect("client"),
+            },
         )
         .expect("request");
 
@@ -317,8 +342,13 @@ mod tests {
             "GET",
             "/",
             &headers,
-            Some("api.example.com"),
-            "203.0.113.55:43210".parse().expect("client"),
+            RequestInputMeta {
+                authority: Some("api.example.com"),
+                content_length: None,
+                request_id: 0,
+                traceparent: None,
+                client_addr: "203.0.113.55:43210".parse().expect("client"),
+            },
         )
         .expect("append request");
 
@@ -357,8 +387,13 @@ mod tests {
             "GET",
             "/",
             &headers,
-            Some("api.example.com"),
-            "203.0.113.55:43210".parse().expect("client"),
+            RequestInputMeta {
+                authority: Some("api.example.com"),
+                content_length: None,
+                request_id: 0,
+                traceparent: None,
+                client_addr: "203.0.113.55:43210".parse().expect("client"),
+            },
         )
         .expect("preserve request");
 
@@ -393,8 +428,13 @@ mod tests {
             "GET",
             "/",
             &[],
-            Some("api.example.com"),
-            "[2001:db8::1]:4444".parse().expect("client"),
+            RequestInputMeta {
+                authority: Some("api.example.com"),
+                content_length: None,
+                request_id: 0,
+                traceparent: None,
+                client_addr: "[2001:db8::1]:4444".parse().expect("client"),
+            },
         )
         .expect("request");
 
@@ -418,8 +458,13 @@ mod tests {
             "GET",
             "/",
             &[],
-            Some("api.example.com"),
-            "203.0.113.10:44321".parse().expect("client"),
+            RequestInputMeta {
+                authority: Some("api.example.com"),
+                content_length: None,
+                request_id: 0,
+                traceparent: None,
+                client_addr: "203.0.113.10:44321".parse().expect("client"),
+            },
         )
         .expect("request");
 
@@ -449,8 +494,13 @@ mod tests {
             "GET",
             "/",
             &[],
-            Some("api.example.com"),
-            "203.0.113.10:44321".parse().expect("client"),
+            RequestInputMeta {
+                authority: Some("api.example.com"),
+                content_length: None,
+                request_id: 0,
+                traceparent: None,
+                client_addr: "203.0.113.10:44321".parse().expect("client"),
+            },
         )
         .expect("request");
 
@@ -467,8 +517,13 @@ mod tests {
             "CONNECT",
             "/",
             &[],
-            Some("target.example.com:443"),
-            "203.0.113.8:44321".parse().expect("client"),
+            RequestInputMeta {
+                authority: Some("target.example.com:443"),
+                content_length: None,
+                request_id: 0,
+                traceparent: None,
+                client_addr: "203.0.113.8:44321".parse().expect("client"),
+            },
         )
         .expect("request");
 
@@ -498,12 +553,14 @@ mod tests {
             request_input(
                 "GET",
                 "/ws",
-                Some("socket.example.com"),
                 &headers,
-                None,
-                11,
-                None,
-                "203.0.113.33:6000".parse().expect("client"),
+                RequestInputMeta {
+                    authority: Some("socket.example.com"),
+                    content_length: None,
+                    request_id: 11,
+                    traceparent: None,
+                    client_addr: "203.0.113.33:6000".parse().expect("client"),
+                },
             ),
         )
         .expect("request");
@@ -549,12 +606,14 @@ mod tests {
             request_input(
                 "GET",
                 "/shared",
-                Some("api.example.com"),
                 &headers,
-                None,
-                55,
-                Some("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"),
-                "198.51.100.44:7000".parse().expect("client"),
+                RequestInputMeta {
+                    authority: Some("api.example.com"),
+                    content_length: None,
+                    request_id: 55,
+                    traceparent: Some("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"),
+                    client_addr: "198.51.100.44:7000".parse().expect("client"),
+                },
             ),
         )
         .expect("h1 request");
@@ -563,12 +622,14 @@ mod tests {
             request_input(
                 "GET",
                 "/shared",
-                Some("api.example.com"),
                 &headers,
-                None,
-                55,
-                Some("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"),
-                "198.51.100.44:7000".parse().expect("client"),
+                RequestInputMeta {
+                    authority: Some("api.example.com"),
+                    content_length: None,
+                    request_id: 55,
+                    traceparent: Some("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"),
+                    client_addr: "198.51.100.44:7000".parse().expect("client"),
+                },
             ),
         )
         .expect("h2 request");

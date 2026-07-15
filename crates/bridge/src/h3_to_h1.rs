@@ -92,6 +92,15 @@ mod tests {
         RequestTraceContext,
     };
 
+    #[derive(Clone, Copy)]
+    struct RequestInputMeta<'a> {
+        authority: Option<&'a str>,
+        content_length: Option<usize>,
+        request_id: u64,
+        traceparent: Option<&'a str>,
+        client_addr: SocketAddr,
+    }
+
     fn request_target<'a>(
         endpoint: &'a BackendEndpoint,
         host_policy: &'a UpstreamHostPolicy,
@@ -109,28 +118,26 @@ mod tests {
     fn request_input<'a>(
         method: &'a str,
         path: &'a str,
-        authority: Option<&'a str>,
         headers: &'a [Header],
-        content_length: Option<usize>,
-        request_id: u64,
-        traceparent: Option<&'a str>,
-        client_addr: SocketAddr,
+        meta: RequestInputMeta<'a>,
     ) -> RequestBuildInput<'a, BoxBody<Bytes, Infallible>> {
         RequestBuildInput {
             method,
             path,
-            authority,
+            authority: meta.authority,
             headers,
             body: Empty::<Bytes>::new().boxed(),
-            content_length,
+            content_length: meta.content_length,
             body_mode: RequestBuildInput::<BoxBody<Bytes, Infallible>>::body_mode_for_length(
-                content_length,
+                meta.content_length,
             ),
             trace: RequestTraceContext {
-                request_id,
-                traceparent,
+                request_id: meta.request_id,
+                traceparent: meta.traceparent,
             },
-            forwarded: RequestForwardedContext { client_addr },
+            forwarded: RequestForwardedContext {
+                client_addr: meta.client_addr,
+            },
         }
     }
 
@@ -163,12 +170,14 @@ mod tests {
             request_input(
                 "POST",
                 "/submit",
-                Some("api.example.com"),
                 &headers,
-                Some(12),
-                42,
-                Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
-                "203.0.113.10:44321".parse().expect("client"),
+                RequestInputMeta {
+                    authority: Some("api.example.com"),
+                    content_length: Some(12),
+                    request_id: 42,
+                    traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+                    client_addr: "203.0.113.10:44321".parse().expect("client"),
+                },
             ),
         )
         .expect("request");
@@ -242,12 +251,14 @@ mod tests {
             request_input(
                 "GET",
                 "/ws",
-                Some("socket.example.com"),
                 &headers,
-                None,
-                7,
-                None,
-                "198.51.100.12:5555".parse().expect("client"),
+                RequestInputMeta {
+                    authority: Some("socket.example.com"),
+                    content_length: None,
+                    request_id: 7,
+                    traceparent: None,
+                    client_addr: "198.51.100.12:5555".parse().expect("client"),
+                },
             ),
         )
         .expect("request");
@@ -301,12 +312,16 @@ mod tests {
                 request_input(
                     "GET",
                     "/",
-                    Some("api.example.com"),
                     headers,
-                    None,
-                    99,
-                    Some("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"),
-                    "203.0.113.88:8080".parse().expect("client"),
+                    RequestInputMeta {
+                        authority: Some("api.example.com"),
+                        content_length: None,
+                        request_id: 99,
+                        traceparent: Some(
+                            "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+                        ),
+                        client_addr: "203.0.113.88:8080".parse().expect("client"),
+                    },
                 ),
             )
             .expect("request")

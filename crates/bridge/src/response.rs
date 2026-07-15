@@ -251,13 +251,14 @@ pub fn apply_response_header_defaults(
 
 #[cfg(test)]
 mod tests {
-    use http::{HeaderMap, HeaderValue, StatusCode};
+    use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 
     use super::{
         ContentLengthPolicy, ContentTypePolicy, NormalizedHeader, ResponseBodyMode,
         ResponseBodyPolicy, ResponseEmissionPolicy, ResponseNormalizationInput,
         ResponseNormalizationProtocol, ResponseProtocolConstraints, UpstreamResponseView,
-        apply_response_header_defaults, normalize_upstream_response, status_forbids_response_body,
+        apply_response_header_defaults, normalize_response_trailers, normalize_upstream_response,
+        response_connection_tokens, should_strip_response_header, status_forbids_response_body,
     };
 
     fn http3_constraints() -> ResponseProtocolConstraints {
@@ -278,12 +279,135 @@ mod tests {
         }
     }
 
+    fn header_value<'a>(headers: &'a [NormalizedHeader], name: &str) -> Option<&'a str> {
+        let name = HeaderName::from_bytes(name.as_bytes()).ok()?;
+        headers
+            .iter()
+            .find(|header| header.name == name)
+            .and_then(|header| header.value.to_str().ok())
+    }
+
     #[test]
     fn forbids_bodies_for_informational_and_empty_statuses() {
         assert!(status_forbids_response_body(StatusCode::CONTINUE));
         assert!(status_forbids_response_body(StatusCode::NO_CONTENT));
         assert!(status_forbids_response_body(StatusCode::NOT_MODIFIED));
         assert!(!status_forbids_response_body(StatusCode::OK));
+    }
+
+    #[test]
+    fn response_connection_tokens_normalize_multiple_values() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            http::header::CONNECTION,
+            HeaderValue::from_static(" keep-alive , x-hop "),
+        );
+        headers.append(
+            http::header::CONNECTION,
+            HeaderValue::from_static("Upgrade, x-extra"),
+        );
+
+        let tokens = response_connection_tokens(&headers);
+
+        assert!(tokens.contains("keep-alive"));
+        assert!(tokens.contains("x-hop"));
+        assert!(tokens.contains("upgrade"));
+        assert!(tokens.contains("x-extra"));
+    }
+
+    #[test]
+    fn http3_header_filter_strips_hop_headers_connection_tokens_and_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("x-internal-hop"),
+        );
+        let tokens = response_connection_tokens(&headers);
+
+        assert!(should_strip_response_header(
+            &http::header::TE,
+            &tokens,
+            http3_constraints(),
+        ));
+        assert!(should_strip_response_header(
+            &http::header::TRAILER,
+            &tokens,
+            http3_constraints(),
+        ));
+        assert!(should_strip_response_header(
+            &http::header::CONTENT_LENGTH,
+            &tokens,
+            http3_constraints(),
+        ));
+        assert!(should_strip_response_header(
+            &HeaderName::from_static("x-internal-hop"),
+            &tokens,
+            http3_constraints(),
+        ));
+        assert!(!should_strip_response_header(
+            &http::header::CACHE_CONTROL,
+            &tokens,
+            http3_constraints(),
+        ));
+    }
+
+    #[test]
+    fn http1_header_filter_strips_alt_svc_and_can_preserve_upgrade() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("x-hop-token"),
+        );
+        let tokens = response_connection_tokens(&headers);
+
+        assert!(should_strip_response_header(
+            &HeaderName::from_static("alt-svc"),
+            &tokens,
+            http1_constraints(),
+        ));
+        assert!(should_strip_response_header(
+            &HeaderName::from_static("x-hop-token"),
+            &tokens,
+            http1_constraints(),
+        ));
+        assert!(!should_strip_response_header(
+            &http::header::UPGRADE,
+            &tokens,
+            ResponseProtocolConstraints {
+                preserve_upgrade: true,
+                ..http1_constraints()
+            },
+        ));
+    }
+
+    #[test]
+    fn trailer_normalization_preserves_end_to_end_and_filters_hop_headers() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert(
+            http::HeaderName::from_static("grpc-status"),
+            HeaderValue::from_static("0"),
+        );
+        trailers.insert(
+            http::HeaderName::from_static("grpc-message"),
+            HeaderValue::from_static("ok"),
+        );
+        trailers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("x-hop-token"),
+        );
+        trailers.insert(http::header::TE, HeaderValue::from_static("trailers"));
+        trailers.insert(
+            http::HeaderName::from_static("x-hop-token"),
+            HeaderValue::from_static("secret"),
+        );
+        trailers.insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("12"));
+
+        let normalized = normalize_response_trailers(&trailers, http3_constraints());
+
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(header_value(&normalized, "grpc-status"), Some("0"));
+        assert_eq!(header_value(&normalized, "grpc-message"), Some("ok"));
+        assert_eq!(header_value(&normalized, "x-hop-token"), None);
     }
 
     #[test]
@@ -333,6 +457,25 @@ mod tests {
                 .iter()
                 .any(|header| header.name == http::HeaderName::from_static("x-custom"))
         );
+    }
+
+    #[test]
+    fn normalizes_bodyless_request_mode_as_suppressed_and_terminal() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("7"));
+
+        let normalized = normalize_upstream_response(ResponseNormalizationInput {
+            upstream: UpstreamResponseView {
+                status: StatusCode::OK,
+                headers: &headers,
+                trailers: None,
+            },
+            body_mode: ResponseBodyMode::BodylessRequest,
+            constraints: http3_constraints(),
+        });
+
+        assert_eq!(normalized.emission.body, ResponseBodyPolicy::Suppress);
+        assert!(normalized.emission.emit_end_stream_on_headers);
     }
 
     #[test]
@@ -449,6 +592,65 @@ mod tests {
             headers
                 .iter()
                 .all(|header| header.name != http::header::CONTENT_LENGTH)
+        );
+    }
+
+    #[test]
+    fn quic_and_bootstrap_normalizers_preserve_same_end_to_end_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("x-hop-token"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-hop-token"),
+            HeaderValue::from_static("secret"),
+        );
+        headers.insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("9"));
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("max-age=60"),
+        );
+        headers.insert(http::header::ETAG, HeaderValue::from_static("\"etag-1\""));
+
+        let h3 = normalize_upstream_response(ResponseNormalizationInput {
+            upstream: UpstreamResponseView {
+                status: StatusCode::OK,
+                headers: &headers,
+                trailers: None,
+            },
+            body_mode: ResponseBodyMode::Normal,
+            constraints: http3_constraints(),
+        });
+        let http1 = normalize_upstream_response(ResponseNormalizationInput {
+            upstream: UpstreamResponseView {
+                status: StatusCode::OK,
+                headers: &headers,
+                trailers: None,
+            },
+            body_mode: ResponseBodyMode::Normal,
+            constraints: http1_constraints(),
+        });
+
+        assert_eq!(h3.head.status, http1.head.status);
+        assert_eq!(h3.emission.body, ResponseBodyPolicy::Forward);
+        assert_eq!(http1.emission.body, ResponseBodyPolicy::Forward);
+        assert!(!h3.emission.emit_end_stream_on_headers);
+        assert!(!http1.emission.emit_end_stream_on_headers);
+        assert_eq!(
+            header_value(&h3.head.headers, "cache-control"),
+            header_value(&http1.head.headers, "cache-control")
+        );
+        assert_eq!(
+            header_value(&h3.head.headers, "etag"),
+            header_value(&http1.head.headers, "etag")
+        );
+        assert_eq!(header_value(&h3.head.headers, "x-hop-token"), None);
+        assert_eq!(header_value(&http1.head.headers, "x-hop-token"), None);
+        assert_eq!(header_value(&h3.head.headers, "content-length"), None);
+        assert_eq!(
+            header_value(&http1.head.headers, "content-length"),
+            Some("9")
         );
     }
 }

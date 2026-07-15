@@ -3,7 +3,7 @@ use std::error::Error as StdError;
 use spooky_lb::health::HealthFailureReason;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UpstreamErrorDetails {
+pub(crate) struct UpstreamErrorDetails {
     pub detail: String,
     pub is_connect: bool,
 }
@@ -65,7 +65,7 @@ pub fn classify_upstream_error_detail(
     UpstreamErrorClassification::transport()
 }
 
-pub fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
+pub(crate) fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
     let mut detail = err.to_string();
     let mut source = err.source();
     while let Some(cause) = source {

@@ -9,6 +9,7 @@ mod stream_progress;
 use std::convert::Infallible;
 
 use spooky_config::config::ScopedRateLimitScope;
+use spooky_errors::ClassifiedUpstreamProxyError;
 
 use self::prepare::{PreparedRequest, StartedAuthRequest};
 pub(in crate::quic_listener) use self::resolve::BootstrapResolutionInput;
@@ -16,8 +17,6 @@ pub(in crate::quic_listener) use self::resolve::BootstrapResolutionInput;
 pub(in crate::quic_listener) use self::resolve::RouteResolutionRequest as TestRouteResolutionRequest;
 use super::*;
 use crate::runtime::connection::{request::PendingForward, stream::StreamAdmissionState};
-#[cfg(test)]
-use std::error::Error as StdError;
 
 pub(super) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> StreamPhase {
     let phase = req.phase.clone();
@@ -83,6 +82,73 @@ pub(crate) struct StreamProgressConfig {
 }
 
 impl QUICListener {
+    pub(super) fn log_classified_upstream_failure(
+        phase: &str,
+        request_id: Option<u64>,
+        upstream_name: Option<&str>,
+        backend_addr: &str,
+        classified: &ClassifiedUpstreamProxyError,
+    ) {
+        let request_id = request_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let upstream_name = upstream_name.unwrap_or("-");
+        match classified.health_failure {
+            Some(health_mapping) => error!(
+                "phase={} request_id={} upstream={} backend={} upstream failure kind={:?} retryability={:?} health_reason={:?} metrics_reason={} detail={}",
+                phase,
+                request_id,
+                upstream_name,
+                backend_addr,
+                classified.kind,
+                classified.retryability,
+                health_mapping.failure_reason,
+                health_mapping.metrics_reason,
+                classified.detail
+            ),
+            None => error!(
+                "phase={} request_id={} upstream={} backend={} upstream failure kind={:?} retryability={:?} detail={}",
+                phase,
+                request_id,
+                upstream_name,
+                backend_addr,
+                classified.kind,
+                classified.retryability,
+                classified.detail
+            ),
+        }
+    }
+
+    pub(super) fn mark_classified_upstream_health_failure(
+        metrics_phase: &str,
+        backend_addr: &str,
+        backend_index: usize,
+        upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
+        metrics: &Metrics,
+        classified: &ClassifiedUpstreamProxyError,
+    ) {
+        let Some(health_mapping) = classified.health_failure else {
+            return;
+        };
+
+        metrics.inc_health_failure(health_mapping.failure_reason);
+        if health_mapping.failure_reason == HealthFailureReason::Tls {
+            metrics.record_upstream_tls_failure(
+                backend_addr,
+                metrics_phase,
+                health_mapping.metrics_reason,
+            );
+        }
+        if let Some(pool) = upstream_pool
+            && let Some(transition) = pool.write().ok().and_then(|mut p| {
+                p.pool
+                    .mark_request_failure(backend_index, health_mapping.failure_reason)
+            })
+        {
+            Self::log_health_transition(backend_addr, transition);
+        }
+    }
+
     fn is_internal_pool_control_error(error: &PoolError) -> bool {
         matches!(
             error,
@@ -1190,38 +1256,6 @@ mod tests {
             RouteOutcome::Success => {}
             _ => panic!("unexpected route outcome"),
         }
-    }
-
-    #[derive(Debug)]
-    struct OuterErr(InnerErr);
-
-    #[derive(Debug)]
-    struct InnerErr;
-
-    impl std::fmt::Display for OuterErr {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "outer")
-        }
-    }
-
-    impl std::fmt::Display for InnerErr {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "inner")
-        }
-    }
-
-    impl StdError for OuterErr {
-        fn source(&self) -> Option<&(dyn StdError + 'static)> {
-            Some(&self.0)
-        }
-    }
-
-    impl StdError for InnerErr {}
-
-    #[test]
-    fn format_error_chain_includes_nested_causes() {
-        let msg = spooky_errors::format_error_chain(&OuterErr(InnerErr));
-        assert_eq!(msg, "outer: inner");
     }
 
     #[test]

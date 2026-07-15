@@ -129,33 +129,43 @@ impl QUICListener {
                                 }
                                 Ok(Err(PoolError::Send(send_err))) => {
                                     let classified = classify_upstream_send_error(&send_err);
-                                    let health_mapping = classified
-                                        .health_failure
-                                        .expect("send errors must include health mapping");
-                                    if health_mapping.failure_reason == HealthFailureReason::Tls {
-                                        task_metrics.record_upstream_tls_failure(
-                                            &job.backend_identity,
-                                            "health_check",
-                                            health_mapping.metrics_reason,
-                                        );
-                                        error!(
-                                            "Health check upstream TLS failure for {} (tls_reason={}): {}",
-                                            job.backend_identity,
-                                            health_mapping.metrics_reason,
-                                            classified.detail
-                                        );
-                                    }
-                                    task_metrics.inc_health_failure(health_mapping.failure_reason);
+                                    Self::log_classified_upstream_failure(
+                                        "health_check",
+                                        None,
+                                        None,
+                                        &job.backend_identity,
+                                        &classified,
+                                    );
+                                    Self::mark_classified_upstream_health_failure(
+                                        "health_check",
+                                        &job.backend_identity,
+                                        job.index,
+                                        Some(&job.upstream_pool),
+                                        task_metrics.as_ref(),
+                                        &classified,
+                                    );
                                     HealthClassification::Failure
                                 }
                                 Ok(Err(pool_err)) => {
                                     let proxy_err = ProxyError::Pool(pool_err);
                                     if let Some(classified) =
                                         classify_upstream_proxy_error(&proxy_err)
-                                        && let Some(health_mapping) = classified.health_failure
                                     {
-                                        task_metrics
-                                            .inc_health_failure(health_mapping.failure_reason);
+                                        Self::log_classified_upstream_failure(
+                                            "health_check",
+                                            None,
+                                            None,
+                                            &job.backend_identity,
+                                            &classified,
+                                        );
+                                        Self::mark_classified_upstream_health_failure(
+                                            "health_check",
+                                            &job.backend_identity,
+                                            job.index,
+                                            Some(&job.upstream_pool),
+                                            task_metrics.as_ref(),
+                                            &classified,
+                                        );
                                     } else {
                                         task_metrics
                                             .inc_health_failure(HealthFailureReason::Transport);
@@ -166,10 +176,21 @@ impl QUICListener {
                                     let classified =
                                         classify_upstream_proxy_error(&ProxyError::Timeout)
                                             .expect("timeout must classify");
-                                    let health_mapping = classified
-                                        .health_failure
-                                        .expect("timeout must include health mapping");
-                                    task_metrics.inc_health_failure(health_mapping.failure_reason);
+                                    Self::log_classified_upstream_failure(
+                                        "health_check",
+                                        None,
+                                        None,
+                                        &job.backend_identity,
+                                        &classified,
+                                    );
+                                    Self::mark_classified_upstream_health_failure(
+                                        "health_check",
+                                        &job.backend_identity,
+                                        job.index,
+                                        Some(&job.upstream_pool),
+                                        task_metrics.as_ref(),
+                                        &classified,
+                                    );
                                     HealthClassification::Failure
                                 }
                             };

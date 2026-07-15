@@ -1003,44 +1003,20 @@ impl QUICListener {
                                             if let Some(classified) =
                                                 classify_upstream_proxy_error(&proxy_err)
                                             {
-                                                if let Some(health_mapping) =
-                                                    classified.health_failure
-                                                {
-                                                    metrics.inc_health_failure(
-                                                        health_mapping.failure_reason,
-                                                    );
-                                                    if health_mapping.failure_reason
-                                                        == spooky_lb::health::HealthFailureReason::Tls
-                                                    {
-                                                        metrics.record_upstream_tls_failure(
-                                                            &backend_addr,
-                                                            "bootstrap",
-                                                            health_mapping.metrics_reason,
-                                                        );
-                                                    }
-                                                    if let Some(transition) = upstream_pool
-                                                        .write()
-                                                        .ok()
-                                                        .and_then(|mut pool| {
-                                                            pool.pool.mark_request_failure(
-                                                                backend_index,
-                                                                health_mapping.failure_reason,
-                                                            )
-                                                        })
-                                                    {
-                                                        Self::log_health_transition(
-                                                            &backend_addr,
-                                                            transition,
-                                                        );
-                                                    }
-                                                }
-                                                warn!(
-                                                    "Bootstrap WebSocket upstream failure route={} backend={} kind={:?} retryability={:?} detail={}",
-                                                    upstream_name,
-                                                    backend_addr,
-                                                    classified.kind,
-                                                    classified.retryability,
-                                                    classified.detail
+                                                Self::log_classified_upstream_failure(
+                                                    "bootstrap",
+                                                    Some(request_id),
+                                                    Some(&upstream_name),
+                                                    &backend_addr,
+                                                    &classified,
+                                                );
+                                                Self::mark_classified_upstream_health_failure(
+                                                    "bootstrap",
+                                                    &backend_addr,
+                                                    backend_index,
+                                                    Some(&upstream_pool),
+                                                    metrics.as_ref(),
+                                                    &classified,
                                                 );
                                             } else {
                                                 warn!(
@@ -1063,34 +1039,21 @@ impl QUICListener {
                                         Err(_) => {
                                             if let Some(classified) =
                                                 classify_upstream_proxy_error(&ProxyError::Timeout)
-                                                && let Some(health_mapping) =
-                                                    classified.health_failure
                                             {
-                                                metrics.inc_health_failure(
-                                                    health_mapping.failure_reason,
+                                                Self::log_classified_upstream_failure(
+                                                    "bootstrap",
+                                                    Some(request_id),
+                                                    Some(&upstream_name),
+                                                    &backend_addr,
+                                                    &classified,
                                                 );
-                                                if let Some(transition) = upstream_pool
-                                                    .write()
-                                                    .ok()
-                                                    .and_then(|mut pool| {
-                                                        pool.pool.mark_request_failure(
-                                                            backend_index,
-                                                            health_mapping.failure_reason,
-                                                        )
-                                                    })
-                                                {
-                                                    Self::log_health_transition(
-                                                        &backend_addr,
-                                                        transition,
-                                                    );
-                                                }
-                                                warn!(
-                                                    "Bootstrap WebSocket upstream failure route={} backend={} kind={:?} retryability={:?} detail={}",
-                                                    upstream_name,
-                                                    backend_addr,
-                                                    classified.kind,
-                                                    classified.retryability,
-                                                    classified.detail
+                                                Self::mark_classified_upstream_health_failure(
+                                                    "bootstrap",
+                                                    &backend_addr,
+                                                    backend_index,
+                                                    Some(&upstream_pool),
+                                                    metrics.as_ref(),
+                                                    &classified,
                                                 );
                                             }
                                             return Ok(Response::builder()
@@ -1119,44 +1082,20 @@ impl QUICListener {
                                             if let Some(classified) =
                                                 classify_upstream_proxy_error(&proxy_err)
                                             {
-                                                if let Some(health_mapping) =
-                                                    classified.health_failure
-                                                {
-                                                    metrics.inc_health_failure(
-                                                        health_mapping.failure_reason,
-                                                    );
-                                                    if health_mapping.failure_reason
-                                                        == spooky_lb::health::HealthFailureReason::Tls
-                                                    {
-                                                        metrics.record_upstream_tls_failure(
-                                                            &backend_addr,
-                                                            "bootstrap",
-                                                            health_mapping.metrics_reason,
-                                                        );
-                                                    }
-                                                    if let Some(transition) = upstream_pool
-                                                        .write()
-                                                        .ok()
-                                                        .and_then(|mut pool| {
-                                                            pool.pool.mark_request_failure(
-                                                                backend_index,
-                                                                health_mapping.failure_reason,
-                                                            )
-                                                        })
-                                                    {
-                                                        Self::log_health_transition(
-                                                            &backend_addr,
-                                                            transition,
-                                                        );
-                                                    }
-                                                }
-                                                warn!(
-                                                    "Bootstrap proxy upstream failure route={} backend={} kind={:?} retryability={:?} detail={}",
-                                                    upstream_name,
-                                                    backend_addr,
-                                                    classified.kind,
-                                                    classified.retryability,
-                                                    classified.detail
+                                                Self::log_classified_upstream_failure(
+                                                    "bootstrap",
+                                                    Some(request_id),
+                                                    Some(&upstream_name),
+                                                    &backend_addr,
+                                                    &classified,
+                                                );
+                                                Self::mark_classified_upstream_health_failure(
+                                                    "bootstrap",
+                                                    &backend_addr,
+                                                    backend_index,
+                                                    Some(&upstream_pool),
+                                                    metrics.as_ref(),
+                                                    &classified,
                                                 );
                                             } else {
                                                 warn!(
@@ -1179,34 +1118,21 @@ impl QUICListener {
                                         Err(_) => {
                                             if let Some(classified) =
                                                 classify_upstream_proxy_error(&ProxyError::Timeout)
-                                                && let Some(health_mapping) =
-                                                    classified.health_failure
                                             {
-                                                metrics.inc_health_failure(
-                                                    health_mapping.failure_reason,
+                                                Self::log_classified_upstream_failure(
+                                                    "bootstrap",
+                                                    Some(request_id),
+                                                    Some(&upstream_name),
+                                                    &backend_addr,
+                                                    &classified,
                                                 );
-                                                if let Some(transition) = upstream_pool
-                                                    .write()
-                                                    .ok()
-                                                    .and_then(|mut pool| {
-                                                        pool.pool.mark_request_failure(
-                                                            backend_index,
-                                                            health_mapping.failure_reason,
-                                                        )
-                                                    })
-                                                {
-                                                    Self::log_health_transition(
-                                                        &backend_addr,
-                                                        transition,
-                                                    );
-                                                }
-                                                warn!(
-                                                    "Bootstrap proxy upstream failure route={} backend={} kind={:?} retryability={:?} detail={}",
-                                                    upstream_name,
-                                                    backend_addr,
-                                                    classified.kind,
-                                                    classified.retryability,
-                                                    classified.detail
+                                                Self::mark_classified_upstream_health_failure(
+                                                    "bootstrap",
+                                                    &backend_addr,
+                                                    backend_index,
+                                                    Some(&upstream_pool),
+                                                    metrics.as_ref(),
+                                                    &classified,
                                                 );
                                             }
                                             return Ok(Response::builder()

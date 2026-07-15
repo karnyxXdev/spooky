@@ -2,70 +2,9 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use super::*;
 use crate::runtime::connection::auth::ExternalAuthDecision;
-use spooky_errors::{
-    ClassifiedUpstreamProxyError, UpstreamProxyErrorKind, classify_upstream_proxy_error,
-};
+use spooky_errors::{UpstreamProxyErrorKind, classify_upstream_proxy_error};
 
 impl QUICListener {
-    pub(in crate::quic_listener) fn log_classified_upstream_error(
-        req: &RequestEnvelope,
-        backend_addr: &str,
-        classified: &ClassifiedUpstreamProxyError,
-    ) {
-        let upstream_name = req.upstream_name.as_deref().unwrap_or("-");
-        match classified.health_failure {
-            Some(health_mapping) => error!(
-                "request_id={} upstream={} backend={} upstream failure kind={:?} retryability={:?} health_reason={:?} metrics_reason={} detail={}",
-                req.request_id,
-                upstream_name,
-                backend_addr,
-                classified.kind,
-                classified.retryability,
-                health_mapping.failure_reason,
-                health_mapping.metrics_reason,
-                classified.detail
-            ),
-            None => error!(
-                "request_id={} upstream={} backend={} upstream failure kind={:?} retryability={:?} detail={}",
-                req.request_id,
-                upstream_name,
-                backend_addr,
-                classified.kind,
-                classified.retryability,
-                classified.detail
-            ),
-        }
-    }
-
-    pub(in crate::quic_listener) fn mark_classified_upstream_health_failure(
-        backend_addr: &str,
-        backend_index: usize,
-        upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
-        metrics: &Metrics,
-        classified: &ClassifiedUpstreamProxyError,
-    ) {
-        let Some(health_mapping) = classified.health_failure else {
-            return;
-        };
-
-        metrics.inc_health_failure(health_mapping.failure_reason);
-        if health_mapping.failure_reason == HealthFailureReason::Tls {
-            metrics.record_upstream_tls_failure(
-                backend_addr,
-                "data_plane",
-                health_mapping.metrics_reason,
-            );
-        }
-        if let Some(pool) = upstream_pool
-            && let Some(transition) = pool.write().ok().and_then(|mut p| {
-                p.pool
-                    .mark_request_failure(backend_index, health_mapping.failure_reason)
-            })
-        {
-            Self::log_health_transition(backend_addr, transition);
-        }
-    }
-
     /// Handle an already-resolved `ForwardResult`, applying health transitions
     /// and sending the H3 response.
     pub(super) fn handle_forward_result(
@@ -259,8 +198,15 @@ impl QUICListener {
                         b"upstream error\n",
                     );
                 };
-                Self::log_classified_upstream_error(req, backend_addr, &classified);
+                Self::log_classified_upstream_failure(
+                    "data_plane",
+                    Some(req.request_id),
+                    req.upstream_name.as_deref(),
+                    backend_addr,
+                    &classified,
+                );
                 Self::mark_classified_upstream_health_failure(
+                    "data_plane",
                     backend_addr,
                     backend_index,
                     upstream_pool.as_ref(),
@@ -730,6 +676,7 @@ impl QUICListener {
                         classified.as_ref(),
                     ) {
                         Self::mark_classified_upstream_health_failure(
+                            "data_plane",
                             addr,
                             idx,
                             upstream_pool,
@@ -826,7 +773,13 @@ impl QUICListener {
                             if let (Some(addr), Some(classified)) =
                                 (req.backend_addr.as_deref(), classified.as_ref())
                             {
-                                Self::log_classified_upstream_error(req, addr, classified);
+                                Self::log_classified_upstream_failure(
+                                    "data_plane",
+                                    Some(req.request_id),
+                                    req.upstream_name.as_deref(),
+                                    addr,
+                                    classified,
+                                );
                             } else {
                                 error!(
                                     "Upstream {} body error: {:?}",

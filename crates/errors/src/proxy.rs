@@ -1,9 +1,10 @@
 use thiserror::Error;
 
+use crate::upstream::UpstreamErrorDetails;
 use crate::{
     BridgeError, PoolError, UpstreamErrorCategory, UpstreamErrorClassification,
-    UpstreamErrorDetails, UpstreamHealthFailureMapping, UpstreamRetryability,
-    UpstreamTerminalErrorKind, UpstreamTlsReason, classify_retryability,
+    UpstreamHealthFailureMapping, UpstreamRetryability, UpstreamTerminalErrorKind,
+    UpstreamTlsReason, classify_retryability,
 };
 
 #[derive(Debug, Error)]

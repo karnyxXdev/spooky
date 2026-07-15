@@ -16,7 +16,6 @@ pub use retry::{
     is_retryable,
 };
 pub use upstream::{
-    UpstreamErrorCategory, UpstreamErrorClassification, UpstreamErrorDetails,
-    UpstreamHealthFailureMapping, UpstreamTlsReason, classify_upstream_error_detail,
-    format_error_chain,
+    UpstreamErrorCategory, UpstreamErrorClassification, UpstreamHealthFailureMapping,
+    UpstreamTlsReason, classify_upstream_error_detail,
 };

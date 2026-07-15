@@ -1077,15 +1077,30 @@ impl QUICListener {
         );
         match rule.scope() {
             ScopedRateLimitScope::Route => Some(route.to_string()),
-            ScopedRateLimitScope::Client => {
-                Self::resolve_lb_key_from_parts(rule.key_spec().unwrap_or("peer_ip"), &request)
-            }
-            ScopedRateLimitScope::Tenant => rule
-                .key_spec()
-                .and_then(|key_spec| Self::resolve_lb_key_from_parts(key_spec, &request)),
-            ScopedRateLimitScope::Token => {
-                Self::resolve_lb_key_from_parts(rule.key_spec().unwrap_or("bearer_token"), &request)
-            }
+            ScopedRateLimitScope::Client => Some(
+                Self::resolve_lb_key_for_input(&LbKeyResolutionInput::new(
+                    "",
+                    Some(rule.key_spec().unwrap_or("peer_ip")),
+                    request,
+                ))
+                .value,
+            ),
+            ScopedRateLimitScope::Tenant => rule.key_spec().map(|key_spec| {
+                Self::resolve_lb_key_for_input(&LbKeyResolutionInput::new(
+                    "",
+                    Some(key_spec),
+                    request,
+                ))
+                .value
+            }),
+            ScopedRateLimitScope::Token => Some(
+                Self::resolve_lb_key_for_input(&LbKeyResolutionInput::new(
+                    "",
+                    Some(rule.key_spec().unwrap_or("bearer_token")),
+                    request,
+                ))
+                .value,
+            ),
         }
     }
 }
@@ -1493,6 +1508,62 @@ mod tests {
             .as_deref(),
             Some("token-2")
         );
+    }
+
+    #[test]
+    fn resolve_scoped_rate_limit_key_falls_back_to_default_request_key() {
+        let tenant_rule = crate::resilience::scoped_rate_limit::ScopedRateLimitRule::from_config(
+            &ScopedRateLimit {
+                name: "tenant".to_string(),
+                scope: ScopedRateLimitScope::Tenant,
+                requests_per_sec: 10,
+                burst: 10,
+                key: Some("header:x-tenant-id".to_string()),
+                route_allowlist: Vec::new(),
+                idle_ttl_secs: 300,
+            },
+        );
+        let headers = std::collections::HashMap::<String, String>::new();
+        let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
+        let client_addr = "198.51.100.10:443".parse().expect("client addr");
+
+        assert_eq!(
+            QUICListener::resolve_scoped_rate_limit_key(
+                &tenant_rule,
+                "api",
+                "GET",
+                "/resource",
+                Some("api.example.com"),
+                client_addr,
+                Some(&lookup),
+            )
+            .as_deref(),
+            Some("api.example.com")
+        );
+    }
+
+    #[test]
+    fn resolve_lb_key_for_input_uses_sticky_cid_before_default_fallback() {
+        let request = LbKeyRequestParts::new(
+            "GET",
+            "/resource",
+            Some("api.example.com"),
+            Some("cid-123"),
+            None,
+            None,
+        );
+
+        let resolved = QUICListener::resolve_lb_key_for_input(&LbKeyResolutionInput::new(
+            "sticky-cid",
+            Some("header:x-user-id"),
+            request,
+        ));
+
+        assert_eq!(resolved.value, "cid-123");
+        assert!(matches!(
+            resolved.source,
+            super::lb_key::LbKeySource::StickyCidFallback
+        ));
     }
 
     #[test]

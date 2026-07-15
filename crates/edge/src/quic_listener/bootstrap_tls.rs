@@ -388,41 +388,31 @@ impl QUICListener {
                                         .and_then(|value| value.to_str().ok())
                                         .map(str::to_string)
                                 };
-                                let (backend_addr, upstream_name, upstream_policy) = {
-                                    let resolution_request =
-                                        super::forwarding::SharedRouteResolutionRequest::new(
-                                            &method,
-                                            &path,
-                                            authority.as_deref(),
-                                            None,
-                                            Some(&lb_header_lookup),
-                                        );
-                                    match Self::resolve_backend_request(
-                                        &resolution_request,
+                                let (backend_addr, upstream_name, upstream_policy) =
+                                    match Self::resolve_bootstrap_target(
+                                        &method,
+                                        &path,
+                                        authority.as_deref(),
+                                        Some(&lb_header_lookup),
+                                        &routing_index,
                                         &upstream_pools,
                                         &upstream_policies,
-                                        &routing_index,
+                                        &metrics,
+                                        Duration::from_millis(0),
                                     ) {
                                         Ok(value) => (
-                                            value.backend.backend_addr,
-                                            value.route.upstream_name,
-                                            value.route.upstream_policy,
+                                            value.backend_addr,
+                                            value.upstream_name,
+                                            value.upstream_policy,
                                         ),
                                         Err(err) => {
-                                            Self::observe_route_resolution_failure(
-                                                &resolution_request,
-                                                &err,
-                                                &metrics,
-                                                Duration::from_millis(0),
-                                            );
                                             let (status, body) =
                                                 Self::bootstrap_route_resolution_error_response(
                                                     &err,
                                                 );
                                             return bootstrap_error(status, body);
                                         }
-                                    }
-                                };
+                                    };
 
                                 let admission = evaluate_forwarding_pre_admission_policy(
                                     &upstream_policy,

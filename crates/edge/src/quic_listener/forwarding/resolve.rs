@@ -59,6 +59,12 @@ pub(super) struct ForwardingResolvedTarget {
     pub(super) backend_lb: String,
 }
 
+pub(in crate::quic_listener) struct BootstrapResolvedTarget {
+    pub(in crate::quic_listener) upstream_name: String,
+    pub(in crate::quic_listener) upstream_policy: RuntimeUpstreamPolicy,
+    pub(in crate::quic_listener) backend_addr: String,
+}
+
 struct BackendSelectionPlan {
     lb_type: String,
     lb_key: String,
@@ -226,6 +232,39 @@ impl QUICListener {
             backend_addr,
             backend_index,
             backend_lb,
+        })
+    }
+
+    pub(in crate::quic_listener) fn resolve_bootstrap_target(
+        method: &str,
+        path: &str,
+        authority: Option<&str>,
+        header_lookup: Option<&LbHeaderLookup<'_>>,
+        routing_index: &RouteIndex,
+        upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        upstream_policies: &HashMap<String, RuntimeUpstreamPolicy>,
+        metrics: &Metrics,
+        elapsed: Duration,
+    ) -> Result<BootstrapResolvedTarget, ProxyError> {
+        let resolution_request =
+            RouteResolutionRequest::new(method, path, authority, None, header_lookup);
+        let ResolvedBackend { route, backend } = match Self::resolve_backend_request(
+            &resolution_request,
+            upstream_pools,
+            upstream_policies,
+            routing_index,
+        ) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                Self::observe_route_resolution_failure(&resolution_request, &err, metrics, elapsed);
+                return Err(err);
+            }
+        };
+
+        Ok(BootstrapResolvedTarget {
+            upstream_name: route.upstream_name,
+            upstream_policy: route.upstream_policy,
+            backend_addr: backend.backend_addr,
         })
     }
 

@@ -37,6 +37,24 @@ pub struct ExternalAuthExecutionPolicy {
 }
 
 impl ExternalAuthExecutionPolicy {
+    pub fn from_external_auth(value: &RuntimeExternalAuth) -> Self {
+        match value {
+            RuntimeExternalAuth::Http {
+                timeout_ms,
+                failure_mode,
+                ..
+            }
+            | RuntimeExternalAuth::Oidc {
+                timeout_ms,
+                failure_mode,
+                ..
+            } => Self {
+                timeout: Duration::from_millis((*timeout_ms).max(1)),
+                failure_mode: *failure_mode,
+            },
+        }
+    }
+
     pub fn disposition(self) -> ExternalAuthFailureDisposition {
         ExternalAuthFailureDisposition::from_failure_mode(self.failure_mode)
     }
@@ -198,6 +216,63 @@ pub enum ExternalAuthDecisionOutcome {
         disposition: ExternalAuthFailureDisposition,
         error: ProxyError,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalAuthFailureResolution {
+    FailOpen,
+    Reject {
+        status: http::StatusCode,
+        body: &'static [u8],
+        timed_out: bool,
+    },
+}
+
+impl ExternalAuthDecisionOutcome {
+    pub fn from_result(
+        result: ExternalAuthResult,
+        disposition: ExternalAuthFailureDisposition,
+    ) -> Self {
+        match result {
+            Ok(ExternalAuthDecision::Allow {
+                request_header_mutations,
+            }) => Self::Allow {
+                request_header_mutations: request_header_mutations
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            },
+            Ok(ExternalAuthDecision::Deny(response)) => Self::Deny(response),
+            Ok(ExternalAuthDecision::Redirect(response)) => Self::Redirect(response),
+            Ok(ExternalAuthDecision::Challenge(response)) => Self::Challenge(response),
+            Err(ProxyError::Timeout) => Self::Timeout { disposition },
+            Err(error) => Self::Error { disposition, error },
+        }
+    }
+
+    pub fn failure_resolution(&self) -> Option<ExternalAuthFailureResolution> {
+        match self {
+            Self::Timeout { disposition } => Some(if disposition.fail_open() {
+                ExternalAuthFailureResolution::FailOpen
+            } else {
+                ExternalAuthFailureResolution::Reject {
+                    status: http::StatusCode::GATEWAY_TIMEOUT,
+                    body: b"external auth timeout\n",
+                    timed_out: true,
+                }
+            }),
+            Self::Error { disposition, .. } => Some(if disposition.fail_open() {
+                ExternalAuthFailureResolution::FailOpen
+            } else {
+                ExternalAuthFailureResolution::Reject {
+                    status: http::StatusCode::SERVICE_UNAVAILABLE,
+                    body: b"external auth unavailable\n",
+                    timed_out: false,
+                }
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Result type returned by the in-flight upstream forwarding task.

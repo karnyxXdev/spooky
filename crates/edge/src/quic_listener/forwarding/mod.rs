@@ -1135,12 +1135,13 @@ mod tests {
     use super::{
         auth::{
             allowed_auth_headers, append_auth_request_headers, auth_allow_mutations,
-            auth_failure_mode, auth_timeout_ms, fail_open, map_http_external_auth_response,
-            oidc_audience_matches, oidc_scope_satisfied,
+            map_http_external_auth_response, oidc_audience_matches, oidc_scope_satisfied,
         },
         *,
     };
-    use crate::runtime::connection::auth::{ExternalAuthDecision, PendingHeaderMutation};
+    use crate::runtime::connection::auth::{
+        ExternalAuthDecision, ExternalAuthExecutionPolicy, PendingHeaderMutation,
+    };
 
     fn sample_pending_forward(headers: Vec<quiche::h3::Header>) -> PendingForward {
         PendingForward {
@@ -1993,7 +1994,8 @@ mod tests {
             failure_mode: RuntimeExternalAuthFailureMode::FailOpen,
         };
 
-        assert_eq!(auth_timeout_ms(&auth), 250);
-        assert!(fail_open(auth_failure_mode(&auth)));
+        let policy = ExternalAuthExecutionPolicy::from_external_auth(&auth);
+        assert_eq!(policy.timeout, Duration::from_millis(250));
+        assert!(policy.disposition().fail_open());
     }
 }

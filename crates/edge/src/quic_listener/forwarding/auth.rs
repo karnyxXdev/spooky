@@ -3,13 +3,14 @@ use std::convert::Infallible;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use serde_json::Value;
-use spooky_config::runtime::{RuntimeExternalAuth, RuntimeExternalAuthFailureMode};
+use spooky_config::runtime::RuntimeExternalAuth;
 use tokio::task::AbortHandle;
 
 use super::*;
 use crate::runtime::connection::{
     auth::{
-        ExternalAuthChallengeResponse, ExternalAuthDecision, ExternalAuthDenyResponse,
+        ExternalAuthChallengeResponse, ExternalAuthDecision, ExternalAuthDecisionOutcome,
+        ExternalAuthDenyResponse, ExternalAuthExecutionPolicy, ExternalAuthFailureResolution,
         ExternalAuthRedirectResponse, ExternalAuthResult, PendingHeaderMutation,
     },
     request::PendingForward,
@@ -57,26 +58,6 @@ impl AuthHttpClient {
             .await
             .map_err(|err| ProxyError::Transport(err.to_string()))
     }
-}
-
-pub(super) fn auth_failure_mode(
-    external_auth: &RuntimeExternalAuth,
-) -> RuntimeExternalAuthFailureMode {
-    match external_auth {
-        RuntimeExternalAuth::Http { failure_mode, .. }
-        | RuntimeExternalAuth::Oidc { failure_mode, .. } => *failure_mode,
-    }
-}
-
-pub(super) fn auth_timeout_ms(external_auth: &RuntimeExternalAuth) -> u64 {
-    match external_auth {
-        RuntimeExternalAuth::Http { timeout_ms, .. }
-        | RuntimeExternalAuth::Oidc { timeout_ms, .. } => *timeout_ms,
-    }
-}
-
-pub(super) fn fail_open(mode: RuntimeExternalAuthFailureMode) -> bool {
-    matches!(mode, RuntimeExternalAuthFailureMode::FailOpen)
 }
 
 fn is_unsafe_forwarded_auth_request_header(name: &[u8]) -> bool {
@@ -585,7 +566,7 @@ async fn run_external_auth(
     pending_forward: Arc<PendingForward>,
     external_auth: RuntimeExternalAuth,
 ) -> ExternalAuthResult {
-    let timeout = Duration::from_millis(auth_timeout_ms(&external_auth).max(1));
+    let timeout = ExternalAuthExecutionPolicy::from_external_auth(&external_auth).timeout;
     match external_auth {
         RuntimeExternalAuth::Http {
             endpoint,
@@ -632,9 +613,8 @@ pub(super) fn start_external_auth_task(
     pending_forward: Arc<PendingForward>,
     external_auth: RuntimeExternalAuth,
 ) -> Result<AuthStart, ProxyError> {
-    let timeout_ms = auth_timeout_ms(&external_auth).max(1);
-    let mode = auth_failure_mode(&external_auth);
-    let timeout = Duration::from_millis(timeout_ms);
+    let policy = ExternalAuthExecutionPolicy::from_external_auth(&external_auth);
+    let timeout = policy.timeout;
     let (tx, rx) = oneshot::channel();
     let fut = async move {
         let result = run_external_auth_with_timeout(pending_forward, external_auth, timeout).await;
@@ -650,7 +630,7 @@ pub(super) fn start_external_auth_task(
         rx,
         abort: join.abort_handle(),
         deadline: Instant::now() + timeout,
-        fail_open: fail_open(mode),
+        fail_open: policy.disposition().fail_open(),
     })
 }
 
@@ -670,26 +650,29 @@ impl QUICListener {
             abort.abort();
         }
         req.auth_deadline = None;
-        match result {
-            Ok(ExternalAuthDecision::Allow {
+        let outcome = ExternalAuthDecisionOutcome::from_result(
+            result,
+            if req.auth_fail_open {
+                crate::runtime::connection::auth::ExternalAuthFailureDisposition::FailOpen
+            } else {
+                crate::runtime::connection::auth::ExternalAuthFailureDisposition::FailClosed
+            },
+        );
+        match outcome {
+            ExternalAuthDecisionOutcome::Allow {
                 request_header_mutations,
-            }) => {
+            } => {
                 metrics.inc_external_auth_allowed();
                 if let Some(pending_forward) = req.pending_forward.as_mut() {
                     Arc::make_mut(pending_forward)
                         .auth_header_mutations
-                        .extend(request_header_mutations);
+                        .extend(request_header_mutations.into_iter().map(Into::into));
                 }
                 Self::materialize_forward_after_auth(stream_id, req, h3, quic, exec_ctx, shared_ctx)
             }
-            Ok(decision) => {
+            ExternalAuthDecisionOutcome::Deny(response) => {
                 req.admission_state = StreamAdmissionState::Denied;
-                req.response_status = match &decision {
-                    ExternalAuthDecision::Deny(response) => Some(response.status.as_u16()),
-                    ExternalAuthDecision::Redirect(response) => Some(response.status.as_u16()),
-                    ExternalAuthDecision::Challenge(response) => Some(response.status.as_u16()),
-                    ExternalAuthDecision::Allow { .. } => None,
-                };
+                req.response_status = Some(response.status.as_u16());
                 metrics.inc_failure();
                 metrics.inc_policy_denied();
                 metrics.inc_external_auth_denied();
@@ -704,46 +687,117 @@ impl QUICListener {
                     req.upstream_name.as_deref().unwrap_or("unrouted"),
                     req.response_status.unwrap_or(0)
                 );
-                Self::send_external_auth_decision_response(h3, quic, stream_id, &decision)?;
+                Self::send_external_auth_decision_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    &ExternalAuthDecision::Deny(response),
+                )?;
                 Ok(false)
             }
-            Err(err) if req.auth_fail_open => {
-                match &err {
-                    ProxyError::Timeout => metrics.inc_external_auth_timeout(),
-                    _ => metrics.inc_external_auth_error(),
-                }
+            ExternalAuthDecisionOutcome::Redirect(response) => {
+                req.admission_state = StreamAdmissionState::Denied;
+                req.response_status = Some(response.status.as_u16());
+                metrics.inc_failure();
+                metrics.inc_policy_denied();
+                metrics.inc_external_auth_denied();
+                metrics.record_route(
+                    req.upstream_name.as_deref().unwrap_or("unrouted"),
+                    req.start.elapsed(),
+                    RouteOutcome::Failure,
+                );
                 warn!(
-                    "request_id={} route={} external auth failed open: {:?}",
+                    "request_id={} route={} external auth denied with status={}",
                     req.request_id,
                     req.upstream_name.as_deref().unwrap_or("unrouted"),
-                    err
+                    req.response_status.unwrap_or(0)
                 );
-                Self::materialize_forward_after_auth(stream_id, req, h3, quic, exec_ctx, shared_ctx)
+                Self::send_external_auth_decision_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    &ExternalAuthDecision::Redirect(response),
+                )?;
+                Ok(false)
             }
-            Err(err) => {
+            ExternalAuthDecisionOutcome::Challenge(response) => {
+                req.admission_state = StreamAdmissionState::Denied;
+                req.response_status = Some(response.status.as_u16());
+                metrics.inc_failure();
+                metrics.inc_policy_denied();
+                metrics.inc_external_auth_denied();
+                metrics.record_route(
+                    req.upstream_name.as_deref().unwrap_or("unrouted"),
+                    req.start.elapsed(),
+                    RouteOutcome::Failure,
+                );
+                warn!(
+                    "request_id={} route={} external auth denied with status={}",
+                    req.request_id,
+                    req.upstream_name.as_deref().unwrap_or("unrouted"),
+                    req.response_status.unwrap_or(0)
+                );
+                Self::send_external_auth_decision_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    &ExternalAuthDecision::Challenge(response),
+                )?;
+                Ok(false)
+            }
+            ExternalAuthDecisionOutcome::Timeout { .. }
+            | ExternalAuthDecisionOutcome::Error { .. } => {
+                let Some(failure) = outcome.failure_resolution() else {
+                    return Ok(false);
+                };
+                match &outcome {
+                    ExternalAuthDecisionOutcome::Timeout { .. } => {
+                        metrics.inc_external_auth_timeout();
+                    }
+                    ExternalAuthDecisionOutcome::Error { .. } => {
+                        metrics.inc_external_auth_error();
+                    }
+                    _ => {}
+                }
+                if matches!(failure, ExternalAuthFailureResolution::FailOpen) {
+                    if let ExternalAuthDecisionOutcome::Error { error, .. } = &outcome {
+                        warn!(
+                            "request_id={} route={} external auth failed open: {:?}",
+                            req.request_id,
+                            req.upstream_name.as_deref().unwrap_or("unrouted"),
+                            error
+                        );
+                    } else {
+                        warn!(
+                            "request_id={} route={} external auth failed open: timeout",
+                            req.request_id,
+                            req.upstream_name.as_deref().unwrap_or("unrouted"),
+                        );
+                    }
+                    return Self::materialize_forward_after_auth(
+                        stream_id, req, h3, quic, exec_ctx, shared_ctx,
+                    );
+                }
                 metrics.inc_failure();
                 let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
-                let (status, body, outcome) = match err {
-                    ProxyError::Timeout => {
-                        metrics.inc_external_auth_timeout();
-                        (
-                            http::StatusCode::GATEWAY_TIMEOUT,
-                            b"external auth timeout\n".as_slice(),
-                            RouteOutcome::Timeout,
-                        )
+                let (status, body, route_outcome) = match failure {
+                    ExternalAuthFailureResolution::Reject {
+                        status,
+                        body,
+                        timed_out,
+                    } => {
+                        let outcome = if timed_out {
+                            RouteOutcome::Timeout
+                        } else {
+                            RouteOutcome::Failure
+                        };
+                        (status, body, outcome)
                     }
-                    _ => {
-                        metrics.inc_external_auth_error();
-                        (
-                            http::StatusCode::SERVICE_UNAVAILABLE,
-                            b"external auth unavailable\n".as_slice(),
-                            RouteOutcome::Failure,
-                        )
-                    }
+                    ExternalAuthFailureResolution::FailOpen => unreachable!(),
                 };
                 req.admission_state = StreamAdmissionState::Denied;
                 req.response_status = Some(status.as_u16());
-                metrics.record_route(route_label, req.start.elapsed(), outcome);
+                metrics.record_route(route_label, req.start.elapsed(), route_outcome);
                 Self::send_simple_response(h3, quic, stream_id, status, body)?;
                 Ok(false)
             }

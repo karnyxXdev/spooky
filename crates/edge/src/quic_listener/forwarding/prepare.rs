@@ -4,7 +4,7 @@ use spooky_config::runtime::RuntimeExternalAuth;
 use tracing::Span;
 
 use super::{
-    auth::{AuthStart, auth_failure_mode, fail_open, start_external_auth_task},
+    auth::{AuthStart, start_external_auth_task},
     resolve::ForwardingResolvedTarget,
     *,
 };
@@ -13,7 +13,10 @@ use crate::{
         AdmissionPolicyDecision, admission_rejection_response,
         evaluate_forwarding_pre_admission_policy,
     },
-    runtime::connection::{auth::PendingHeaderMutation, request::PendingForward},
+    runtime::connection::{
+        auth::{ExternalAuthExecutionPolicy, PendingHeaderMutation},
+        request::PendingForward,
+    },
 };
 
 pub(super) struct PreparedRequest {
@@ -365,7 +368,11 @@ impl QUICListener {
                 let external_auth = upstream_policy.upstream_auth.external_auth.clone();
                 let auth_fail_open = external_auth
                     .as_ref()
-                    .map(|auth| fail_open(auth_failure_mode(auth)))
+                    .map(|auth| {
+                        ExternalAuthExecutionPolicy::from_external_auth(auth)
+                            .disposition()
+                            .fail_open()
+                    })
                     .unwrap_or(false);
                 let pending_forward = Arc::new(PendingForward {
                     method: Arc::<str>::from(method),

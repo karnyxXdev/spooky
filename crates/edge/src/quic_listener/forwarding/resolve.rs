@@ -27,24 +27,24 @@ impl<'a> RouteResolutionRequest<'a> {
     }
 }
 
-pub(crate) struct ResolvedRoute {
-    pub(crate) upstream_name: String,
-    pub(crate) upstream_pool: Arc<RwLock<UpstreamPool>>,
-    pub(crate) upstream_policy: RuntimeUpstreamPolicy,
-    pub(crate) route_path_len: usize,
-    pub(crate) route_host_specific: bool,
-    pub(crate) route_reason: RouteDecisionReason,
+pub(in crate::quic_listener) struct ResolvedRoute {
+    pub(in crate::quic_listener) upstream_name: String,
+    pub(in crate::quic_listener) upstream_pool: Arc<RwLock<UpstreamPool>>,
+    pub(in crate::quic_listener) upstream_policy: RuntimeUpstreamPolicy,
+    pub(in crate::quic_listener) route_path_len: usize,
+    pub(in crate::quic_listener) route_host_specific: bool,
+    pub(in crate::quic_listener) route_reason: RouteDecisionReason,
 }
 
-pub(crate) struct SelectedBackend {
-    pub(crate) backend_addr: String,
-    pub(crate) backend_index: usize,
-    pub(crate) backend_lb: String,
+pub(in crate::quic_listener) struct SelectedBackend {
+    pub(in crate::quic_listener) backend_addr: String,
+    pub(in crate::quic_listener) backend_index: usize,
+    pub(in crate::quic_listener) backend_lb: String,
 }
 
-pub(crate) struct ResolvedBackend {
-    pub(crate) route: ResolvedRoute,
-    pub(crate) backend: SelectedBackend,
+pub(in crate::quic_listener) struct ResolvedBackend {
+    pub(in crate::quic_listener) route: ResolvedRoute,
+    pub(in crate::quic_listener) backend: SelectedBackend,
 }
 
 pub(super) struct ForwardingResolvedTarget {
@@ -127,7 +127,7 @@ impl QUICListener {
         }
     }
 
-    pub(in crate::quic_listener) fn observe_route_resolution_failure(
+    fn observe_route_resolution_failure(
         request: &RouteResolutionRequest<'_>,
         err: &ProxyError,
         metrics: &Metrics,
@@ -248,11 +248,12 @@ impl QUICListener {
     ) -> Result<BootstrapResolvedTarget, ProxyError> {
         let resolution_request =
             RouteResolutionRequest::new(method, path, authority, None, header_lookup);
-        let ResolvedBackend { route, backend } = match Self::resolve_backend_request(
+        let ResolvedBackend { route, backend } = match Self::resolve_backend_internal(
             &resolution_request,
             upstream_pools,
             upstream_policies,
             routing_index,
+            true,
         ) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -450,7 +451,7 @@ impl QUICListener {
         Ok(ResolvedBackend { route, backend })
     }
 
-    pub(super) fn resolve_backend_without_inflight_request(
+    fn resolve_backend_without_inflight_request(
         request: &RouteResolutionRequest<'_>,
         upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
         upstream_policies: &HashMap<String, RuntimeUpstreamPolicy>,
@@ -465,8 +466,8 @@ impl QUICListener {
         )
     }
 
-    /// Resolve routing + LB for a request, returning `(backend_addr, backend_index, pool)`.
-    pub(in crate::quic_listener) fn resolve_backend_request(
+    #[cfg(test)]
+    pub(in crate::quic_listener) fn resolve_backend_request_for_test(
         request: &RouteResolutionRequest<'_>,
         upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
         upstream_policies: &HashMap<String, RuntimeUpstreamPolicy>,

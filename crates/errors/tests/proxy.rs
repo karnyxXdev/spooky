@@ -2,7 +2,7 @@ use spooky_errors::{
     PoolError, ProxyError, RetryPolicyDecision, RetryPolicyDenial, RetryPolicyInput,
     UpstreamErrorClassification, UpstreamHealthFailureMapping, UpstreamProxyErrorKind,
     UpstreamRetryReason, UpstreamRetryability, UpstreamTerminalErrorKind, UpstreamTlsReason,
-    classify_retryability, classify_upstream_proxy_error, evaluate_retry_policy,
+    classify_retryability, classify_upstream_proxy_error, evaluate_retry_policy, is_retryable,
 };
 
 #[test]
@@ -40,6 +40,10 @@ fn retryability_classification_distinguishes_retryable_and_terminal_errors() {
     assert_eq!(
         classify_retryability(&ProxyError::Tls("bad cert".to_string())),
         UpstreamRetryability::Terminal(UpstreamTerminalErrorKind::Tls)
+    );
+    assert_eq!(
+        classify_retryability(&ProxyError::Protocol("bad frame".to_string())),
+        UpstreamRetryability::Terminal(UpstreamTerminalErrorKind::Protocol)
     );
 }
 
@@ -127,4 +131,68 @@ fn upstream_proxy_error_classification_marks_timeout_as_retryable_health_failure
         classified.retryability,
         UpstreamRetryability::Retryable(UpstreamRetryReason::Timeout)
     );
+}
+
+#[test]
+fn upstream_proxy_error_classification_covers_protocol_and_transport_cases() {
+    let transport =
+        classify_upstream_proxy_error(&ProxyError::Transport("connection reset".into()))
+            .expect("classified transport");
+    assert_eq!(transport.kind, UpstreamProxyErrorKind::Transport);
+    assert_eq!(
+        transport.classification,
+        UpstreamErrorClassification::transport()
+    );
+    assert_eq!(
+        transport.health_failure,
+        Some(UpstreamHealthFailureMapping {
+            failure_reason: spooky_lb::health::HealthFailureReason::Transport,
+            metrics_reason: "transport",
+        })
+    );
+    assert_eq!(
+        transport.retryability,
+        UpstreamRetryability::Retryable(UpstreamRetryReason::Transport)
+    );
+
+    let protocol = classify_upstream_proxy_error(&ProxyError::Protocol("bad frame".into()))
+        .expect("classified protocol");
+    assert_eq!(protocol.kind, UpstreamProxyErrorKind::Protocol);
+    assert_eq!(
+        protocol.classification,
+        UpstreamErrorClassification::protocol()
+    );
+    assert!(protocol.health_failure.is_none());
+    assert_eq!(
+        protocol.retryability,
+        UpstreamRetryability::Terminal(UpstreamTerminalErrorKind::Protocol)
+    );
+}
+
+#[test]
+fn retryability_boolean_matches_typed_retryability_contract() {
+    let retryable_errors = [
+        ProxyError::Timeout,
+        ProxyError::Transport("reset".into()),
+        ProxyError::Pool(PoolError::UnknownBackend("api-a".into())),
+    ];
+    for err in retryable_errors {
+        assert!(is_retryable(&err));
+        assert!(matches!(
+            classify_retryability(&err),
+            UpstreamRetryability::Retryable(_)
+        ));
+    }
+
+    let terminal_errors = [
+        ProxyError::Tls("bad cert".into()),
+        ProxyError::Protocol("bad frame".into()),
+    ];
+    for err in terminal_errors {
+        assert!(!is_retryable(&err));
+        assert!(matches!(
+            classify_retryability(&err),
+            UpstreamRetryability::Terminal(_)
+        ));
+    }
 }

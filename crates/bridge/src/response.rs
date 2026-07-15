@@ -229,14 +229,13 @@ pub fn apply_response_header_defaults(
 
     if matches!(emission.content_length, ContentLengthPolicy::Strip) {
         headers.retain(|header| header.name != http::header::CONTENT_LENGTH);
-    } else if !has_content_length {
-        if let Ok(value) = HeaderValue::from_str(&body_len.to_string()) {
+    } else if !has_content_length
+        && let Ok(value) = HeaderValue::from_str(&body_len.to_string()) {
             headers.push(NormalizedHeader {
                 name: http::header::CONTENT_LENGTH,
                 value,
             });
         }
-    }
 
     if matches!(
         emission.content_type,

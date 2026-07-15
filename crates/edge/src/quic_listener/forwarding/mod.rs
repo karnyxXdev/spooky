@@ -1460,6 +1460,170 @@ mod tests {
     }
 
     #[test]
+    fn canonical_lb_key_resolver_extracts_common_sources() {
+        let headers = [
+            ("authorization".to_string(), "Bearer token-3".to_string()),
+            ("cookie".to_string(), "session=s123; theme=dark".to_string()),
+            ("x-user-id".to_string(), "alice".to_string()),
+        ]
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+        let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
+        let client_addr = "203.0.113.9:443".parse().expect("client addr");
+
+        let assert_key = |spec: &str, expected: &str| {
+            let resolved = QUICListener::resolve_lb_key(
+                "",
+                Some(spec),
+                "POST",
+                "/api/items?tenant=acme",
+                Some("api.example.com"),
+                Some("cid-123"),
+                Some(client_addr),
+                Some(&lookup),
+            );
+            assert_eq!(resolved.value, expected);
+            assert!(matches!(
+                resolved.source,
+                super::lb_key::LbKeySource::ConfiguredSpec
+            ));
+        };
+
+        assert_key("header:x-user-id", "alice");
+        assert_key("cookie:session", "s123");
+        assert_key("query:tenant", "acme");
+        assert_key("bearer_token", "token-3");
+        assert_key("cid", "cid-123");
+        assert_key("peer_ip", "203.0.113.9");
+        assert_key("path", "/api/items");
+        assert_key("authority", "api.example.com");
+        assert_key("method", "POST");
+    }
+
+    #[test]
+    fn canonical_lb_key_resolver_unifies_default_and_sticky_cid_fallbacks() {
+        let sticky = QUICListener::resolve_lb_key(
+            "sticky-cid",
+            Some("header:x-user-id"),
+            "GET",
+            "/resource",
+            Some("api.example.com"),
+            Some("cid-123"),
+            None,
+            None,
+        );
+        assert_eq!(sticky.value, "cid-123");
+        assert!(matches!(
+            sticky.source,
+            super::lb_key::LbKeySource::StickyCidFallback
+        ));
+
+        let authority_default = QUICListener::resolve_lb_key(
+            "",
+            Some("header:x-user-id"),
+            "GET",
+            "/resource",
+            Some("api.example.com"),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(authority_default.value, "api.example.com");
+        assert!(matches!(
+            authority_default.source,
+            super::lb_key::LbKeySource::DefaultFallback
+        ));
+
+        let path_default = QUICListener::resolve_lb_key(
+            "",
+            Some("header:x-user-id"),
+            "GET",
+            "/resource",
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(path_default.value, "/resource");
+
+        let method_default = QUICListener::resolve_lb_key(
+            "",
+            Some("header:x-user-id"),
+            "GET",
+            "",
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(method_default.value, "GET");
+        assert!(matches!(
+            method_default.source,
+            super::lb_key::LbKeySource::DefaultFallback
+        ));
+    }
+
+    #[test]
+    fn canonical_lb_key_route_request_adapter_matches_direct_resolver() {
+        let headers = [
+            ("authorization".to_string(), "Bearer token-4".to_string()),
+            ("x-user-id".to_string(), "bob".to_string()),
+        ]
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+        let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
+        let route_request = TestRouteResolutionRequest::new(
+            "GET",
+            "/api/items?tenant=acme",
+            Some("api.example.com"),
+            Some("cid-456"),
+            Some(&lookup),
+        );
+
+        let direct_header = QUICListener::resolve_lb_key(
+            "",
+            Some("header:x-user-id"),
+            "GET",
+            "/api/items?tenant=acme",
+            Some("api.example.com"),
+            Some("cid-456"),
+            None,
+            Some(&lookup),
+        );
+        let routed_header = QUICListener::resolve_lb_key_for_route_request(
+            "",
+            Some("header:x-user-id"),
+            &route_request,
+        );
+        assert_eq!(direct_header.value, routed_header.value);
+        assert!(matches!(
+            routed_header.source,
+            super::lb_key::LbKeySource::ConfiguredSpec
+        ));
+
+        let direct_sticky = QUICListener::resolve_lb_key(
+            "sticky-cid",
+            Some("header:x-missing"),
+            "GET",
+            "/api/items?tenant=acme",
+            Some("api.example.com"),
+            Some("cid-456"),
+            None,
+            Some(&lookup),
+        );
+        let routed_sticky = QUICListener::resolve_lb_key_for_route_request(
+            "sticky-cid",
+            Some("header:x-missing"),
+            &route_request,
+        );
+        assert_eq!(direct_sticky.value, routed_sticky.value);
+        assert!(matches!(
+            routed_sticky.source,
+            super::lb_key::LbKeySource::StickyCidFallback
+        ));
+    }
+
+    #[test]
     fn resolve_scoped_rate_limit_key_defaults_match_scope() {
         let client_rule = crate::resilience::scoped_rate_limit::ScopedRateLimitRule::from_config(
             &ScopedRateLimit {

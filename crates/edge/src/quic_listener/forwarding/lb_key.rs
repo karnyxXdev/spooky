@@ -95,6 +95,22 @@ fn extract_query_param(path: &str, param: &str) -> Option<String> {
 }
 
 impl QUICListener {
+    pub(in crate::quic_listener) fn resolve_lb_key_for_route_request(
+        lb_type: &str,
+        lb_key_spec: Option<&str>,
+        request: &super::resolve::RouteResolutionRequest<'_>,
+    ) -> ResolvedLbKey {
+        let request = LbKeyRequestParts::new(
+            request.method,
+            request.path,
+            request.authority,
+            request.cid_key,
+            None,
+            request.header_lookup,
+        );
+        Self::resolve_lb_key_for_input(&LbKeyResolutionInput::new(lb_type, lb_key_spec, request))
+    }
+
     pub(in crate::quic_listener) fn resolve_lb_key_from_parts(
         lb_key_spec: &str,
         request: &LbKeyRequestParts<'_>,

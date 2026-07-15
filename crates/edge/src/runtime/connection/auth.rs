@@ -1,32 +1,24 @@
 use std::{collections::HashMap, time::Duration};
 
 use quiche::h3::NameValue;
-use spooky_config::runtime::{
-    RuntimeExternalAuth, RuntimeExternalAuthFailureMode, RuntimeExternalAuthRequestHeader,
-};
+use spooky_config::runtime::{RuntimeExternalAuth, RuntimeExternalAuthFailureMode};
 use spooky_errors::ProxyError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExternalAuthProviderKind {
-    Http,
-    Oidc,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExternalAuthFailureDisposition {
+pub(crate) enum ExternalAuthFailureDisposition {
     FailOpen,
     FailClosed,
 }
 
 impl ExternalAuthFailureDisposition {
-    pub fn from_failure_mode(mode: RuntimeExternalAuthFailureMode) -> Self {
+    pub(crate) fn from_failure_mode(mode: RuntimeExternalAuthFailureMode) -> Self {
         match mode {
             RuntimeExternalAuthFailureMode::FailOpen => Self::FailOpen,
             RuntimeExternalAuthFailureMode::FailClosed => Self::FailClosed,
         }
     }
 
-    pub fn from_fail_open(fail_open: bool) -> Self {
+    pub(crate) fn from_fail_open(fail_open: bool) -> Self {
         if fail_open {
             Self::FailOpen
         } else {
@@ -34,19 +26,19 @@ impl ExternalAuthFailureDisposition {
         }
     }
 
-    pub fn fail_open(self) -> bool {
+    pub(crate) fn fail_open(self) -> bool {
         matches!(self, Self::FailOpen)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExternalAuthExecutionPolicy {
+pub(crate) struct ExternalAuthExecutionPolicy {
     pub timeout: Duration,
     pub failure_mode: RuntimeExternalAuthFailureMode,
 }
 
 impl ExternalAuthExecutionPolicy {
-    pub fn from_external_auth(value: &RuntimeExternalAuth) -> Self {
+    pub(crate) fn from_external_auth(value: &RuntimeExternalAuth) -> Self {
         match value {
             RuntimeExternalAuth::Http {
                 timeout_ms,
@@ -64,19 +56,19 @@ impl ExternalAuthExecutionPolicy {
         }
     }
 
-    pub fn disposition(self) -> ExternalAuthFailureDisposition {
+    pub(crate) fn disposition(self) -> ExternalAuthFailureDisposition {
         ExternalAuthFailureDisposition::from_failure_mode(self.failure_mode)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExternalAuthTaskConfig {
+pub(crate) struct ExternalAuthTaskConfig {
     pub timeout: Duration,
     pub disposition: ExternalAuthFailureDisposition,
 }
 
 impl ExternalAuthTaskConfig {
-    pub fn from_external_auth(value: &RuntimeExternalAuth) -> Self {
+    pub(crate) fn from_external_auth(value: &RuntimeExternalAuth) -> Self {
         let policy = ExternalAuthExecutionPolicy::from_external_auth(value);
         Self {
             timeout: policy.timeout,
@@ -85,131 +77,31 @@ impl ExternalAuthTaskConfig {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum ExternalAuthProviderInput<'a> {
-    Http {
-        endpoint: &'a str,
-        request_headers: &'a [RuntimeExternalAuthRequestHeader],
-        response_header_allowlist: &'a [String],
-    },
-    Oidc {
-        discovery_url: Option<&'a str>,
-        issuer_url: Option<&'a str>,
-        client_id: &'a str,
-        client_secret: Option<&'a str>,
-        audience: Option<&'a str>,
-        scopes: &'a [String],
-        request_headers: &'a [RuntimeExternalAuthRequestHeader],
-        response_header_allowlist: &'a [String],
-    },
-}
-
-impl<'a> ExternalAuthProviderInput<'a> {
-    pub fn kind(&self) -> ExternalAuthProviderKind {
-        match self {
-            Self::Http { .. } => ExternalAuthProviderKind::Http,
-            Self::Oidc { .. } => ExternalAuthProviderKind::Oidc,
-        }
-    }
-
-    pub fn request_headers(&self) -> &'a [RuntimeExternalAuthRequestHeader] {
-        match self {
-            Self::Http {
-                request_headers, ..
-            }
-            | Self::Oidc {
-                request_headers, ..
-            } => request_headers,
-        }
-    }
-
-    pub fn response_header_allowlist(&self) -> &'a [String] {
-        match self {
-            Self::Http {
-                response_header_allowlist,
-                ..
-            }
-            | Self::Oidc {
-                response_header_allowlist,
-                ..
-            } => response_header_allowlist,
-        }
-    }
-}
-
-impl<'a> From<&'a RuntimeExternalAuth> for ExternalAuthProviderInput<'a> {
-    fn from(value: &'a RuntimeExternalAuth) -> Self {
-        match value {
-            RuntimeExternalAuth::Http {
-                endpoint,
-                request_headers,
-                response_header_allowlist,
-                ..
-            } => Self::Http {
-                endpoint,
-                request_headers,
-                response_header_allowlist,
-            },
-            RuntimeExternalAuth::Oidc {
-                discovery_url,
-                issuer_url,
-                client_id,
-                client_secret,
-                audience,
-                scopes,
-                request_headers,
-                response_header_allowlist,
-                ..
-            } => Self::Oidc {
-                discovery_url: discovery_url.as_deref(),
-                issuer_url: issuer_url.as_deref(),
-                client_id,
-                client_secret: client_secret.as_deref(),
-                audience: audience.as_deref(),
-                scopes,
-                request_headers,
-                response_header_allowlist,
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExternalAuthRequestContext<'a> {
-    pub method: &'a str,
-    pub path: &'a str,
-    pub authority: Option<&'a str>,
-    pub upstream_name: &'a str,
-    pub backend_addr: &'a str,
-}
-
 #[derive(Debug)]
-pub struct ExternalAuthResponseMetadata<'a> {
+pub(crate) struct ExternalAuthResponseMetadata<'a> {
     pub status: http::StatusCode,
     pub headers: &'a http::HeaderMap,
     pub body: &'a [u8],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OidcAuthorizationCheck {
+pub(crate) enum OidcAuthorizationCheck {
     Token(String),
     Challenge(ExternalAuthChallengeResponse),
 }
 
 #[derive(Debug, Clone)]
-pub struct OidcDiscoveryTarget {
+pub(crate) struct OidcDiscoveryTarget {
     pub url: String,
-    pub uri: http::Uri,
 }
 
 #[derive(Debug, Clone)]
-pub struct OidcProviderMetadata {
+pub(crate) struct OidcProviderMetadata {
     pub introspection_endpoint: String,
-    pub introspection_uri: http::Uri,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExternalAuthMutationIntent {
+pub(crate) enum ExternalAuthMutationIntent {
     Upsert { name: Vec<u8>, value: Vec<u8> },
     Remove { name: Vec<u8> },
 }
@@ -233,7 +125,7 @@ impl From<PendingHeaderMutation> for ExternalAuthMutationIntent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExternalAuthDecision {
+pub(crate) enum ExternalAuthDecision {
     Allow {
         request_header_mutations: Vec<PendingHeaderMutation>,
     },
@@ -242,10 +134,10 @@ pub enum ExternalAuthDecision {
     Challenge(ExternalAuthChallengeResponse),
 }
 
-pub type ExternalAuthResult = Result<ExternalAuthDecision, ProxyError>;
+pub(crate) type ExternalAuthResult = Result<ExternalAuthDecision, ProxyError>;
 
 #[derive(Debug)]
-pub enum ExternalAuthDecisionOutcome {
+enum ExternalAuthDecisionOutcome {
     Allow {
         request_header_mutations: Vec<ExternalAuthMutationIntent>,
     },
@@ -262,7 +154,7 @@ pub enum ExternalAuthDecisionOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExternalAuthFailureResolution {
+enum ExternalAuthFailureResolution {
     FailOpen,
     Reject {
         status: http::StatusCode,
@@ -272,7 +164,7 @@ pub enum ExternalAuthFailureResolution {
 }
 
 #[derive(Debug)]
-pub enum ExternalAuthCompletion {
+pub(crate) enum ExternalAuthCompletion {
     Allow {
         request_header_mutations: Vec<PendingHeaderMutation>,
     },
@@ -290,7 +182,7 @@ pub enum ExternalAuthCompletion {
 }
 
 impl ExternalAuthDecisionOutcome {
-    pub fn from_result(
+    fn from_result(
         result: ExternalAuthResult,
         disposition: ExternalAuthFailureDisposition,
     ) -> Self {
@@ -311,7 +203,7 @@ impl ExternalAuthDecisionOutcome {
         }
     }
 
-    pub fn failure_resolution(&self) -> Option<ExternalAuthFailureResolution> {
+    fn failure_resolution(&self) -> Option<ExternalAuthFailureResolution> {
         match self {
             Self::Timeout { disposition } => Some(if disposition.fail_open() {
                 ExternalAuthFailureResolution::FailOpen
@@ -337,7 +229,7 @@ impl ExternalAuthDecisionOutcome {
 }
 
 impl ExternalAuthDecision {
-    pub fn status(&self) -> http::StatusCode {
+    pub(crate) fn status(&self) -> http::StatusCode {
         match self {
             Self::Allow { .. } => http::StatusCode::OK,
             Self::Deny(response) => response.status,
@@ -347,7 +239,7 @@ impl ExternalAuthDecision {
     }
 }
 
-pub fn evaluate_external_auth_completion(
+pub(crate) fn evaluate_external_auth_completion(
     result: ExternalAuthResult,
     disposition: ExternalAuthFailureDisposition,
 ) -> ExternalAuthCompletion {
@@ -406,7 +298,7 @@ pub fn evaluate_external_auth_completion(
     }
 }
 
-pub fn oidc_authorization_check(authorization: Option<&str>) -> OidcAuthorizationCheck {
+pub(crate) fn oidc_authorization_check(authorization: Option<&str>) -> OidcAuthorizationCheck {
     let Some(authorization) = authorization else {
         return OidcAuthorizationCheck::Challenge(ExternalAuthChallengeResponse {
             status: http::StatusCode::UNAUTHORIZED,
@@ -433,7 +325,7 @@ fn bearer_token_from_authorization_value(raw: &str) -> Option<&str> {
         .then_some(value.trim())
 }
 
-pub fn auth_uri_scheme_permitted(uri: &http::Uri) -> bool {
+fn auth_uri_scheme_permitted(uri: &http::Uri) -> bool {
     match uri.scheme_str() {
         Some("https") => uri.authority().is_some(),
         Some("http") => uri.host().is_some_and(uri_host_is_loopback),
@@ -452,7 +344,7 @@ fn uri_host_is_loopback(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-pub fn oidc_discovery_target(
+pub(crate) fn oidc_discovery_target(
     discovery_url: Option<&str>,
     issuer_url: Option<&str>,
 ) -> Result<OidcDiscoveryTarget, ProxyError> {
@@ -476,10 +368,10 @@ pub fn oidc_discovery_target(
             "oidc discovery endpoint must use https (http allowed only for loopback)".into(),
         ));
     }
-    Ok(OidcDiscoveryTarget { url, uri })
+    Ok(OidcDiscoveryTarget { url })
 }
 
-pub fn validate_oidc_provider_metadata(
+pub(crate) fn validate_oidc_provider_metadata(
     document: &serde_json::Value,
 ) -> Result<OidcProviderMetadata, ProxyError> {
     let introspection_endpoint = document
@@ -499,18 +391,20 @@ pub fn validate_oidc_provider_metadata(
     }
     Ok(OidcProviderMetadata {
         introspection_endpoint,
-        introspection_uri,
     })
 }
 
-pub fn oidc_scope_satisfied(required_scopes: &[String], granted_scopes: &str) -> bool {
+pub(crate) fn oidc_scope_satisfied(required_scopes: &[String], granted_scopes: &str) -> bool {
     let granted: std::collections::HashSet<&str> = granted_scopes.split_whitespace().collect();
     required_scopes
         .iter()
         .all(|scope| granted.contains(scope.as_str()))
 }
 
-pub fn oidc_audience_matches(expected: Option<&str>, value: Option<&serde_json::Value>) -> bool {
+pub(crate) fn oidc_audience_matches(
+    expected: Option<&str>,
+    value: Option<&serde_json::Value>,
+) -> bool {
     let Some(expected) = expected else {
         return true;
     };
@@ -591,7 +485,7 @@ fn normalize_auth_request_mutation(
     }
 }
 
-pub fn canonicalize_auth_request_mutations<I>(mutations: I) -> Vec<PendingHeaderMutation>
+fn canonicalize_auth_request_mutations<I>(mutations: I) -> Vec<PendingHeaderMutation>
 where
     I: IntoIterator<Item = PendingHeaderMutation>,
 {
@@ -614,8 +508,10 @@ where
         .collect()
 }
 
-pub fn merge_auth_request_mutations<I>(existing: &mut Vec<PendingHeaderMutation>, incoming: I)
-where
+pub(crate) fn merge_auth_request_mutations<I>(
+    existing: &mut Vec<PendingHeaderMutation>,
+    incoming: I,
+) where
     I: IntoIterator<Item = PendingHeaderMutation>,
 {
     existing.extend(incoming);
@@ -623,7 +519,7 @@ where
     *existing = merged;
 }
 
-pub fn apply_auth_request_mutations(
+pub(crate) fn apply_auth_request_mutations(
     headers: &mut Vec<quiche::h3::Header>,
     mutations: &[PendingHeaderMutation],
 ) {
@@ -640,7 +536,7 @@ pub fn apply_auth_request_mutations(
     }
 }
 
-pub fn allowed_auth_headers(
+pub(crate) fn allowed_auth_headers(
     headers: &http::HeaderMap,
     allowlist: &[String],
 ) -> Vec<(String, String)> {
@@ -661,7 +557,7 @@ pub fn allowed_auth_headers(
         .collect()
 }
 
-pub fn auth_allow_mutations(
+pub(crate) fn auth_allow_mutations(
     headers: &http::HeaderMap,
     allowlist: &[String],
 ) -> Vec<PendingHeaderMutation> {
@@ -673,7 +569,7 @@ pub fn auth_allow_mutations(
     ))
 }
 
-pub fn map_http_external_auth_response(
+pub(crate) fn map_http_external_auth_response(
     metadata: ExternalAuthResponseMetadata<'_>,
     response_header_allowlist: &[String],
 ) -> ExternalAuthResult {
@@ -747,21 +643,21 @@ pub fn map_http_external_auth_response(
 /// Result type returned by the in-flight upstream forwarding task.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalAuthDenyResponse {
+pub(crate) struct ExternalAuthDenyResponse {
     pub status: http::StatusCode,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalAuthRedirectResponse {
+pub(crate) struct ExternalAuthRedirectResponse {
     pub status: http::StatusCode,
     pub headers: Vec<(String, String)>,
     pub location: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalAuthChallengeResponse {
+pub(crate) struct ExternalAuthChallengeResponse {
     pub status: http::StatusCode,
     pub headers: Vec<(String, String)>,
     pub www_authenticate: String,
@@ -769,7 +665,7 @@ pub struct ExternalAuthChallengeResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PendingHeaderMutation {
+pub(crate) enum PendingHeaderMutation {
     Upsert { name: Vec<u8>, value: Vec<u8> },
     Remove { name: Vec<u8> },
 }
@@ -1056,7 +952,7 @@ mod tests {
 
         let http_loopback = oidc_discovery_target(Some("http://127.0.0.1:9000/oidc"), None)
             .expect("loopback discovery should be allowed");
-        assert_eq!(http_loopback.uri.scheme_str(), Some("http"));
+        assert!(http_loopback.url.starts_with("http://"));
 
         let err = oidc_discovery_target(Some("http://example.com/oidc"), None)
             .expect_err("non-loopback http discovery must be rejected");

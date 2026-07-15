@@ -174,24 +174,28 @@ impl QUICListener {
                                     HealthClassification::Failure
                                 }
                                 Err(_) => {
-                                    let classified =
+                                    if let Some(classified) =
                                         classify_upstream_proxy_error(&ProxyError::Timeout)
-                                            .expect("timeout must classify");
-                                    Self::log_classified_upstream_failure(
-                                        "health_check",
-                                        None,
-                                        None,
-                                        &job.backend_identity,
-                                        &classified,
-                                    );
-                                    Self::mark_classified_upstream_health_failure(
-                                        "health_check",
-                                        &job.backend_identity,
-                                        job.index,
-                                        Some(&job.upstream_pool),
-                                        task_metrics.as_ref(),
-                                        &classified,
-                                    );
+                                    {
+                                        Self::log_classified_upstream_failure(
+                                            "health_check",
+                                            None,
+                                            None,
+                                            &job.backend_identity,
+                                            &classified,
+                                        );
+                                        Self::mark_classified_upstream_health_failure(
+                                            "health_check",
+                                            &job.backend_identity,
+                                            job.index,
+                                            Some(&job.upstream_pool),
+                                            task_metrics.as_ref(),
+                                            &classified,
+                                        );
+                                    } else {
+                                        task_metrics
+                                            .inc_health_failure(HealthFailureReason::Timeout);
+                                    }
                                     HealthClassification::Failure
                                 }
                             };

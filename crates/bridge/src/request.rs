@@ -10,8 +10,7 @@ use spooky_config::{
 
 use crate::{
     BridgeError,
-    context::{ForwardedHeaderChains, ForwardedHeaderValues},
-    forwarded::build_forwarded_header_values,
+    forwarded::{ForwardedHeaderChains, ForwardedHeaderValues, build_forwarded_header_values},
     headers::{connection_header_tokens, should_strip_request_header},
     host::resolve_upstream_host_value,
 };
@@ -59,28 +58,28 @@ pub struct RequestBuildInput<'a, B = BoxBody<Bytes, Infallible>> {
 }
 
 #[derive(Debug)]
-pub struct RequestHeaderPolicyInput<'a> {
-    pub target: RequestBuildTarget<'a>,
-    pub authority: Option<&'a str>,
-    pub headers: &'a [quiche::h3::Header],
-    pub preserve_upgrade: bool,
-    pub forwarded: RequestForwardedContext,
+pub(crate) struct RequestHeaderPolicyInput<'a> {
+    pub(crate) target: RequestBuildTarget<'a>,
+    pub(crate) authority: Option<&'a str>,
+    pub(crate) headers: &'a [quiche::h3::Header],
+    pub(crate) preserve_upgrade: bool,
+    pub(crate) forwarded: RequestForwardedContext,
 }
 
 #[derive(Debug)]
-pub struct ResolvedRequestHeaderPolicy {
-    pub passthrough_headers: Vec<(HeaderName, HeaderValue)>,
-    pub host_value: String,
-    pub forwarded_values: ForwardedHeaderValues,
+pub(crate) struct ResolvedRequestHeaderPolicy {
+    pub(crate) passthrough_headers: Vec<(HeaderName, HeaderValue)>,
+    pub(crate) host_value: String,
+    pub(crate) forwarded_values: ForwardedHeaderValues,
 }
 
-pub struct RequestHeaderAssembly<'a> {
-    pub resolved_headers: ResolvedRequestHeaderPolicy,
-    pub trace: RequestTraceContext<'a>,
-    pub content_length: Option<usize>,
-    pub include_content_length: bool,
-    pub include_host_header: bool,
-    pub add_te_trailers: bool,
+pub(crate) struct RequestHeaderAssembly<'a> {
+    pub(crate) resolved_headers: ResolvedRequestHeaderPolicy,
+    pub(crate) trace: RequestTraceContext<'a>,
+    pub(crate) content_length: Option<usize>,
+    pub(crate) include_content_length: bool,
+    pub(crate) include_host_header: bool,
+    pub(crate) add_te_trailers: bool,
 }
 
 impl<'a, B> RequestBuildInput<'a, B> {
@@ -93,7 +92,7 @@ impl<'a, B> RequestBuildInput<'a, B> {
     }
 }
 
-pub fn apply_request_header_policies(
+pub(crate) fn apply_request_header_policies(
     input: RequestHeaderPolicyInput<'_>,
 ) -> Result<ResolvedRequestHeaderPolicy, BridgeError> {
     use quiche::h3::NameValue;
@@ -176,7 +175,7 @@ pub fn apply_request_header_policies(
     })
 }
 
-pub fn apply_request_header_assembly(
+pub(crate) fn apply_request_header_assembly(
     mut builder: http::request::Builder,
     assembly: RequestHeaderAssembly<'_>,
 ) -> Result<http::request::Builder, BridgeError> {

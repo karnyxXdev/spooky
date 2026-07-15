@@ -3,18 +3,12 @@ use std::convert::Infallible;
 use bytes::Bytes;
 use http::{Method, Request, Uri};
 use http_body_util::combinators::BoxBody;
-use spooky_config::{
-    backend_endpoint::BackendEndpoint,
-    config::{ForwardedHeaderPolicy, UpstreamHostPolicy},
-};
 
 use crate::{
     BridgeError,
-    context::ForwardedContext,
     request::{
-        RequestBuildInput, RequestBuildPolicies, RequestBuildTarget, RequestHeaderAssembly,
-        RequestHeaderPolicyInput, RequestTraceContext, apply_request_header_assembly,
-        apply_request_header_policies,
+        RequestBuildInput, RequestBuildTarget, RequestHeaderAssembly, RequestHeaderPolicyInput,
+        apply_request_header_assembly, apply_request_header_policies,
     },
     websocket::{H3WebsocketRequestKind, h3_websocket_request_kind},
 };
@@ -74,47 +68,6 @@ pub fn build_h1_request(
     )?;
 
     builder.body(body).map_err(BridgeError::Build)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn build_h1_request_for_endpoint_with_host_policy(
-    endpoint: &BackendEndpoint,
-    host_policy: &UpstreamHostPolicy,
-    forwarded_policy: &ForwardedHeaderPolicy,
-    method: &str,
-    path: &str,
-    headers: &[quiche::h3::Header],
-    body: BoxBody<Bytes, Infallible>,
-    content_length: Option<usize>,
-    forwarded_ctx: ForwardedContext<'_>,
-) -> Result<Request<BoxBody<Bytes, Infallible>>, BridgeError> {
-    build_h1_request(
-        RequestBuildTarget {
-            endpoint,
-            policies: RequestBuildPolicies {
-                host_policy,
-                forwarded_header_policy: forwarded_policy,
-            },
-        },
-        RequestBuildInput {
-            method,
-            path,
-            authority: forwarded_ctx.request_authority,
-            headers,
-            body,
-            content_length,
-            body_mode: RequestBuildInput::<BoxBody<Bytes, Infallible>>::body_mode_for_length(
-                content_length,
-            ),
-            trace: RequestTraceContext {
-                request_id: forwarded_ctx.request_id,
-                traceparent: forwarded_ctx.traceparent,
-            },
-            forwarded: crate::request::RequestForwardedContext {
-                client_addr: forwarded_ctx.client_addr,
-            },
-        },
-    )
 }
 
 #[cfg(test)]

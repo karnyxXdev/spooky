@@ -3,10 +3,18 @@ use std::convert::Infallible;
 use spooky_config::runtime::RuntimeExternalAuth;
 use tracing::Span;
 
-use super::auth::{AuthStart, auth_failure_mode, fail_open, start_external_auth_task};
-use super::resolve::ResolvedBackend;
-use super::*;
-use crate::runtime::connection::{auth::PendingHeaderMutation, request::PendingForward};
+use super::{
+    auth::{AuthStart, auth_failure_mode, fail_open, start_external_auth_task},
+    resolve::ResolvedBackend,
+    *,
+};
+use crate::{
+    quic_listener::admission::{
+        AdmissionPolicyDecision, admission_rejection_response,
+        evaluate_forwarding_pre_admission_policy,
+    },
+    runtime::connection::{auth::PendingHeaderMutation, request::PendingForward},
+};
 
 pub(super) struct PreparedRequest {
     pub(super) upstream_name: String,
@@ -201,34 +209,116 @@ impl QUICListener {
                     .get(&upstream_name)
                     .cloned()
                     .unwrap_or_default();
-                let denied_challenge =
-                    if !Self::api_key_is_authorized(&upstream_policy, Some(&lb_header_lookup)) {
-                        Some(b"ApiKey".as_slice())
-                    } else if !Self::jwt_is_authorized(&upstream_policy, Some(&lb_header_lookup)) {
-                        Some(b"Bearer".as_slice())
-                    } else {
-                        None
-                    };
-                if let Some(challenge) = denied_challenge {
-                    metrics.inc_failure();
-                    metrics.inc_policy_denied();
-                    metrics.record_route(
-                        &upstream_name,
-                        request_start.elapsed(),
-                        RouteOutcome::Failure,
-                    );
-                    warn!(
-                        "request_id=unassigned route={} denied by local auth policy",
-                        upstream_name
-                    );
-                    Self::send_unauthorized_response(
-                        h3,
-                        quic,
-                        stream_id,
-                        b"unauthorized\n",
-                        challenge,
-                    )?;
-                    return Ok(None);
+                let admission = evaluate_forwarding_pre_admission_policy(
+                    &upstream_policy,
+                    Some(&lb_header_lookup),
+                    &resilience.brownout,
+                    resilience.adaptive_admission.inflight_percent(),
+                    &upstream_name,
+                    resilience.shed_retry_after_seconds,
+                    &resilience.scoped_rate_limits,
+                    |rule| {
+                        Self::resolve_scoped_rate_limit_key(
+                            rule,
+                            &upstream_name,
+                            method,
+                            path,
+                            authority,
+                            peer_address,
+                            Some(&lb_header_lookup),
+                        )
+                    },
+                );
+                metrics.set_brownout_active(resilience.brownout.is_active());
+                let rejection_response = admission_rejection_response(&admission);
+                match admission {
+                    AdmissionPolicyDecision::AdmitReady => {}
+                    AdmissionPolicyDecision::Unauthorized(_) => {
+                        metrics.inc_failure();
+                        metrics.inc_policy_denied();
+                        metrics.record_route(
+                            &upstream_name,
+                            request_start.elapsed(),
+                            RouteOutcome::Failure,
+                        );
+                        warn!(
+                            "request_id=unassigned route={} denied by local auth policy",
+                            upstream_name
+                        );
+                        let Some(response) = rejection_response.as_ref() else {
+                            warn!(
+                                "request_id=unassigned route={} missing admission rejection response for unauthorized decision",
+                                upstream_name
+                            );
+                            Self::send_simple_response(
+                                h3,
+                                quic,
+                                stream_id,
+                                http::StatusCode::INTERNAL_SERVER_ERROR,
+                                b"internal proxy error\n",
+                            )?;
+                            return Ok(None);
+                        };
+                        Self::send_admission_rejection_response(h3, quic, stream_id, response)?;
+                        return Ok(None);
+                    }
+                    AdmissionPolicyDecision::RateLimited(decision) => {
+                        metrics.inc_failure();
+                        metrics.inc_request_rate_limited();
+                        metrics.record_route(
+                            &upstream_name,
+                            request_start.elapsed(),
+                            RouteOutcome::RateLimited,
+                        );
+                        warn!(
+                            "request_id=unassigned route={} scoped rate limit exceeded by rule={}",
+                            decision.route, decision.rule_name
+                        );
+                        let Some(response) = rejection_response.as_ref() else {
+                            warn!(
+                                "request_id=unassigned route={} missing admission rejection response for rate-limited decision",
+                                upstream_name
+                            );
+                            Self::send_simple_response(
+                                h3,
+                                quic,
+                                stream_id,
+                                http::StatusCode::INTERNAL_SERVER_ERROR,
+                                b"internal proxy error\n",
+                            )?;
+                            return Ok(None);
+                        };
+                        Self::send_admission_rejection_response(h3, quic, stream_id, response)?;
+                        return Ok(None);
+                    }
+                    AdmissionPolicyDecision::Overloaded(decision) => {
+                        metrics.inc_failure();
+                        metrics.inc_overload_shed_reason(decision.reason.metrics_reason());
+                        metrics.record_route(
+                            &upstream_name,
+                            request_start.elapsed(),
+                            RouteOutcome::OverloadShed,
+                        );
+                        let Some(response) = rejection_response.as_ref() else {
+                            warn!(
+                                "request_id=unassigned route={} missing admission rejection response for overload decision",
+                                upstream_name
+                            );
+                            Self::send_simple_response(
+                                h3,
+                                quic,
+                                stream_id,
+                                http::StatusCode::INTERNAL_SERVER_ERROR,
+                                b"internal proxy error\n",
+                            )?;
+                            return Ok(None);
+                        };
+                        Self::send_admission_rejection_response(h3, quic, stream_id, response)?;
+                        resilience
+                            .adaptive_admission
+                            .observe(request_start.elapsed(), true);
+                        return Ok(None);
+                    }
                 }
 
                 let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);

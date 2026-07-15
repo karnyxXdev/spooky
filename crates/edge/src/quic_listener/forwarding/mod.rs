@@ -6,21 +6,11 @@ mod resolve;
 mod response;
 mod stream_progress;
 
-use self::prepare::{PreparedRequest, StartedAuthRequest};
+use std::{convert::Infallible, error::Error as StdError};
 
-use std::{
-    convert::Infallible,
-    error::Error as StdError,
-    time::{SystemTime, UNIX_EPOCH},
-};
-
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use hmac::{Hmac, Mac};
-use serde_json::Value;
-use sha2::Sha256;
 use spooky_config::config::ScopedRateLimitScope;
-use subtle::ConstantTimeEq;
 
+use self::prepare::{PreparedRequest, StartedAuthRequest};
 use super::*;
 use crate::runtime::connection::{request::PendingForward, stream::StreamAdmissionState};
 
@@ -295,155 +285,45 @@ impl QUICListener {
             )?;
             return Ok(false);
         };
-        let header_lookup = |name: &str| {
-            pending_forward
-                .headers
-                .iter()
-                .find(|header| header.name().eq_ignore_ascii_case(name.as_bytes()))
-                .and_then(|header| std::str::from_utf8(header.value()).ok())
-                .map(str::to_string)
-        };
 
-        resilience
-            .brownout
-            .observe_admission_pressure(resilience.adaptive_admission.inflight_percent());
-        metrics.set_brownout_active(resilience.brownout.is_active());
-        if !resilience.brownout.route_allowed(&upstream_name) {
-            metrics.inc_failure();
-            metrics.inc_overload_shed_reason(OverloadShedReason::Brownout);
-            metrics.record_route(
-                &upstream_name,
-                req.start.elapsed(),
-                RouteOutcome::OverloadShed,
-            );
-            Self::send_overload_response(
-                h3,
-                quic,
-                stream_id,
-                b"brownout active, non-core route shed\n",
-                resilience.shed_retry_after_seconds,
-            )?;
-            resilience
-                .adaptive_admission
-                .observe(req.start.elapsed(), true);
-            return Ok(false);
-        }
-
-        if let Some(rejection) = resilience.scoped_rate_limits.check(&upstream_name, |rule| {
-            Self::resolve_scoped_rate_limit_key(
-                rule,
-                &upstream_name,
-                &req.method,
-                &req.path,
-                req.authority.as_deref(),
-                pending_forward.client_addr,
-                Some(&header_lookup),
-            )
-        }) {
-            metrics.inc_failure();
-            metrics.inc_request_rate_limited();
-            metrics.record_route(
-                &upstream_name,
-                req.start.elapsed(),
-                RouteOutcome::RateLimited,
-            );
-            warn!(
-                "request_id={} route={} scoped rate limit exceeded by rule={}",
-                req.request_id, rejection.route, rejection.rule_name
-            );
-            Self::send_rate_limited_response(
-                h3,
-                quic,
-                stream_id,
-                b"request rate limited\n",
-                rejection.retry_after_seconds,
-            )?;
-            return Ok(false);
-        }
-
-        let adaptive_permit = match resilience.adaptive_admission.try_acquire() {
-            Some(permit) => permit,
-            None => {
-                metrics.inc_failure();
-                metrics.inc_overload_shed_reason(OverloadShedReason::AdaptiveAdmission);
-                metrics.record_route(
-                    &upstream_name,
-                    req.start.elapsed(),
-                    RouteOutcome::OverloadShed,
-                );
-                Self::send_overload_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    b"adaptive admission overload\n",
-                    resilience.shed_retry_after_seconds,
-                )?;
-                resilience
-                    .adaptive_admission
-                    .observe(req.start.elapsed(), true);
-                return Ok(false);
-            }
-        };
-
-        let route_queue_permit = match resilience.route_queue.try_acquire(&upstream_name) {
-            Ok(permit) => permit,
-            Err(RouteQueueRejection::RouteCap) => {
-                metrics.inc_failure();
-                metrics.inc_overload_shed_reason(OverloadShedReason::RouteCap);
-                metrics.record_route(
-                    &upstream_name,
-                    req.start.elapsed(),
-                    RouteOutcome::OverloadShed,
-                );
-                Self::send_overload_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    b"route queue cap exceeded\n",
-                    resilience.shed_retry_after_seconds,
-                )?;
-                resilience
-                    .adaptive_admission
-                    .observe(req.start.elapsed(), true);
-                return Ok(false);
-            }
-            Err(RouteQueueRejection::GlobalCap) => {
-                metrics.inc_failure();
-                metrics.inc_overload_shed_reason(OverloadShedReason::RouteGlobalCap);
-                metrics.record_route(
-                    &upstream_name,
-                    req.start.elapsed(),
-                    RouteOutcome::OverloadShed,
-                );
-                Self::send_overload_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    b"global queue cap exceeded\n",
-                    resilience.shed_retry_after_seconds,
-                )?;
-                resilience
-                    .adaptive_admission
-                    .observe(req.start.elapsed(), true);
-                return Ok(false);
-            }
-        };
-
-        let global_permit = match Self::try_acquire_owned_with_micro_wait(
+        let (
+            backend_index,
+            upstream_pool,
+            global_permit,
+            upstream_permit,
+            adaptive_permit,
+            route_queue_permit,
+        ) = match crate::quic_listener::admission::execute_forwarding_post_auth_admission(
+            resilience,
+            &upstream_name,
+            req.upstream_pool.as_ref(),
+            req.backend_index,
+            pending_forward.backend_index,
+            exec_ctx.upstream_inflight,
             Arc::clone(&exec_ctx.global_inflight),
             exec_ctx.inflight_acquire_wait,
         ) {
-            Ok((permit, waited)) => {
-                if waited {
+            crate::quic_listener::admission::PostAuthAdmissionExecution::Ready(ready) => {
+                if ready.waited_for_global_permit {
                     metrics.inc_inflight_wait_admit_global();
                 }
-                permit
+                if ready.waited_for_upstream_permit {
+                    metrics.inc_inflight_wait_admit_upstream();
+                }
+                (
+                    ready.backend_index,
+                    ready.upstream_pool,
+                    ready.global_permit,
+                    ready.upstream_permit,
+                    ready.adaptive_permit,
+                    ready.route_queue_permit,
+                )
             }
-            Err(_) => {
-                drop(route_queue_permit);
-                drop(adaptive_permit);
+            crate::quic_listener::admission::PostAuthAdmissionExecution::Rejected(
+                crate::quic_listener::admission::PostAuthAdmissionRejection::Overloaded(decision),
+            ) => {
                 metrics.inc_failure();
-                metrics.inc_overload_shed_reason(OverloadShedReason::GlobalInflight);
+                metrics.inc_overload_shed_reason(decision.reason.metrics_reason());
                 metrics.record_route(
                     &upstream_name,
                     req.start.elapsed(),
@@ -453,124 +333,42 @@ impl QUICListener {
                     h3,
                     quic,
                     stream_id,
-                    b"overloaded, retry later\n",
-                    resilience.shed_retry_after_seconds,
+                    decision.body,
+                    decision.retry_after_seconds,
                 )?;
                 resilience
                     .adaptive_admission
                     .observe(req.start.elapsed(), true);
                 return Ok(false);
             }
-        };
-
-        let upstream_permit = match exec_ctx.upstream_inflight.get(&upstream_name).cloned() {
-            Some(semaphore) => {
-                match Self::try_acquire_owned_with_micro_wait(
-                    semaphore,
-                    exec_ctx.inflight_acquire_wait,
-                ) {
-                    Ok((permit, waited)) => {
-                        if waited {
-                            metrics.inc_inflight_wait_admit_upstream();
-                        }
-                        permit
-                    }
-                    Err(_) => {
-                        drop(global_permit);
-                        drop(route_queue_permit);
-                        drop(adaptive_permit);
-                        metrics.inc_failure();
-                        metrics.inc_overload_shed_reason(OverloadShedReason::UpstreamInflight);
-                        metrics.record_route(
-                            &upstream_name,
-                            req.start.elapsed(),
-                            RouteOutcome::OverloadShed,
-                        );
-                        Self::send_overload_response(
-                            h3,
-                            quic,
-                            stream_id,
-                            b"upstream overloaded, retry later\n",
-                            resilience.shed_retry_after_seconds,
-                        )?;
-                        resilience
-                            .adaptive_admission
-                            .observe(req.start.elapsed(), true);
-                        return Ok(false);
-                    }
-                }
-            }
-            None => {
-                drop(global_permit);
-                drop(route_queue_permit);
-                drop(adaptive_permit);
+            crate::quic_listener::admission::PostAuthAdmissionExecution::Rejected(
+                crate::quic_listener::admission::PostAuthAdmissionRejection::Failed(decision),
+            ) => {
                 metrics.inc_failure();
-                metrics.inc_overload_shed_reason(OverloadShedReason::UpstreamInflight);
-                metrics.record_route(
-                    &upstream_name,
-                    req.start.elapsed(),
-                    RouteOutcome::OverloadShed,
-                );
-                Self::send_simple_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    http::StatusCode::SERVICE_UNAVAILABLE,
-                    b"upstream admission limiter unavailable\n",
-                )?;
-                resilience
-                    .adaptive_admission
-                    .observe(req.start.elapsed(), true);
+                if let Some(reason) = decision.overload_reason {
+                    metrics.inc_overload_shed_reason(reason.metrics_reason());
+                }
+                if let Some(route_outcome) = decision.route_outcome {
+                    metrics.record_route(&upstream_name, req.start.elapsed(), route_outcome);
+                }
+                Self::send_simple_response(h3, quic, stream_id, decision.status, decision.body)?;
+                if decision.observe_adaptive_overload {
+                    resilience
+                        .adaptive_admission
+                        .observe(req.start.elapsed(), true);
+                }
                 return Ok(false);
             }
         };
 
-        let backend_index = req.backend_index.unwrap_or(pending_forward.backend_index);
-        let Some(upstream_pool) = req.upstream_pool.as_ref().cloned() else {
-            drop(upstream_permit);
-            drop(global_permit);
-            drop(route_queue_permit);
-            drop(adaptive_permit);
-            metrics.inc_failure();
-            Self::send_simple_response(
-                h3,
-                quic,
-                stream_id,
-                http::StatusCode::INTERNAL_SERVER_ERROR,
-                b"missing upstream pool\n",
-            )?;
-            return Ok(false);
-        };
-        let request_started = upstream_pool
-            .read()
-            .ok()
-            .is_some_and(|pool| pool.begin_request_if_healthy(backend_index));
-        if !request_started {
-            drop(upstream_permit);
-            drop(global_permit);
-            drop(route_queue_permit);
-            drop(adaptive_permit);
-            metrics.inc_failure();
-            metrics.record_route(&upstream_name, req.start.elapsed(), RouteOutcome::Failure);
-            Self::send_simple_response(
-                h3,
-                quic,
-                stream_id,
-                http::StatusCode::SERVICE_UNAVAILABLE,
-                b"selected backend no longer healthy\n",
-            )?;
-            return Ok(false);
-        }
-
-        let backend_addr = pending_forward.backend_addr.to_string();
-        let Some(backend_endpoint) = exec_ctx.backend_endpoints.get(&backend_addr).cloned() else {
+        let Some(backend_endpoint) = exec_ctx
+            .backend_endpoints
+            .get(pending_forward.backend_addr.as_ref())
+            .cloned()
+        else {
             if let Ok(mut guard) = upstream_pool.write() {
                 guard.finish_request(backend_index, req.start.elapsed(), Some(503));
             }
-            drop(upstream_permit);
-            drop(global_permit);
-            drop(route_queue_permit);
-            drop(adaptive_permit);
             metrics.inc_failure();
             metrics.record_route(&upstream_name, req.start.elapsed(), RouteOutcome::Failure);
             Self::send_simple_response(
@@ -1254,178 +1052,6 @@ impl QUICListener {
         Ok(())
     }
 
-    pub(crate) fn api_key_is_authorized(
-        policy: &RuntimeUpstreamPolicy,
-        header_lookup: Option<&LbHeaderLookup<'_>>,
-    ) -> bool {
-        let Some(api_key) = policy.upstream_auth.api_key.as_ref() else {
-            return true;
-        };
-        let Some(provided) = header_lookup.and_then(|lookup| lookup(api_key.header_name.as_str()))
-        else {
-            return false;
-        };
-        let provided = provided.trim();
-        !provided.is_empty()
-            && api_key
-                .keys
-                .iter()
-                .any(|expected| bool::from(provided.as_bytes().ct_eq(expected.as_bytes())))
-    }
-
-    pub(crate) fn jwt_is_authorized(
-        policy: &RuntimeUpstreamPolicy,
-        header_lookup: Option<&LbHeaderLookup<'_>>,
-    ) -> bool {
-        let Some(jwt) = policy.upstream_auth.jwt.as_ref() else {
-            return true;
-        };
-        let Some(raw) =
-            header_lookup.and_then(|lookup| lookup(http::header::AUTHORIZATION.as_str()))
-        else {
-            return false;
-        };
-        let Some(token) = Self::bearer_token_from_authorization_value(&raw) else {
-            return false;
-        };
-        let Some(claims) = Self::validated_hs256_jwt_claims(token.as_str(), jwt, SystemTime::now())
-        else {
-            return false;
-        };
-        Self::jwt_claims_satisfy_rbac(policy, &claims)
-    }
-
-    fn validated_hs256_jwt_claims(
-        token: &str,
-        jwt: &spooky_config::runtime::RuntimeJwtAuth,
-        now: SystemTime,
-    ) -> Option<Value> {
-        let mut parts = token.split('.');
-        let (Some(header_b64), Some(payload_b64), Some(signature_b64), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return None;
-        };
-        let Ok(header_bytes) = URL_SAFE_NO_PAD.decode(header_b64) else {
-            return None;
-        };
-        let Ok(payload_bytes) = URL_SAFE_NO_PAD.decode(payload_b64) else {
-            return None;
-        };
-        let Ok(signature) = URL_SAFE_NO_PAD.decode(signature_b64) else {
-            return None;
-        };
-        let Ok(header) = serde_json::from_slice::<Value>(&header_bytes) else {
-            return None;
-        };
-        if header.get("alg").and_then(Value::as_str) != Some("HS256") {
-            return None;
-        }
-
-        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(jwt.secret.as_bytes()) else {
-            return None;
-        };
-        mac.update(format!("{header_b64}.{payload_b64}").as_bytes());
-        let expected = mac.finalize().into_bytes();
-        if expected.len() != signature.len()
-            || !bool::from(expected.as_slice().ct_eq(signature.as_slice()))
-        {
-            return None;
-        }
-
-        let Ok(claims) = serde_json::from_slice::<Value>(&payload_bytes) else {
-            return None;
-        };
-        let Ok(now_secs) = now.duration_since(UNIX_EPOCH).map(|value| value.as_secs()) else {
-            return None;
-        };
-        let exp = claims.get("exp").and_then(Value::as_u64)?;
-        if now_secs > exp.saturating_add(jwt.clock_skew_secs) {
-            return None;
-        }
-        if claims
-            .get("nbf")
-            .and_then(Value::as_u64)
-            .is_some_and(|nbf| now_secs.saturating_add(jwt.clock_skew_secs) < nbf)
-        {
-            return None;
-        }
-        if claims
-            .get("iat")
-            .and_then(Value::as_u64)
-            .is_some_and(|iat| now_secs.saturating_add(jwt.clock_skew_secs) < iat)
-        {
-            return None;
-        }
-        if jwt
-            .issuer
-            .as_deref()
-            .is_some_and(|issuer| claims.get("iss").and_then(Value::as_str) != Some(issuer))
-        {
-            return None;
-        }
-        if let Some(audience) = jwt.audience.as_deref() {
-            let claim_aud = claims.get("aud")?;
-            match claim_aud {
-                Value::String(value) if value == audience => {}
-                Value::Array(values)
-                    if values
-                        .iter()
-                        .any(|value| value.as_str().is_some_and(|value| value == audience)) => {}
-                _ => return None,
-            }
-        }
-
-        Some(claims)
-    }
-
-    fn jwt_claims_satisfy_rbac(policy: &RuntimeUpstreamPolicy, claims: &Value) -> bool {
-        let scopes = Self::jwt_string_claim_values(claims, &["scope", "scp"]);
-        let roles = Self::jwt_string_claim_values(claims, &["roles", "role"]);
-        policy
-            .upstream_auth
-            .required_scopes
-            .iter()
-            .all(|required| scopes.contains(required))
-            && policy
-                .upstream_auth
-                .required_roles
-                .iter()
-                .all(|required| roles.contains(required))
-    }
-
-    fn jwt_string_claim_values(
-        claims: &Value,
-        claim_names: &[&str],
-    ) -> std::collections::HashSet<String> {
-        let mut values = std::collections::HashSet::new();
-        for claim_name in claim_names {
-            let Some(value) = claims.get(*claim_name) else {
-                continue;
-            };
-            match value {
-                Value::String(value) => {
-                    for item in value.split_whitespace() {
-                        if !item.is_empty() {
-                            values.insert(item.to_string());
-                        }
-                    }
-                }
-                Value::Array(items) => {
-                    for item in items {
-                        if let Some(item) = item.as_str()
-                            && !item.is_empty()
-                        {
-                            values.insert(item.to_string());
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        values
-    }
-
     pub(crate) fn resolve_scoped_rate_limit_key(
         rule: &crate::resilience::scoped_rate_limit::ScopedRateLimitRule,
         route: &str,
@@ -1472,6 +1098,12 @@ impl QUICListener {
 
 #[cfg(test)]
 mod tests {
+
+    use std::time::UNIX_EPOCH;
+
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
     use spooky_config::{
         config::{ScopedRateLimit, ScopedRateLimitScope},
         runtime::{
@@ -1480,12 +1112,14 @@ mod tests {
         },
     };
 
-    use super::auth::{
-        allowed_auth_headers, append_auth_request_headers, auth_allow_mutations, auth_failure_mode,
-        auth_timeout_ms, fail_open, map_http_external_auth_response, oidc_audience_matches,
-        oidc_scope_satisfied,
+    use super::{
+        auth::{
+            allowed_auth_headers, append_auth_request_headers, auth_allow_mutations,
+            auth_failure_mode, auth_timeout_ms, fail_open, map_http_external_auth_response,
+            oidc_audience_matches, oidc_scope_satisfied,
+        },
+        *,
     };
-    use super::*;
     use crate::runtime::connection::auth::{ExternalAuthDecision, PendingHeaderMutation};
 
     fn sample_pending_forward(headers: Vec<quiche::h3::Header>) -> PendingForward {
@@ -1657,12 +1291,17 @@ mod tests {
         let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
         let wrong_lookup = |_: &str| Some("wrong-key".to_string());
 
-        assert!(QUICListener::api_key_is_authorized(&policy, Some(&lookup)));
-        assert!(!QUICListener::api_key_is_authorized(
+        assert!(super::super::admission::api_key_is_authorized(
+            &policy,
+            Some(&lookup)
+        ));
+        assert!(!super::super::admission::api_key_is_authorized(
             &policy,
             Some(&wrong_lookup)
         ));
-        assert!(!QUICListener::api_key_is_authorized(&policy, None));
+        assert!(!super::super::admission::api_key_is_authorized(
+            &policy, None
+        ));
     }
 
     #[test]
@@ -1701,9 +1340,12 @@ mod tests {
             .collect::<std::collections::HashMap<_, _>>();
         let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
 
-        assert!(QUICListener::jwt_is_authorized(&policy, Some(&lookup)));
+        assert!(super::super::admission::jwt_is_authorized(
+            &policy,
+            Some(&lookup)
+        ));
         assert!(
-            QUICListener::validated_hs256_jwt_claims(
+            super::super::admission::validated_hs256_jwt_claims(
                 token.as_str(),
                 policy.upstream_auth.jwt.as_ref().expect("jwt policy"),
                 now
@@ -1718,7 +1360,8 @@ mod tests {
             clock_skew_secs: 30,
         };
         assert!(
-            QUICListener::validated_hs256_jwt_claims(token.as_str(), &wrong_secret, now).is_none()
+            super::super::admission::validated_hs256_jwt_claims(token.as_str(), &wrong_secret, now)
+                .is_none()
         );
 
         let expired = test_hs256_jwt(
@@ -1727,7 +1370,7 @@ mod tests {
             "HS256",
         );
         assert!(
-            QUICListener::validated_hs256_jwt_claims(
+            super::super::admission::validated_hs256_jwt_claims(
                 expired.as_str(),
                 &RuntimeJwtAuth {
                     secret: "jwt-secret".to_string(),
@@ -1764,11 +1407,11 @@ mod tests {
             "roles": ["operator"]
         });
 
-        assert!(QUICListener::jwt_claims_satisfy_rbac(
+        assert!(super::super::admission::jwt_claims_satisfy_rbac(
             &policy,
             &allowed_claims
         ));
-        assert!(!QUICListener::jwt_claims_satisfy_rbac(
+        assert!(!super::super::admission::jwt_claims_satisfy_rbac(
             &policy,
             &denied_claims
         ));

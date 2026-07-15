@@ -36,9 +36,15 @@ use spooky_transport::transport_pool::UpstreamTransportPool;
 
 use super::{
     BootstrapServiceFuture, BootstrapStreamingBody, QUICListener,
+    admission::{
+        AdmissionPolicyDecision, admission_rejection_response,
+        evaluate_forwarding_pre_admission_policy,
+    },
     bootstrap_resolution_error_response, boxed_full, connection_header_tokens, is_head_method,
-    is_websocket_upgrade_request, runtime_endpoint::RuntimeConnectionSlotGuard, runtime_handle,
-    should_strip_bootstrap_response_header, spawn_supervised_async_task, validate_http_request,
+    is_websocket_upgrade_request,
+    runtime_endpoint::RuntimeConnectionSlotGuard,
+    runtime_handle, should_strip_bootstrap_response_header, spawn_supervised_async_task,
+    validate_http_request,
 };
 use crate::{
     Metrics, REQUEST_ID_COUNTER, RouteOutcome,
@@ -416,21 +422,35 @@ impl QUICListener {
                                     }
                                 };
 
-                                if let Some(policy) = upstream_policies.get(&upstream_name) {
-                                    let denied_challenge = if !Self::api_key_is_authorized(
-                                        policy,
-                                        Some(&lb_header_lookup),
-                                    ) {
-                                        Some("ApiKey")
-                                    } else if !Self::jwt_is_authorized(
-                                        policy,
-                                        Some(&lb_header_lookup),
-                                    ) {
-                                        Some("Bearer")
-                                    } else {
-                                        None
-                                    };
-                                    if let Some(challenge) = denied_challenge {
+                                let upstream_policy = upstream_policies
+                                    .get(&upstream_name)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let admission = evaluate_forwarding_pre_admission_policy(
+                                    &upstream_policy,
+                                    Some(&lb_header_lookup),
+                                    &resilience.brownout,
+                                    resilience.adaptive_admission.inflight_percent(),
+                                    &upstream_name,
+                                    resilience.shed_retry_after_seconds,
+                                    &resilience.scoped_rate_limits,
+                                    |rule| {
+                                        Self::resolve_scoped_rate_limit_key(
+                                            rule,
+                                            &upstream_name,
+                                            &method,
+                                            &path,
+                                            authority.as_deref(),
+                                            peer,
+                                            Some(&lb_header_lookup),
+                                        )
+                                    },
+                                );
+                                metrics.set_brownout_active(resilience.brownout.is_active());
+                                let rejection_response = admission_rejection_response(&admission);
+                                match admission {
+                                    AdmissionPolicyDecision::AdmitReady => {}
+                                    AdmissionPolicyDecision::Unauthorized(_) => {
                                         metrics.inc_failure();
                                         metrics.inc_policy_denied();
                                         metrics.record_route(
@@ -442,58 +462,170 @@ impl QUICListener {
                                             "Bootstrap request route={} denied by auth policy",
                                             upstream_name
                                         );
+                                        let Some(response) = rejection_response.as_ref() else {
+                                            warn!(
+                                                "Bootstrap request route={} missing admission rejection response for unauthorized decision",
+                                                upstream_name
+                                            );
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"internal proxy error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        };
+                                        let Some(challenge) = response.www_authenticate else {
+                                            warn!(
+                                                "Bootstrap request route={} missing auth challenge in admission rejection response",
+                                                upstream_name
+                                            );
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"internal proxy error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        };
                                         return Ok(Response::builder()
-                                            .status(StatusCode::UNAUTHORIZED)
+                                            .status(response.status)
                                             .header("alt-svc", &alt)
                                             .header("www-authenticate", challenge)
-                                            .body(boxed_full(Bytes::from_static(b"unauthorized\n")))
+                                            .body(boxed_full(Bytes::from_static(response.body)))
                                             .unwrap_or_else(|_| {
                                                 Response::new(boxed_full(Bytes::from_static(
                                                     b"error\n",
                                                 )))
                                             }));
                                     }
-                                }
-
-                                if let Some(rejection) =
-                                    resilience.scoped_rate_limits.check(&upstream_name, |rule| {
-                                        Self::resolve_scoped_rate_limit_key(
-                                            rule,
+                                    AdmissionPolicyDecision::RateLimited(decision) => {
+                                        metrics.inc_failure();
+                                        metrics.inc_request_rate_limited();
+                                        metrics.record_route(
                                             &upstream_name,
-                                            &method,
-                                            &path,
-                                            authority.as_deref(),
-                                            peer,
-                                            Some(&lb_header_lookup),
-                                        )
-                                    })
-                                {
-                                    metrics.inc_failure();
-                                    metrics.inc_request_rate_limited();
-                                    metrics.record_route(
-                                        &upstream_name,
-                                        Duration::from_millis(0),
-                                        RouteOutcome::RateLimited,
-                                    );
-                                    warn!(
-                                        "Bootstrap request route={} scoped rate limit exceeded by rule={}",
-                                        rejection.route, rejection.rule_name
-                                    );
-                                    return Ok(Response::builder()
-                                        .status(StatusCode::TOO_MANY_REQUESTS)
-                                        .header("alt-svc", &alt)
-                                        .header(
-                                            "retry-after",
-                                            rejection.retry_after_seconds.max(1).to_string(),
-                                        )
-                                        .body(boxed_full(Bytes::from_static(
-                                            b"request rate limited\n",
-                                        )))
-                                        .unwrap_or_else(|_| {
-                                            Response::new(boxed_full(Bytes::from_static(
-                                                b"error\n",
-                                            )))
-                                        }));
+                                            Duration::from_millis(0),
+                                            RouteOutcome::RateLimited,
+                                        );
+                                        warn!(
+                                            "Bootstrap request route={} scoped rate limit exceeded by rule={}",
+                                            decision.route, decision.rule_name
+                                        );
+                                        let Some(response) = rejection_response.as_ref() else {
+                                            warn!(
+                                                "Bootstrap request route={} missing admission rejection response for rate-limited decision",
+                                                upstream_name
+                                            );
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"internal proxy error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        };
+                                        let Some(retry_after_seconds) =
+                                            response.retry_after_seconds
+                                        else {
+                                            warn!(
+                                                "Bootstrap request route={} missing retry-after in rate-limited admission rejection response",
+                                                upstream_name
+                                            );
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"internal proxy error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        };
+                                        return Ok(Response::builder()
+                                            .status(response.status)
+                                            .header("alt-svc", &alt)
+                                            .header("retry-after", retry_after_seconds.to_string())
+                                            .body(boxed_full(Bytes::from_static(response.body)))
+                                            .unwrap_or_else(|_| {
+                                                Response::new(boxed_full(Bytes::from_static(
+                                                    b"error\n",
+                                                )))
+                                            }));
+                                    }
+                                    AdmissionPolicyDecision::Overloaded(decision) => {
+                                        metrics.inc_failure();
+                                        metrics.inc_overload_shed_reason(
+                                            decision.reason.metrics_reason(),
+                                        );
+                                        metrics.record_route(
+                                            &upstream_name,
+                                            Duration::from_millis(0),
+                                            RouteOutcome::OverloadShed,
+                                        );
+                                        resilience
+                                            .adaptive_admission
+                                            .observe(Duration::from_millis(0), true);
+                                        let Some(response) = rejection_response.as_ref() else {
+                                            warn!(
+                                                "Bootstrap request route={} missing admission rejection response for overload decision",
+                                                upstream_name
+                                            );
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"internal proxy error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        };
+                                        let Some(retry_after_seconds) =
+                                            response.retry_after_seconds
+                                        else {
+                                            warn!(
+                                                "Bootstrap request route={} missing retry-after in overload admission rejection response",
+                                                upstream_name
+                                            );
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"internal proxy error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        };
+                                        return Ok(Response::builder()
+                                            .status(response.status)
+                                            .header("alt-svc", &alt)
+                                            .header("retry-after", retry_after_seconds.to_string())
+                                            .body(boxed_full(Bytes::from_static(response.body)))
+                                            .unwrap_or_else(|_| {
+                                                Response::new(boxed_full(Bytes::from_static(
+                                                    b"error\n",
+                                                )))
+                                            }));
+                                    }
                                 }
 
                                 let endpoint = match backend_endpoints.get(&backend_addr) {
@@ -512,10 +644,6 @@ impl QUICListener {
                                 };
 
                                 let request_path = if path.is_empty() { "/" } else { &path };
-                                let upstream_policy = upstream_policies
-                                    .get(&upstream_name)
-                                    .cloned()
-                                    .unwrap_or_default();
                                 if !is_websocket_upgrade
                                     && content_length
                                         .is_some_and(|value| value > max_request_body_bytes)

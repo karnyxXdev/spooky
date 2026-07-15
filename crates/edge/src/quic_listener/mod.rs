@@ -77,7 +77,7 @@ use crate::{
         RESPONSE_CHUNK_BYTES_LIMIT, RESPONSE_CHUNK_CHANNEL_CAPACITY,
         SCID_ROTATION_PACKET_THRESHOLD, UDP_READ_TIMEOUT_MS, scid_rotation_interval,
     },
-    resilience::{route_queue::RouteQueueRejection, runtime::RuntimeResilience},
+    resilience::runtime::RuntimeResilience,
     routing::{decision::RouteDecisionReason, index::RouteIndex},
     runtime::{
         backend::{resolution::RuntimeBackendResolution, store::RuntimeBackendResolutionStore},
@@ -103,6 +103,7 @@ use crate::{
     watchdog::{config::WatchdogRuntimeConfig, coordinator::WatchdogCoordinator, time::now_millis},
 };
 
+mod admission;
 mod backend_resolution;
 mod bootstrap_tls;
 mod connection;
@@ -1901,15 +1902,6 @@ impl QUICListener {
                 }
             }
         }
-    }
-
-    fn try_acquire_owned_with_micro_wait(
-        semaphore: Arc<Semaphore>,
-        _wait_budget: Duration,
-    ) -> Result<(tokio::sync::OwnedSemaphorePermit, bool), tokio::sync::TryAcquireError> {
-        // Never block the synchronous QUIC worker thread: acquire immediately or
-        // shed. A blocking wait here stalls every connection on the shard.
-        semaphore.try_acquire_owned().map(|permit| (permit, false))
     }
 
     #[allow(clippy::too_many_arguments)]

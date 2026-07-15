@@ -1,5 +1,6 @@
-use super::*;
 use spooky_config::runtime::RuntimeUpstreamPolicy;
+
+use super::*;
 
 pub(in crate::quic_listener) struct RouteResolutionRequest<'a> {
     pub(in crate::quic_listener) method: &'a str,

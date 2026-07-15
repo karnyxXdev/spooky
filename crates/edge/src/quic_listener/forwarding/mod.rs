@@ -11,11 +11,10 @@ use std::{convert::Infallible, error::Error as StdError};
 use spooky_config::config::ScopedRateLimitScope;
 
 use self::prepare::{PreparedRequest, StartedAuthRequest};
-use super::*;
-use crate::runtime::connection::{request::PendingForward, stream::StreamAdmissionState};
-
 #[cfg(test)]
 pub(in crate::quic_listener) use self::resolve::RouteResolutionRequest as TestRouteResolutionRequest;
+use super::*;
+use crate::runtime::connection::{request::PendingForward, stream::StreamAdmissionState};
 
 pub(super) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> StreamPhase {
     let phase = req.phase.clone();

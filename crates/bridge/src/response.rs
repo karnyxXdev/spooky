@@ -83,7 +83,7 @@ pub struct NormalizedResponse {
     pub emission: ResponseEmissionPolicy,
 }
 
-pub fn status_forbids_response_body(status: StatusCode) -> bool {
+pub(crate) fn status_forbids_response_body(status: StatusCode) -> bool {
     status.is_informational()
         || status == StatusCode::NO_CONTENT
         || status == StatusCode::NOT_MODIFIED
@@ -105,7 +105,7 @@ fn is_hop_by_hop_response_header(name: &HeaderName, preserve_upgrade: bool) -> b
         || name.as_str().eq_ignore_ascii_case("proxy-connection")
 }
 
-pub fn response_connection_tokens(headers: &HeaderMap) -> HashSet<String> {
+pub(crate) fn response_connection_tokens(headers: &HeaderMap) -> HashSet<String> {
     let mut tokens = HashSet::new();
     for value in headers.get_all(http::header::CONNECTION) {
         let Ok(raw) = value.to_str() else {
@@ -121,7 +121,7 @@ pub fn response_connection_tokens(headers: &HeaderMap) -> HashSet<String> {
     tokens
 }
 
-pub fn should_strip_response_header(
+pub(crate) fn should_strip_response_header(
     name: &HeaderName,
     connection_tokens: &HashSet<String>,
     constraints: ResponseProtocolConstraints,

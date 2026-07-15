@@ -47,6 +47,11 @@ pub(crate) struct ResolvedBackend {
     pub(crate) backend: SelectedBackend,
 }
 
+struct BackendSelectionPlan {
+    lb_type: String,
+    lb_key: String,
+}
+
 impl QUICListener {
     #[allow(clippy::type_complexity)]
     fn resolve_route_target(
@@ -82,89 +87,106 @@ impl QUICListener {
         })
     }
 
+    fn build_backend_selection_plan(
+        request: &RouteResolutionRequest<'_>,
+        pool: &UpstreamPool,
+    ) -> BackendSelectionPlan {
+        let lb_type = pool.lb_name().to_string();
+        let lb_key = Self::resolve_lb_request_key(
+            &lb_type,
+            pool.lb_key(),
+            request.method,
+            request.path,
+            request.authority,
+            request.cid_key,
+            request.header_lookup,
+        );
+        BackendSelectionPlan { lb_type, lb_key }
+    }
+
+    fn no_servers_in_upstream_error() -> ProxyError {
+        ProxyError::Transport("no servers in upstream".into())
+    }
+
+    fn no_healthy_servers_error(pool: &UpstreamPool) -> ProxyError {
+        let total = pool.pool.len();
+        let healthy = pool.pool.healthy_len();
+        error!(
+            "no healthy backends available: {}/{} backends healthy",
+            healthy, total
+        );
+        ProxyError::Transport("no healthy servers".into())
+    }
+
+    fn select_backend_readonly(
+        pool: &UpstreamPool,
+        plan: &BackendSelectionPlan,
+        begin_request: bool,
+    ) -> Option<SelectedBackend> {
+        if pool.pool.readmit_due() {
+            return None;
+        }
+
+        pool.pick_readonly(plan.lb_key.as_str())
+            .and_then(|idx| pool.pool.address(idx).map(|addr| (idx, addr.to_string())))
+            .and_then(|(idx, addr)| {
+                (!begin_request || pool.begin_request_if_healthy(idx)).then_some(SelectedBackend {
+                    backend_addr: addr,
+                    backend_index: idx,
+                    backend_lb: plan.lb_type.clone(),
+                })
+            })
+    }
+
+    fn select_backend_with_write_lock(
+        pool: &mut UpstreamPool,
+        plan: &BackendSelectionPlan,
+        begin_request: bool,
+    ) -> Result<SelectedBackend, ProxyError> {
+        let idx = if begin_request {
+            pool.pick(plan.lb_key.as_str())
+        } else {
+            pool.pick_without_begin(plan.lb_key.as_str())
+        }
+        .ok_or_else(|| Self::no_healthy_servers_error(pool))?;
+        let backend_addr = pool
+            .pool
+            .address(idx)
+            .map(str::to_string)
+            .ok_or_else(|| ProxyError::Transport("invalid server address".into()))?;
+        Ok(SelectedBackend {
+            backend_addr,
+            backend_index: idx,
+            backend_lb: plan.lb_type.clone(),
+        })
+    }
+
     fn select_backend_from_pool(
         request: &RouteResolutionRequest<'_>,
         upstream_pool: &Arc<RwLock<UpstreamPool>>,
         begin_request: bool,
     ) -> Result<SelectedBackend, ProxyError> {
-        let (backend_index, backend_lb, backend_addr) = {
-            let (read_lb_type, read_fast_selected) = {
-                let pool = upstream_pool
-                    .read()
-                    .map_err(|_| ProxyError::Transport("upstream pool lock poisoned".into()))?;
-                if pool.pool.is_empty() {
-                    return Err(ProxyError::Transport("no servers in upstream".into()));
-                }
-                let lb_type = pool.lb_name();
-                let key = Self::resolve_lb_request_key(
-                    lb_type,
-                    pool.lb_key(),
-                    request.method,
-                    request.path,
-                    request.authority,
-                    request.cid_key,
-                    request.header_lookup,
-                );
-                let fast_selected = if pool.pool.readmit_due() {
-                    None
-                } else {
-                    pool.pick_readonly(key.as_str())
-                        .and_then(|idx| pool.pool.address(idx).map(|addr| (idx, addr.to_string())))
-                        .and_then(|(idx, addr)| {
-                            (!begin_request || pool.begin_request_if_healthy(idx))
-                                .then_some((idx, addr))
-                        })
-                };
-                (lb_type, fast_selected)
-            };
-
-            if let Some((idx, addr)) = read_fast_selected {
-                (idx, read_lb_type, addr)
-            } else {
-                let mut pool = upstream_pool
-                    .write()
-                    .map_err(|_| ProxyError::Transport("upstream pool lock poisoned".into()))?;
-                if pool.pool.is_empty() {
-                    return Err(ProxyError::Transport("no servers in upstream".into()));
-                }
-                let lb_type = pool.lb_name();
-                let key = Self::resolve_lb_request_key(
-                    lb_type,
-                    pool.lb_key(),
-                    request.method,
-                    request.path,
-                    request.authority,
-                    request.cid_key,
-                    request.header_lookup,
-                );
-                let idx = if begin_request {
-                    pool.pick(key.as_str())
-                } else {
-                    pool.pick_without_begin(key.as_str())
-                }
-                .ok_or_else(|| {
-                    let total = pool.pool.len();
-                    let healthy = pool.pool.healthy_len();
-                    error!(
-                        "no healthy backends available: {}/{} backends healthy",
-                        healthy, total
-                    );
-                    ProxyError::Transport("no healthy servers".into())
-                })?;
-                let backend_addr = pool
-                    .pool
-                    .address(idx)
-                    .map(str::to_string)
-                    .ok_or_else(|| ProxyError::Transport("invalid server address".into()))?;
-                (idx, lb_type, backend_addr)
+        {
+            let pool = upstream_pool
+                .read()
+                .map_err(|_| ProxyError::Transport("upstream pool lock poisoned".into()))?;
+            if pool.pool.is_empty() {
+                return Err(Self::no_servers_in_upstream_error());
             }
-        };
+            let plan = Self::build_backend_selection_plan(request, &pool);
+            if let Some(selected) = Self::select_backend_readonly(&pool, &plan, begin_request) {
+                return Ok(selected);
+            }
+        }
 
-        Ok(SelectedBackend {
-            backend_addr,
-            backend_index,
-            backend_lb: backend_lb.to_string(),
-        })
+        let mut pool = upstream_pool
+            .write()
+            .map_err(|_| ProxyError::Transport("upstream pool lock poisoned".into()))?;
+        if pool.pool.is_empty() {
+            return Err(Self::no_servers_in_upstream_error());
+        }
+        let plan = Self::build_backend_selection_plan(request, &pool);
+        Self::select_backend_with_write_lock(&mut pool, &plan, begin_request)
     }
 
     fn log_backend_selection(

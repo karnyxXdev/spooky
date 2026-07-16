@@ -13,6 +13,8 @@ impl RuntimeUpstream {
             .tls
             .clone()
             .unwrap_or_else(|| config.upstream_tls.clone());
+        let upstream_transport =
+            RuntimeUpstreamTransportPolicy::from_effective_tls(&effective_tls, &base_policies.transport);
         let policy = RuntimeUpstreamPolicy {
             upstream_auth: RuntimeAuthPolicy::normalize(&upstream.auth, name)?,
             host: RuntimeHostPolicy(upstream.host_policy.clone()),
@@ -30,7 +32,7 @@ impl RuntimeUpstream {
                 rate_limits: base_policies.rate_limits.clone(),
                 load_balancing: RuntimeLoadBalancingPolicy::normalize(&upstream.load_balancing)?,
                 admission: base_policies.admission.clone(),
-                transport: RuntimeUpstreamTransportPolicy::from_effective_tls(&effective_tls),
+                transport: upstream_transport,
                 host: RuntimeHostPolicy(upstream.host_policy.clone()),
                 forwarded_headers: RuntimeForwardedHeaderPolicy(upstream.forwarded_headers.clone()),
                 protocol: base_policies.admission.protocol.clone(),
@@ -39,12 +41,8 @@ impl RuntimeUpstream {
             backends: upstream
                 .backends
                 .iter()
-                .cloned()
-                .map(|backend| RuntimeBackend {
-                    backend,
-                    effective_tls: effective_tls.clone(),
-                })
-                .collect(),
+                .map(|backend| RuntimeBackend::normalize(name, backend))
+                .collect::<Result<Vec<_>, _>>()?,
         };
         runtime_upstream.policy_set.auth = runtime_upstream.policy.upstream_auth.clone();
 
@@ -62,7 +60,14 @@ impl RuntimeUpstream {
             backends: self
                 .backends
                 .iter()
-                .map(|backend| backend.backend.clone())
+                .map(|backend| {
+                    let mut config_backend = backend.backend.clone();
+                    config_backend.health_check = backend
+                        .health_check
+                        .as_ref()
+                        .map(RuntimeBackendHealthCheck::as_config);
+                    config_backend
+                })
                 .collect(),
         }
     }
@@ -108,39 +113,18 @@ pub(super) fn normalize_upstreams(
         let mut upstream_uses_https_backends = false;
 
         for backend in &runtime_upstream.backends {
-            if backend.backend.id.trim().is_empty() {
-                return Err(RuntimeConfigError::ConfigInvalid(format!(
-                    "upstream '{upstream_name}' contains an empty backend id"
-                )));
-            }
-            if backend.backend.address.trim().is_empty() {
-                return Err(RuntimeConfigError::ConfigInvalid(format!(
-                    "backend '{}' in upstream '{}' has an empty address",
-                    backend.backend.id, upstream_name
-                )));
-            }
-
-            let endpoint = BackendEndpoint::parse(&backend.backend.address).map_err(|err| {
-                RuntimeConfigError::BackendAddressInvalid {
-                    upstream: upstream_name.clone(),
-                    backend: backend.backend.id.clone(),
-                    address: backend.backend.address.clone(),
-                    reason: err,
-                }
-            })?;
-            if endpoint.scheme() == crate::backend_endpoint::BackendScheme::Https {
+            if matches!(backend.endpoint.transport_kind, RuntimeBackendTransportKind::H2) {
                 upstream_uses_https_backends = true;
             }
 
-            let origin = endpoint.origin();
             if let Some((existing_upstream, existing_backend)) = seen_backend_origins.insert(
-                origin.clone(),
+                backend.endpoint.origin.clone(),
                 (upstream_name.clone(), backend.backend.id.clone()),
             ) {
                 return Err(RuntimeConfigError::BackendAddressInvalid {
                     upstream: upstream_name.clone(),
                     backend: backend.backend.id.clone(),
-                    address: origin,
+                    address: backend.endpoint.origin.clone(),
                     reason: format!(
                         "conflicts with upstream '{}' backend '{}'",
                         existing_upstream, existing_backend
@@ -150,13 +134,55 @@ pub(super) fn normalize_upstreams(
         }
 
         if upstream_uses_https_backends {
-            validate_runtime_upstream_tls(upstream_name, &runtime_upstream.effective_tls)?;
+            validate_runtime_upstream_tls(
+                upstream_name,
+                &runtime_upstream.policy_set.transport.tls.as_upstream_tls(),
+            )?;
         }
 
         normalized.insert(upstream_name.clone(), runtime_upstream);
     }
 
     Ok(normalized)
+}
+
+impl RuntimeBackend {
+    pub(super) fn normalize(
+        upstream_name: &str,
+        backend: &Backend,
+    ) -> Result<Self, RuntimeConfigError> {
+        if backend.id.trim().is_empty() {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' contains an empty backend id"
+            )));
+        }
+        if backend.address.trim().is_empty() {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "backend '{}' in upstream '{}' has an empty address",
+                backend.id, upstream_name
+            )));
+        }
+
+        Ok(Self {
+            backend: backend.clone(),
+            endpoint: RuntimeBackendEndpoint::normalize(
+                upstream_name,
+                backend.id.as_str(),
+                backend.address.as_str(),
+            )?,
+            health_check: backend
+                .health_check
+                .as_ref()
+                .map(|health_check| {
+                    RuntimeBackendHealthCheck::normalize(
+                        upstream_name,
+                        backend.id.as_str(),
+                        health_check,
+                    )
+                })
+                .transpose()?,
+        })
+    }
 }
 
 fn validate_protocol_policy(policy: &ProtocolPolicy) -> Result<(), RuntimeConfigError> {

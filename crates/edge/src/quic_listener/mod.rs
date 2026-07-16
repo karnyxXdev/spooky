@@ -48,9 +48,10 @@ use spooky_bridge::response::{
 };
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
-    config::{ClientAuth, UpstreamTls},
+    config::ClientAuth,
     runtime::{
         ListenerRuntimeConfig, RuntimeConfig, RuntimeListenerTls, RuntimeTlsIdentity,
+        RuntimeBackendAddressKind, RuntimeBackendTlsPolicy, RuntimeBackendTransportKind,
         RuntimeUpstreamPolicy,
     },
 };
@@ -495,7 +496,7 @@ impl QUICListener {
         Self::new_with_socket_and_shared_state(listener_config, socket, shared_state)
     }
 
-    fn upstream_tls_client_config(tls: &UpstreamTls) -> TlsClientConfig {
+    fn upstream_tls_client_config(tls: &RuntimeBackendTlsPolicy) -> TlsClientConfig {
         TlsClientConfig {
             verify_certificates: tls.verify_certificates,
             strict_sni: tls.strict_sni,
@@ -514,58 +515,57 @@ impl QUICListener {
     }
 
     pub fn build_shared_state(config: &RuntimeConfig) -> Result<SharedRuntimeState, ProxyError> {
-        let worker_threads = config.performance.worker_threads.max(1);
-        let shard_count = config.performance.packet_shards_per_worker.max(1);
-        let active_worker_threads = if worker_threads > 1 && !config.performance.reuseport {
+        let transport_policy = &config.policies.transport;
+        let timeout_policy = &config.policies.timeouts;
+        let worker_threads = transport_policy.worker_threads.max(1);
+        let shard_count = transport_policy.packet_shards_per_worker.max(1);
+        let active_worker_threads = if worker_threads > 1 && !transport_policy.reuseport {
             1
         } else {
             worker_threads
         };
         let worker_slots = active_worker_threads.saturating_mul(shard_count).max(1);
-        let per_upstream_limit = config.performance.per_upstream_inflight_limit.max(1);
-        let global_inflight_limit = config.performance.global_inflight_limit.max(1);
-        let max_inflight_per_backend = config
-            .performance
-            .per_backend_inflight_limit
-            .saturating_mul(worker_threads);
+        let per_upstream_limit = transport_policy.connection_limits.per_upstream_inflight.max(1);
+        let global_inflight_limit = transport_policy.connection_limits.global_inflight.max(1);
+        let max_inflight_per_backend = transport_policy.backend_connections.max_inflight.max(1);
 
         info!(
             "Runtime performance concurrency worker_threads={} control_plane_threads={} packet_shards_per_worker={} reuseport={} pin_workers={}",
             worker_threads,
-            config.performance.control_plane_threads.max(1),
+            transport_policy.control_plane_threads.max(1),
             shard_count,
-            config.performance.reuseport,
-            config.performance.pin_workers,
+            transport_policy.reuseport,
+            transport_policy.pin_workers,
         );
         info!(
             "Runtime performance inflight_limits global_inflight_limit={} per_upstream_inflight_limit={} per_backend_inflight_limit={} max_active_connections={}",
             global_inflight_limit,
             per_upstream_limit,
-            config.performance.per_backend_inflight_limit,
-            config.performance.max_active_connections,
+            transport_policy.connection_limits.per_backend,
+            transport_policy.connection_limits.max_active_connections,
         );
         info!(
             "Runtime performance upstream_timeouts backend_connect_timeout_ms={} backend_timeout_ms={} backend_body_idle_timeout_ms={} backend_body_total_timeout_ms={} backend_total_request_timeout_ms={}",
-            config.performance.backend_connect_timeout_ms,
-            config.performance.backend_timeout_ms,
-            config.performance.backend_body_idle_timeout_ms,
-            config.performance.backend_body_total_timeout_ms,
-            config.performance.backend_total_request_timeout_ms,
+            timeout_policy.backend_connect.as_millis(),
+            timeout_policy.backend_request.as_millis(),
+            timeout_policy.backend_body_idle.as_millis(),
+            timeout_policy.backend_body_total.as_millis(),
+            timeout_policy.backend_total_request.as_millis(),
         );
         info!(
             "Runtime performance request_limits client_body_idle_timeout_ms={} max_request_body_bytes={} max_response_body_bytes={} request_buffer_global_cap_bytes={} unknown_length_response_prebuffer_bytes={}",
-            config.performance.client_body_idle_timeout_ms,
-            config.performance.max_request_body_bytes,
-            config.performance.max_response_body_bytes,
-            config.performance.request_buffer_global_cap_bytes,
-            config.performance.unknown_length_response_prebuffer_bytes,
+            timeout_policy.client_body_idle.as_millis(),
+            transport_policy.max_request_body_bytes,
+            transport_policy.max_response_body_bytes,
+            transport_policy.request_buffer_global_cap_bytes,
+            transport_policy.unknown_length_response_prebuffer_bytes,
         );
         info!(
             "Runtime performance transport_buffers udp_recv_buffer_bytes={} udp_send_buffer_bytes={} h2_pool_max_idle_per_backend={} h2_pool_idle_timeout_ms={}",
-            config.performance.udp_recv_buffer_bytes,
-            config.performance.udp_send_buffer_bytes,
-            config.performance.h2_pool_max_idle_per_backend,
-            config.performance.h2_pool_idle_timeout_ms,
+            transport_policy.udp_recv_buffer_bytes,
+            transport_policy.udp_send_buffer_bytes,
+            transport_policy.backend_connections.max_idle_per_backend,
+            transport_policy.backend_connections.pool_idle_timeout.as_millis(),
         );
 
         let listener_runtime_configs = config
@@ -579,21 +579,15 @@ impl QUICListener {
         let mut backend_resolutions = Vec::new();
         let mut seen_backend_origins: HashMap<String, (String, String)> = HashMap::new();
         let mut backend_tls_configs: HashMap<String, TlsClientConfig> = HashMap::new();
+        let mut backend_endpoints: HashMap<String, BackendEndpoint> = HashMap::new();
+        let mut backend_health_checks = HashMap::new();
         for (upstream_name, upstream) in &config.upstreams {
-            let upstream_tls_client = Self::upstream_tls_client_config(&upstream.effective_tls);
+            let upstream_tls_client =
+                Self::upstream_tls_client_config(&upstream.policy_set.transport.tls);
 
             for backend in &upstream.backends {
-                let endpoint = match BackendEndpoint::parse(&backend.backend.address) {
-                    Ok(endpoint) => endpoint,
-                    Err(err) => {
-                        return Err(ProxyError::Transport(format!(
-                            "invalid backend address '{}' in upstream '{}' (backend '{}'): {}",
-                            backend.backend.address, upstream_name, backend.backend.id, err
-                        )));
-                    }
-                };
-
-                let origin = endpoint.origin();
+                let endpoint = backend.endpoint.canonical.clone();
+                let origin = backend.endpoint.origin.clone();
                 if let Some((existing_upstream, existing_backend)) = seen_backend_origins.insert(
                     origin.clone(),
                     (upstream_name.clone(), backend.backend.id.clone()),
@@ -609,14 +603,14 @@ impl QUICListener {
                 }
                 backend_transports.push((
                     backend.backend.address.clone(),
-                    match endpoint.scheme() {
-                        BackendScheme::Http => BackendTransportKind::Http1,
-                        BackendScheme::Https => BackendTransportKind::H2,
+                    match backend.endpoint.transport_kind {
+                        RuntimeBackendTransportKind::Http1 => BackendTransportKind::Http1,
+                        RuntimeBackendTransportKind::H2 => BackendTransportKind::H2,
                     },
                 ));
-                let authority_host = endpoint.authority_host().to_string();
-                let authority_port = endpoint.authority_port();
-                let resolution = if endpoint.authority_is_ip_literal() {
+                let authority_host = backend.endpoint.authority_host.clone();
+                let authority_port = backend.endpoint.authority_port;
+                let resolution = if matches!(backend.endpoint.address_kind, RuntimeBackendAddressKind::IpLiteral) {
                     let ip_addr = authority_host.parse::<IpAddr>().map_err(|err| {
                         ProxyError::Transport(format!(
                             "failed to parse IP literal backend '{}' in upstream '{}' (backend '{}'): {}",
@@ -637,10 +631,9 @@ impl QUICListener {
                     )
                 };
                 backend_resolutions.push(resolution);
-                let authority_kind = if endpoint.authority_is_ip_literal() {
-                    "ip_literal"
-                } else {
-                    "hostname"
+                let authority_kind = match backend.endpoint.address_kind {
+                    RuntimeBackendAddressKind::IpLiteral => "ip_literal",
+                    RuntimeBackendAddressKind::Hostname => "hostname",
                 };
                 debug!(
                     "Configured upstream TLS policy backend={} upstream={} verify_certificates={} strict_sni={} ca_file={:?} ca_dir={:?} authority_kind={}",
@@ -652,7 +645,11 @@ impl QUICListener {
                     upstream_tls_client.ca_dir,
                     authority_kind
                 );
-                if endpoint.scheme() == BackendScheme::Https {
+                backend_endpoints.insert(backend.backend.address.clone(), endpoint);
+                if let Some(health_check) = backend.health_check.clone() {
+                    backend_health_checks.insert(backend.backend.address.clone(), health_check);
+                }
+                if matches!(backend.endpoint.transport_kind, RuntimeBackendTransportKind::H2) {
                     backend_tls_configs
                         .insert(backend.backend.address.clone(), upstream_tls_client.clone());
                 }
@@ -682,9 +679,9 @@ impl QUICListener {
                 backend_transports,
                 backend_tls_configs,
                 max_inflight_per_backend,
-                config.performance.h2_pool_max_idle_per_backend,
-                Duration::from_millis(config.performance.h2_pool_idle_timeout_ms),
-                Duration::from_millis(config.performance.backend_connect_timeout_ms),
+                transport_policy.backend_connections.max_idle_per_backend,
+                transport_policy.backend_connections.pool_idle_timeout,
+                transport_policy.backend_connections.connect_timeout,
                 backend_dns_resolver.clone(),
                 Some(connect_observer),
             )
@@ -752,18 +749,8 @@ impl QUICListener {
             listener_runtime_configs: Arc::new(listener_runtime_configs),
             listener_tls_store,
             transport_pool,
-            backend_endpoints: Arc::new(
-                config
-                    .upstreams
-                    .values()
-                    .flat_map(|upstream| upstream.backends.iter())
-                    .filter_map(|backend| {
-                        BackendEndpoint::parse(&backend.backend.address)
-                            .ok()
-                            .map(|endpoint| (backend.backend.address.clone(), endpoint))
-                    })
-                    .collect(),
-            ),
+            backend_endpoints: Arc::new(backend_endpoints),
+            backend_health_checks: Arc::new(backend_health_checks),
             backend_resolution_store,
             backend_dns_resolver,
             upstream_policies: Arc::new(
@@ -857,6 +844,7 @@ impl QUICListener {
             shared_state.upstream_pools.clone(),
             Arc::clone(&shared_state.transport_pool),
             Arc::clone(&shared_state.backend_endpoints),
+            Arc::clone(&shared_state.backend_health_checks),
             Arc::clone(&shared_state.backend_resolution_store),
             Arc::clone(&shared_state.metrics),
             Arc::clone(&task_registry),

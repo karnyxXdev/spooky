@@ -18,8 +18,11 @@ mod upstreams;
 
 pub use policies::{
     RuntimeAdmissionPolicy, RuntimeApiKeyAuth, RuntimeAuthPolicy, RuntimeBrownoutPolicy,
-    RuntimeCircuitBreakerPolicy, RuntimeExternalAuth, RuntimeExternalAuthFailureMode,
-    RuntimeExternalAuthRequestHeader, RuntimeHedgingPolicy, RuntimeJwtAuth,
+    RuntimeBackendAddressKind, RuntimeBackendConnectionPolicy, RuntimeBackendDnsPolicy,
+    RuntimeBackendEndpoint, RuntimeBackendHealthCheck, RuntimeBackendTlsPolicy,
+    RuntimeBackendTransportKind, RuntimeCircuitBreakerPolicy, RuntimeConnectionLimits,
+    RuntimeExternalAuth, RuntimeExternalAuthFailureMode, RuntimeExternalAuthRequestHeader,
+    RuntimeHedgingPolicy, RuntimeJwtAuth,
     RuntimeListenerPolicySet, RuntimeLoadBalancingPolicy, RuntimeLoadBalancingStrategy,
     RuntimePolicySet, RuntimeRateLimitPolicy, RuntimeRetryBudgetPolicy,
     RuntimeRouteQueuePolicy, RuntimeScopedRateLimitPolicy, RuntimeTimeoutPolicy,
@@ -246,7 +249,8 @@ pub struct RuntimeUpstream {
 #[derive(Debug, Clone)]
 pub struct RuntimeBackend {
     pub backend: Backend,
-    pub effective_tls: UpstreamTls,
+    pub endpoint: RuntimeBackendEndpoint,
+    pub health_check: Option<RuntimeBackendHealthCheck>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -509,8 +513,12 @@ mod tests {
             Some("x-api-key")
         );
         assert_eq!(
-            api.transport.effective_tls.ca_file.as_deref(),
+            api.transport.tls.ca_file.as_deref(),
             Some("/tmp/upstream-ca.pem")
+        );
+        assert_eq!(
+            api.transport.connection.max_inflight,
+            runtime.policies.transport.connection_limits.backend_pool_max_inflight
         );
         assert_eq!(api.rate_limits.scoped_limits.len(), 1);
         assert_eq!(
@@ -623,6 +631,16 @@ mod tests {
             upstream.backends[0].backend.address,
             "https://api.internal:8443"
         );
+        assert_eq!(upstream.backends[0].endpoint.authority_host, "api.internal");
+        assert_eq!(upstream.backends[0].endpoint.authority_port, 8443);
+        assert_eq!(
+            upstream.backends[0].endpoint.transport_kind,
+            RuntimeBackendTransportKind::H2
+        );
+        assert_eq!(
+            upstream.policy_set.transport.tls.ca_file.as_deref(),
+            Some("/tmp/roots/upstream.pem")
+        );
         assert_eq!(upstream.policy.host.0.mode, UpstreamHostPolicyMode::Rewrite);
         assert_eq!(
             upstream.policy.forwarded_headers.0.mode,
@@ -679,6 +697,31 @@ mod tests {
             err.to_string()
                 .contains("upstream 'api' has an empty effective upstream_tls.ca_file")
         );
+    }
+
+    #[test]
+    fn runtime_backend_health_check_and_endpoint_are_canonicalized() {
+        let mut config = sample_config();
+        config.upstream.get_mut("api").expect("api").backends[0].health_check =
+            Some(crate::config::HealthCheck {
+                path: String::new(),
+                interval: 2_000,
+                timeout_ms: 250,
+                failure_threshold: 4,
+                success_threshold: 3,
+                cooldown_ms: 5_000,
+            });
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let backend = &runtime.upstreams.get("api").expect("api").backends[0];
+        let health = backend.health_check.as_ref().expect("health check");
+
+        assert_eq!(backend.endpoint.origin, "https://api.internal:8443");
+        assert_eq!(health.path, "/");
+        assert_eq!(health.interval, Duration::from_millis(2_000));
+        assert_eq!(health.timeout, Duration::from_millis(250));
+        assert_eq!(health.failure_threshold, 4);
+        assert_eq!(health.success_threshold, 3);
     }
 
     #[test]

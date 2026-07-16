@@ -586,6 +586,32 @@ pub struct RuntimeTransportPolicy {
     pub max_request_body_bytes: usize,
     pub request_buffer_global_cap_bytes: usize,
     pub unknown_length_response_prebuffer_bytes: usize,
+    pub connection_limits: RuntimeConnectionLimits,
+    pub backend_connections: RuntimeBackendConnectionPolicy,
+    pub backend_dns: RuntimeBackendDnsPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeConnectionLimits {
+    pub global_inflight: usize,
+    pub per_upstream_inflight: usize,
+    pub per_backend: usize,
+    pub backend_pool_max_inflight: usize,
+    pub max_active_connections: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeBackendConnectionPolicy {
+    pub max_inflight: usize,
+    pub max_idle_per_backend: usize,
+    pub pool_idle_timeout: Duration,
+    pub connect_timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeBackendDnsPolicy {
+    pub refresh_enabled: bool,
+    pub refresh_interval: Duration,
 }
 
 impl RuntimeTransportPolicy {
@@ -756,7 +782,184 @@ impl RuntimeTransportPolicy {
             request_buffer_global_cap_bytes: performance.request_buffer_global_cap_bytes,
             unknown_length_response_prebuffer_bytes:
                 performance.unknown_length_response_prebuffer_bytes,
+            connection_limits: RuntimeConnectionLimits {
+                global_inflight: performance.global_inflight_limit,
+                per_upstream_inflight: performance.per_upstream_inflight_limit,
+                per_backend: performance.per_backend_inflight_limit,
+                backend_pool_max_inflight: performance
+                    .per_backend_inflight_limit
+                    .saturating_mul(performance.worker_threads.max(1)),
+                max_active_connections: performance.max_active_connections,
+            },
+            backend_connections: RuntimeBackendConnectionPolicy {
+                max_inflight: performance
+                    .per_backend_inflight_limit
+                    .saturating_mul(performance.worker_threads.max(1)),
+                max_idle_per_backend: performance.h2_pool_max_idle_per_backend,
+                pool_idle_timeout: Duration::from_millis(performance.h2_pool_idle_timeout_ms),
+                connect_timeout: Duration::from_millis(
+                    performance.backend_connect_timeout_ms,
+                ),
+            },
+            backend_dns: RuntimeBackendDnsPolicy {
+                refresh_enabled: performance.backend_dns_refresh_enabled,
+                refresh_interval: Duration::from_millis(
+                    performance.backend_dns_refresh_interval_ms,
+                ),
+            },
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeBackendTransportKind {
+    Http1,
+    H2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeBackendAddressKind {
+    Hostname,
+    IpLiteral,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeBackendEndpoint {
+    pub configured_address: String,
+    pub canonical: BackendEndpoint,
+    pub origin: String,
+    pub authority_host: String,
+    pub authority_port: u16,
+    pub address_kind: RuntimeBackendAddressKind,
+    pub transport_kind: RuntimeBackendTransportKind,
+}
+
+impl RuntimeBackendEndpoint {
+    pub fn normalize(
+        upstream_name: &str,
+        backend_id: &str,
+        address: &str,
+    ) -> Result<Self, RuntimeConfigError> {
+        let canonical =
+            BackendEndpoint::parse(address).map_err(|reason| RuntimeConfigError::BackendAddressInvalid {
+                upstream: upstream_name.to_string(),
+                backend: backend_id.to_string(),
+                address: address.to_string(),
+                reason,
+            })?;
+        let authority_host = canonical.authority_host().to_string();
+        let authority_port = canonical.authority_port();
+        let address_kind = if canonical.authority_is_ip_literal() {
+            RuntimeBackendAddressKind::IpLiteral
+        } else {
+            RuntimeBackendAddressKind::Hostname
+        };
+        let transport_kind = match canonical.scheme() {
+            crate::backend_endpoint::BackendScheme::Http => RuntimeBackendTransportKind::Http1,
+            crate::backend_endpoint::BackendScheme::Https => RuntimeBackendTransportKind::H2,
+        };
+        let origin = canonical.origin();
+
+        Ok(Self {
+            configured_address: address.to_string(),
+            canonical,
+            origin,
+            authority_host,
+            authority_port,
+            address_kind,
+            transport_kind,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeBackendHealthCheck {
+    pub path: String,
+    pub interval: Duration,
+    pub timeout: Duration,
+    pub failure_threshold: u32,
+    pub success_threshold: u32,
+    pub cooldown: Duration,
+}
+
+impl RuntimeBackendHealthCheck {
+    pub fn normalize(
+        upstream_name: &str,
+        backend_id: &str,
+        health_check: &crate::config::HealthCheck,
+    ) -> Result<Self, RuntimeConfigError> {
+        if health_check.interval == 0 {
+            return Err(config_invalid(format!(
+                "health check interval is invalid (0) for backend '{backend_id}' in upstream '{upstream_name}'"
+            )));
+        }
+        if health_check.timeout_ms == 0 {
+            return Err(config_invalid(format!(
+                "health check timeout is invalid (0) for backend '{backend_id}' in upstream '{upstream_name}'"
+            )));
+        }
+        if health_check.failure_threshold == 0 {
+            return Err(config_invalid(format!(
+                "health check failure threshold is invalid (0) for backend '{backend_id}' in upstream '{upstream_name}'"
+            )));
+        }
+        if health_check.success_threshold == 0 {
+            return Err(config_invalid(format!(
+                "health check success threshold is invalid (0) for backend '{backend_id}' in upstream '{upstream_name}'"
+            )));
+        }
+
+        Ok(Self {
+            path: if health_check.path.trim().is_empty() {
+                "/".to_string()
+            } else {
+                health_check.path.clone()
+            },
+            interval: Duration::from_millis(health_check.interval),
+            timeout: Duration::from_millis(health_check.timeout_ms),
+            failure_threshold: health_check.failure_threshold,
+            success_threshold: health_check.success_threshold,
+            cooldown: Duration::from_millis(health_check.cooldown_ms),
+        })
+    }
+
+    pub fn as_config(&self) -> crate::config::HealthCheck {
+        crate::config::HealthCheck {
+            path: self.path.clone(),
+            interval: self.interval.as_millis().try_into().unwrap_or(u64::MAX),
+            timeout_ms: self.timeout.as_millis().try_into().unwrap_or(u64::MAX),
+            failure_threshold: self.failure_threshold,
+            success_threshold: self.success_threshold,
+            cooldown_ms: self.cooldown.as_millis().try_into().unwrap_or(u64::MAX),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeBackendTlsPolicy {
+    pub verify_certificates: bool,
+    pub strict_sni: bool,
+    pub ca_file: Option<String>,
+    pub ca_dir: Option<String>,
+}
+
+impl RuntimeBackendTlsPolicy {
+    pub fn from_effective_tls(effective_tls: &UpstreamTls) -> Self {
+        Self {
+            verify_certificates: effective_tls.verify_certificates,
+            strict_sni: effective_tls.strict_sni,
+            ca_file: effective_tls.ca_file.clone(),
+            ca_dir: effective_tls.ca_dir.clone(),
+        }
+    }
+
+    pub fn as_upstream_tls(&self) -> UpstreamTls {
+        UpstreamTls {
+            verify_certificates: self.verify_certificates,
+            strict_sni: self.strict_sni,
+            ca_file: self.ca_file.clone(),
+            ca_dir: self.ca_dir.clone(),
+        }
     }
 }
 
@@ -1291,13 +1494,20 @@ impl RuntimeAdmissionPolicy {
 
 #[derive(Debug, Clone)]
 pub struct RuntimeUpstreamTransportPolicy {
-    pub effective_tls: UpstreamTls,
+    pub tls: RuntimeBackendTlsPolicy,
+    pub connection: RuntimeBackendConnectionPolicy,
+    pub dns: RuntimeBackendDnsPolicy,
 }
 
 impl RuntimeUpstreamTransportPolicy {
-    pub fn from_effective_tls(effective_tls: &UpstreamTls) -> Self {
+    pub fn from_effective_tls(
+        effective_tls: &UpstreamTls,
+        transport: &RuntimeTransportPolicy,
+    ) -> Self {
         Self {
-            effective_tls: effective_tls.clone(),
+            tls: RuntimeBackendTlsPolicy::from_effective_tls(effective_tls),
+            connection: transport.backend_connections.clone(),
+            dns: transport.backend_dns.clone(),
         }
     }
 }
@@ -1368,7 +1578,10 @@ impl RuntimeUpstreamPolicySet {
             rate_limits: base.rate_limits.clone(),
             load_balancing: RuntimeLoadBalancingPolicy::normalize(&upstream.load_balancing)?,
             admission: base.admission.clone(),
-            transport: RuntimeUpstreamTransportPolicy::from_effective_tls(&upstream.effective_tls),
+            transport: RuntimeUpstreamTransportPolicy::from_effective_tls(
+                &upstream.effective_tls,
+                &base.transport,
+            ),
             host: upstream.policy.host.clone(),
             forwarded_headers: upstream.policy.forwarded_headers.clone(),
             protocol: upstream.policy.protocol.clone(),

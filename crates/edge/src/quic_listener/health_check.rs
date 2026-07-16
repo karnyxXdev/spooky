@@ -7,6 +7,7 @@ impl QUICListener {
         upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
         transport_pool: Arc<UpstreamTransportPool>,
         backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+        backend_health_checks: Arc<HashMap<String, spooky_config::runtime::RuntimeBackendHealthCheck>>,
         _backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
         metrics: Arc<Metrics>,
         task_registry: Arc<RuntimeTaskRegistry>,
@@ -32,15 +33,11 @@ impl QUICListener {
                 Err(_) => continue,
             };
             for index in pool.pool.all_indices() {
-                let (address, health) =
-                    match (pool.pool.address(index), pool.pool.health_check(index)) {
-                        (Some(address), Some(health)) => (address.to_string(), health),
-                        _ => continue,
-                    };
-                let path: &str = if health.path.is_empty() {
-                    "/"
-                } else {
-                    &health.path
+                let Some(address) = pool.pool.address(index).map(str::to_string) else {
+                    continue;
+                };
+                let Some(health) = backend_health_checks.get(&address) else {
+                    continue;
                 };
                 let endpoint = match backend_endpoints.get(&address) {
                     Some(endpoint) => endpoint,
@@ -52,7 +49,8 @@ impl QUICListener {
                         continue;
                     }
                 };
-                let base_interval_ms = health.interval.max(1);
+                let base_interval_ms: u64 =
+                    health.interval.as_millis().try_into().unwrap_or(u64::MAX).max(1);
                 let initial_jitter_ms = if base_interval_ms > 1 {
                     crate::stable_hash64(address.as_bytes()) % base_interval_ms
                 } else {
@@ -63,8 +61,8 @@ impl QUICListener {
                     upstream_pool: Arc::clone(upstream_pool),
                     index,
                     backend_identity: address,
-                    health_uri: endpoint.uri_for_path(path),
-                    timeout: Duration::from_millis(health.timeout_ms.max(1)),
+                    health_uri: endpoint.uri_for_path(&health.path),
+                    timeout: health.timeout,
                     base_interval_ms,
                     consecutive_failures: 0,
                     next_due_at,

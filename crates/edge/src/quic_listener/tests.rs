@@ -443,8 +443,12 @@ fn bootstrap_connection_state_prefers_reloaded_runtime_settings() {
 
     let mut reloaded = startup.clone();
     reloaded.performance.backend_timeout_ms = 4321;
+    reloaded.performance.backend_body_idle_timeout_ms = 5321;
+    reloaded.performance.backend_body_total_timeout_ms = 6321;
+    reloaded.performance.backend_total_request_timeout_ms = 7321;
     reloaded.performance.max_request_body_bytes = 65_537;
     reloaded.performance.max_response_body_bytes = 98_765;
+    reloaded.performance.unknown_length_response_prebuffer_bytes = 98_765;
     reloaded.performance.max_active_connections = 37;
     reloaded.performance.client_body_idle_timeout_ms = 7654;
 

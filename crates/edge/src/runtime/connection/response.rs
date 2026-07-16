@@ -1,8 +1,6 @@
 use bytes::Bytes;
-use spooky_errors::ProxyError;
+use spooky_errors::{ProxyError, RetryPolicyDenialReason, RetryTelemetryReason};
 use tokio::sync::mpsc;
-
-use crate::RetryReason;
 
 pub enum ForwardSuccess {
     Response {
@@ -23,10 +21,10 @@ pub struct UpstreamResult {
     pub forward: ForwardResult,
     pub hedge: HedgeTelemetry,
     pub retry_count: u8,
-    /// Set when a retry was attempted; the error reason that triggered it.
-    pub retry_attempt_reason: Option<RetryReason>,
-    /// Set when a retry was denied; the first denial reason encountered.
-    pub retry_denial_reason: Option<RetryReason>,
+    /// Set when a retry was attempted; the shared policy reason that triggered it.
+    pub retry_attempt_reason: Option<RetryTelemetryReason>,
+    /// Set when a retry was denied; the first shared policy denial encountered.
+    pub retry_denial_reason: Option<RetryPolicyDenialReason>,
 }
 
 /// A chunk of the upstream response being streamed back to the client.

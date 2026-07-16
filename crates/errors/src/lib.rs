@@ -11,9 +11,13 @@ pub use proxy::{
     classify_upstream_proxy_error, classify_upstream_send_error,
 };
 pub use retry::{
-    RetryPolicyDecision, RetryPolicyDenial, RetryPolicyInput, UpstreamRetryReason,
-    UpstreamRetryability, UpstreamTerminalErrorKind, classify_retryability, evaluate_retry_policy,
-    is_retryable,
+    AlternateBackendChoice, AlternateBackendDecision, AlternateBackendDenialReason,
+    AlternateBackendPolicyFacts, HedgePolicyDecision, HedgePolicyDenialReason,
+    HedgePolicyFacts, HedgeTelemetryReason, RetryPolicyDecision, RetryPolicyDenial,
+    RetryPolicyDenialReason, RetryPolicyFacts, RetryPolicyInput, RetryTelemetryReason,
+    UpstreamRetryReason, UpstreamRetryability, UpstreamTerminalErrorKind,
+    is_idempotent_method,
+    classify_retryability, evaluate_retry_policy, is_retryable,
 };
 pub use upstream::{
     UpstreamErrorCategory, UpstreamErrorClassification, UpstreamHealthFailureMapping,

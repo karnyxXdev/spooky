@@ -9,6 +9,29 @@ use crate::runtime::connection::{
         response_body_limit_reason, response_chunk_ranges,
     },
 };
+use spooky_errors::{RetryPolicyDenialReason, RetryTelemetryReason};
+
+fn metrics_retry_reason(reason: RetryTelemetryReason) -> RetryReason {
+    match reason {
+        RetryTelemetryReason::Timeout => RetryReason::BackendTimeout,
+        RetryTelemetryReason::Transport => RetryReason::BackendTransport,
+        RetryTelemetryReason::Pool => RetryReason::BackendPool,
+    }
+}
+
+fn metrics_retry_denial(reason: RetryPolicyDenialReason) -> Option<RetryReason> {
+    match reason {
+        RetryPolicyDenialReason::MethodNotIdempotent
+        | RetryPolicyDenialReason::RequestBodyNotReplayable => Some(RetryReason::NotBodylessMode),
+        RetryPolicyDenialReason::BudgetDenied => Some(RetryReason::BudgetDenied),
+        RetryPolicyDenialReason::NoAlternateBackend
+        | RetryPolicyDenialReason::AlternateBackendUnhealthy => {
+            Some(RetryReason::NoAlternateBackend)
+        }
+        RetryPolicyDenialReason::TerminalError(_)
+        | RetryPolicyDenialReason::AttemptLimitReached => None,
+    }
+}
 
 fn response_body_guardrail_error(decision: ResponseBodyGuardrailDecision) -> Option<ProxyError> {
     match decision {
@@ -272,10 +295,12 @@ impl QUICListener {
                     metrics.observe_hedge_primary_late_ms(forward_result.hedge.primary_late_ms);
                 }
                 if let Some(reason) = forward_result.retry_attempt_reason {
-                    metrics.inc_retry_attempt(reason);
+                    metrics.inc_retry_attempt(metrics_retry_reason(reason));
                 }
                 if let Some(reason) = forward_result.retry_denial_reason {
-                    metrics.inc_retry_denied(reason);
+                    if let Some(reason) = metrics_retry_denial(reason) {
+                        metrics.inc_retry_denied(reason);
+                    }
                 }
 
                 if let Some(req) = streams.get_mut(&stream_id) {

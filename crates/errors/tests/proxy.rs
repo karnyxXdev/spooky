@@ -52,29 +52,45 @@ fn retry_policy_evaluation_preserves_existing_denial_behavior() {
     assert_eq!(
         evaluate_retry_policy(RetryPolicyInput {
             retryability: UpstreamRetryability::Terminal(UpstreamTerminalErrorKind::Protocol),
-            bodyless_mode: true,
+            method_idempotent: true,
+            request_body_replayable: true,
+            attempt_count: 0,
+            max_attempts: 1,
             budget_available: true,
             alternate_backend_available: true,
+            alternate_backend_healthy: true,
         }),
-        RetryPolicyDecision::DoNotRetry { denial: None }
+        RetryPolicyDecision::DoNotRetry {
+            denial: Some(RetryPolicyDenial::TerminalError(
+                UpstreamTerminalErrorKind::Protocol,
+            )),
+        }
     );
     assert_eq!(
         evaluate_retry_policy(RetryPolicyInput {
             retryability: UpstreamRetryability::Retryable(UpstreamRetryReason::Transport),
-            bodyless_mode: false,
+            method_idempotent: true,
+            request_body_replayable: false,
+            attempt_count: 0,
+            max_attempts: 1,
             budget_available: true,
             alternate_backend_available: true,
+            alternate_backend_healthy: true,
         }),
         RetryPolicyDecision::DoNotRetry {
-            denial: Some(RetryPolicyDenial::NotBodylessMode),
+            denial: Some(RetryPolicyDenial::RequestBodyNotReplayable),
         }
     );
     assert_eq!(
         evaluate_retry_policy(RetryPolicyInput {
             retryability: UpstreamRetryability::Retryable(UpstreamRetryReason::Pool),
-            bodyless_mode: true,
+            method_idempotent: true,
+            request_body_replayable: true,
+            attempt_count: 0,
+            max_attempts: 1,
             budget_available: false,
             alternate_backend_available: true,
+            alternate_backend_healthy: true,
         }),
         RetryPolicyDecision::DoNotRetry {
             denial: Some(RetryPolicyDenial::BudgetDenied),
@@ -83,9 +99,13 @@ fn retry_policy_evaluation_preserves_existing_denial_behavior() {
     assert_eq!(
         evaluate_retry_policy(RetryPolicyInput {
             retryability: UpstreamRetryability::Retryable(UpstreamRetryReason::Timeout),
-            bodyless_mode: true,
+            method_idempotent: true,
+            request_body_replayable: true,
+            attempt_count: 0,
+            max_attempts: 1,
             budget_available: true,
             alternate_backend_available: true,
+            alternate_backend_healthy: true,
         }),
         RetryPolicyDecision::Retry {
             reason: UpstreamRetryReason::Timeout,

@@ -1,25 +1,11 @@
 use spooky_errors::{
-    RetryPolicyDecision, RetryPolicyDenial, RetryPolicyInput, UpstreamRetryReason,
-    evaluate_retry_policy,
+    RetryPolicyDecision, RetryPolicyFacts, RetryPolicyDenialReason, RetryTelemetryReason,
+    evaluate_retry_policy, is_idempotent_method,
 };
 
 use super::*;
 
-fn metrics_retry_reason(reason: UpstreamRetryReason) -> RetryReason {
-    match reason {
-        UpstreamRetryReason::Timeout => RetryReason::BackendTimeout,
-        UpstreamRetryReason::Transport => RetryReason::BackendTransport,
-        UpstreamRetryReason::Pool => RetryReason::BackendPool,
-    }
-}
-
-fn metrics_retry_denial(reason: RetryPolicyDenial) -> RetryReason {
-    match reason {
-        RetryPolicyDenial::NotBodylessMode => RetryReason::NotBodylessMode,
-        RetryPolicyDenial::BudgetDenied => RetryReason::BudgetDenied,
-        RetryPolicyDenial::NoAlternateBackend => RetryReason::NoAlternateBackend,
-    }
-}
+const MAX_UPSTREAM_RETRY_ATTEMPTS: u8 = 1;
 
 impl QUICListener {
     #[allow(clippy::too_many_arguments)]
@@ -177,12 +163,13 @@ impl QUICListener {
         let tunnel_mode = req.tunnel_mode;
         let bodyless_mode = req.bodyless_mode;
         let request_id = req.request_id;
+        let method_idempotent = is_idempotent_method(&req.method);
         let fut = async move {
             let mut hedge_telemetry =
                 crate::runtime::connection::response::HedgeTelemetry::default();
             let mut retry_count: u8 = 0;
-            let mut retry_attempt_reason: Option<RetryReason> = None;
-            let mut retry_denial_reason: Option<RetryReason> = None;
+            let mut retry_attempt_reason: Option<RetryTelemetryReason> = None;
+            let mut retry_denial_reason: Option<RetryPolicyDenialReason> = None;
             let result: ForwardResult = async {
                 retry_budget.mark_primary(&route_name);
 
@@ -300,18 +287,20 @@ impl QUICListener {
                         {
                             Ok(response) => response,
                             Err(primary_err) => {
-                                let retry_decision = evaluate_retry_policy(RetryPolicyInput {
+                                let retry_decision = evaluate_retry_policy(RetryPolicyFacts {
                                     retryability: spooky_errors::classify_retryability(&primary_err),
-                                    bodyless_mode,
+                                    method_idempotent,
+                                    request_body_replayable: bodyless_mode,
+                                    attempt_count: retry_count,
+                                    max_attempts: MAX_UPSTREAM_RETRY_ATTEMPTS,
                                     budget_available: retry_budget.allow_retry(&route_name).is_ok(),
                                     alternate_backend_available: alternate_backend.is_some(),
+                                    alternate_backend_healthy: alternate_backend.is_some(),
                                 });
                                 let retry_reason = match retry_decision {
-                                    RetryPolicyDecision::Retry { reason } => {
-                                        metrics_retry_reason(reason)
-                                    }
+                                    RetryPolicyDecision::Retry { reason } => reason.into(),
                                     RetryPolicyDecision::DoNotRetry { denial } => {
-                                        retry_denial_reason = denial.map(metrics_retry_denial);
+                                        retry_denial_reason = denial;
                                         return Err(primary_err);
                                     }
                                 };

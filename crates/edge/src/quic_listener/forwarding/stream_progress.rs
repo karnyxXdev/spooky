@@ -758,24 +758,15 @@ impl QUICListener {
 
                         if let Some(req) = streams.get(&stream_id) {
                             if let (Some(addr), Some(idx)) = (&req.backend_addr, req.backend_index)
-                                && let Some(pool) = req.upstream_pool.as_ref()
                             {
-                                let transition = pool.write().ok().and_then(|mut p| {
-                                    match outcome_from_status(status) {
-                                        crate::runtime::health::HealthClassification::Success => {
-                                            p.pool.mark_success(idx)
-                                        }
-                                        crate::runtime::health::HealthClassification::Failure => {
-                                            p.pool.mark_request_failure(
-                                                idx,
-                                                HealthFailureReason::HttpStatus5xx,
-                                            )
-                                        }
-                                        crate::runtime::health::HealthClassification::Neutral => {
-                                            None
-                                        }
-                                    }
-                                });
+                                let transition = crate::runtime::connection::outcome::observe_backend_response_status(
+                                    crate::runtime::connection::outcome::BackendHealthObservationInput {
+                                        backend_addr: addr,
+                                        backend_index: idx,
+                                        upstream_pool: req.upstream_pool.as_ref(),
+                                        status,
+                                    },
+                                );
                                 if let Some(t) = transition {
                                     Self::log_health_transition(addr, t);
                                 }

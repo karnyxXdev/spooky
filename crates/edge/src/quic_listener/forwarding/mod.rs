@@ -18,8 +18,10 @@ pub(in crate::quic_listener) use self::resolve::RouteResolutionRequest as TestRo
 use super::*;
 use crate::runtime::connection::{
     outcome::{
+        BackendRequestFinishInput, ClassifiedBackendFailureInput,
         OutcomeBackendTarget, OutcomeRouteTarget, RequestMetricsObservation,
-        classify_status_outcome,
+        classify_status_outcome, finish_backend_request_accounting,
+        log_backend_health_transition, observe_classified_backend_failure,
         record_request_metrics_observation,
     },
     request::PendingForward,
@@ -29,15 +31,12 @@ use crate::runtime::connection::{
 pub(super) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> StreamPhase {
     let phase = req.phase.clone();
     if req.backend_request_started && !req.backend_request_finished {
-        if let (Some(pool), Some(index)) = (&req.upstream_pool, req.backend_index)
-            && let Ok(mut guard) = pool.write()
-        {
-            guard.finish_request(
-                index,
-                req.start.elapsed(),
-                req.response_status.or(Some(503)),
-            );
-        }
+        finish_backend_request_accounting(BackendRequestFinishInput {
+            upstream_pool: req.upstream_pool.as_ref(),
+            backend_index: req.backend_index,
+            elapsed: req.start.elapsed(),
+            status: req.response_status.or(Some(503)),
+        });
         req.backend_request_finished = true;
     }
     if req.body_buf_bytes > 0 {
@@ -135,24 +134,14 @@ impl QUICListener {
         metrics: &Metrics,
         classified: &ClassifiedUpstreamProxyError,
     ) {
-        let Some(health_mapping) = classified.health_failure else {
-            return;
-        };
-
-        metrics.inc_health_failure(health_mapping.failure_reason);
-        if health_mapping.failure_reason == HealthFailureReason::Tls {
-            metrics.record_upstream_tls_failure(
-                backend_addr,
-                metrics_phase,
-                health_mapping.metrics_reason,
-            );
-        }
-        if let Some(pool) = upstream_pool
-            && let Some(transition) = pool.write().ok().and_then(|mut p| {
-                p.pool
-                    .mark_request_failure(backend_index, health_mapping.failure_reason)
-            })
-        {
+        if let Some(transition) = observe_classified_backend_failure(ClassifiedBackendFailureInput {
+            metrics_phase,
+            backend_addr,
+            backend_index,
+            upstream_pool,
+            metrics,
+            classified,
+        }) {
             Self::log_health_transition(backend_addr, transition);
         }
     }
@@ -395,9 +384,12 @@ impl QUICListener {
             .get(pending_forward.backend_addr.as_ref())
             .cloned()
         else {
-            if let Ok(mut guard) = upstream_pool.write() {
-                guard.finish_request(backend_index, req.start.elapsed(), Some(503));
-            }
+            finish_backend_request_accounting(BackendRequestFinishInput {
+                upstream_pool: Some(&upstream_pool),
+                backend_index: Some(backend_index),
+                elapsed: req.start.elapsed(),
+                status: Some(503),
+            });
             metrics.inc_failure();
             metrics.record_route(&upstream_name, req.start.elapsed(), RouteOutcome::Failure);
             Self::send_simple_response(
@@ -434,9 +426,12 @@ impl QUICListener {
             ) {
                 Ok(request) => Some(request),
                 Err(err) => {
-                    if let Ok(mut guard) = upstream_pool.write() {
-                        guard.finish_request(backend_index, req.start.elapsed(), Some(503));
-                    }
+                    finish_backend_request_accounting(BackendRequestFinishInput {
+                        upstream_pool: Some(&upstream_pool),
+                        backend_index: Some(backend_index),
+                        elapsed: req.start.elapsed(),
+                        status: Some(503),
+                    });
                     metrics.inc_failure();
                     metrics.record_route(
                         &upstream_name,
@@ -470,9 +465,12 @@ impl QUICListener {
         ) {
             Ok(result_rx) => result_rx,
             Err(err) => {
-                if let Ok(mut guard) = upstream_pool.write() {
-                    guard.finish_request(backend_index, req.start.elapsed(), Some(503));
-                }
+                finish_backend_request_accounting(BackendRequestFinishInput {
+                    upstream_pool: Some(&upstream_pool),
+                    backend_index: Some(backend_index),
+                    elapsed: req.start.elapsed(),
+                    status: Some(503),
+                });
                 metrics.inc_failure();
                 metrics.record_route(&upstream_name, req.start.elapsed(), RouteOutcome::Failure);
                 Self::send_simple_response(
@@ -546,14 +544,7 @@ impl QUICListener {
     }
 
     pub(crate) fn log_health_transition(addr: &str, transition: HealthTransition) {
-        match transition {
-            HealthTransition::BecameHealthy => {
-                info!("Backend {} became healthy", addr);
-            }
-            HealthTransition::BecameUnhealthy => {
-                error!("Backend {} became unhealthy", addr);
-            }
-        }
+        log_backend_health_transition(addr, transition);
     }
 }
 

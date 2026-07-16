@@ -640,12 +640,19 @@ impl QUICListener {
                             metrics,
                             classified,
                         );
-                    } else if let (Some(idx), Some(pool)) = (req.backend_index, upstream_pool)
-                        && let Some(t) = pool.write().ok().and_then(|mut p| {
-                            p.pool
-                                .mark_request_failure(idx, HealthFailureReason::HttpStatus5xx)
-                        })
-                        && let Some(addr) = &req.backend_addr
+                    } else if let (Some(addr), Some(idx)) =
+                        (req.backend_addr.as_deref(), req.backend_index)
+                        && let Some(t) = crate::runtime::connection::outcome::observe_backend_response_status(
+                            crate::runtime::connection::outcome::BackendHealthObservationInput {
+                                backend_addr: addr,
+                                backend_index: idx,
+                                upstream_pool,
+                                status: req
+                                    .response_status
+                                    .and_then(|code| http::StatusCode::from_u16(code).ok())
+                                    .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR),
+                            },
+                        )
                     {
                         Self::log_health_transition(addr, t);
                     }

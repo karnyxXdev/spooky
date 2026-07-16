@@ -1,10 +1,16 @@
-use std::time::Duration;
+use std::{
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use http::StatusCode;
-use spooky_errors::{PoolError, ProxyError};
-use spooky_lb::health::HealthFailureReason;
+use log::{error, info};
+use spooky_errors::{ClassifiedUpstreamProxyError, PoolError, ProxyError};
+use spooky_lb::{
+    backend::HealthTransition, health::HealthFailureReason, upstream_pool::UpstreamPool,
+};
 
-use crate::{OverloadShedReason, RouteOutcome};
+use crate::{Metrics, OverloadShedReason, RouteOutcome, runtime::health::outcome_from_status};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CanonicalRouteOutcome {
@@ -358,6 +364,107 @@ pub fn record_request_metrics_observation(
         metrics_outcome,
         elapsed,
     );
+}
+
+#[derive(Clone, Copy)]
+pub struct BackendRequestFinishInput<'a> {
+    pub upstream_pool: Option<&'a Arc<RwLock<UpstreamPool>>>,
+    pub backend_index: Option<usize>,
+    pub elapsed: Duration,
+    pub status: Option<u16>,
+}
+
+#[derive(Clone, Copy)]
+pub struct BackendHealthObservationInput<'a> {
+    pub backend_addr: &'a str,
+    pub backend_index: usize,
+    pub upstream_pool: Option<&'a Arc<RwLock<UpstreamPool>>>,
+    pub status: StatusCode,
+}
+
+#[derive(Clone, Copy)]
+pub struct ClassifiedBackendFailureInput<'a> {
+    pub metrics_phase: &'a str,
+    pub backend_addr: &'a str,
+    pub backend_index: usize,
+    pub upstream_pool: Option<&'a Arc<RwLock<UpstreamPool>>>,
+    pub metrics: &'a Metrics,
+    pub classified: &'a ClassifiedUpstreamProxyError,
+}
+
+pub fn finish_backend_request_accounting(input: BackendRequestFinishInput<'_>) {
+    let BackendRequestFinishInput {
+        upstream_pool,
+        backend_index,
+        elapsed,
+        status,
+    } = input;
+
+    if let (Some(pool), Some(index)) = (upstream_pool, backend_index)
+        && let Ok(mut guard) = pool.write()
+    {
+        guard.finish_request(index, elapsed, status);
+    }
+}
+
+pub fn observe_backend_response_status(
+    input: BackendHealthObservationInput<'_>,
+) -> Option<HealthTransition> {
+    let BackendHealthObservationInput {
+        backend_addr: _backend_addr,
+        backend_index,
+        upstream_pool,
+        status,
+    } = input;
+
+    let pool = upstream_pool?;
+    let mut pool = pool.write().ok()?;
+    match outcome_from_status(status) {
+        crate::runtime::health::HealthClassification::Success => pool.pool.mark_success(backend_index),
+        crate::runtime::health::HealthClassification::Failure => {
+            pool.pool
+                .mark_request_failure(backend_index, HealthFailureReason::HttpStatus5xx)
+        }
+        crate::runtime::health::HealthClassification::Neutral => None,
+    }
+}
+
+pub fn observe_classified_backend_failure(
+    input: ClassifiedBackendFailureInput<'_>,
+) -> Option<HealthTransition> {
+    let ClassifiedBackendFailureInput {
+        metrics_phase,
+        backend_addr,
+        backend_index,
+        upstream_pool,
+        metrics,
+        classified,
+    } = input;
+
+    let health_mapping = classified.health_failure?;
+    metrics.inc_health_failure(health_mapping.failure_reason);
+    if health_mapping.failure_reason == HealthFailureReason::Tls {
+        metrics.record_upstream_tls_failure(
+            backend_addr,
+            metrics_phase,
+            health_mapping.metrics_reason,
+        );
+    }
+    let pool = upstream_pool?;
+    let mut pool = pool.write().ok()?;
+    pool.pool
+        .mark_request_failure(backend_index, health_mapping.failure_reason)
+}
+
+pub fn log_backend_health_transition(addr: &str, transition: HealthTransition) {
+    match transition {
+        HealthTransition::BecameHealthy => {
+            info!("Backend {} became healthy", addr);
+        }
+        HealthTransition::BecameUnhealthy => {
+            error!("Backend {} became unhealthy", addr);
+        }
+    }
 }
 
 #[cfg(test)]

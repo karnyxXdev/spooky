@@ -672,8 +672,9 @@ pub(crate) enum PendingHeaderMutation {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn canonicalize_auth_request_mutations_drops_protected_and_invalid_names() {

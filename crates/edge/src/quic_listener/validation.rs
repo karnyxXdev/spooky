@@ -11,9 +11,9 @@ pub(super) struct RequestValidationResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RequestBufferError {
-    BodySizeCap,
-    StreamCap,
-    GlobalCap,
+    BodySize,
+    Stream,
+    Global,
 }
 
 pub(super) fn validate_request_headers(

@@ -1227,7 +1227,7 @@ fn response_size_cap_enforced_as_running_total() {
             },
         ),
         Err(ResponseBodyGuardrailDecision::Reject {
-            kind: BodyLimitKind::BodySizeCap,
+            kind: BodyLimitKind::BodySize,
         })
     );
 }

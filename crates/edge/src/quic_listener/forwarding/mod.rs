@@ -900,7 +900,7 @@ impl QUICListener {
                                     );
                                     match next_state {
                                         Err(RequestBodyGuardrailDecision::Reject {
-                                            kind: BodyLimitKind::BodySizeCap,
+                                            kind: BodyLimitKind::BodySize,
                                         }) => {
                                             payload_too_large = Some((
                                                 req.upstream_name
@@ -923,7 +923,7 @@ impl QUICListener {
                                                     max_request_body_bytes,
                                                     request_buffer_global_cap_bytes,
                                                 ) {
-                                                    if err == RequestBufferError::BodySizeCap {
+                                                    if err == RequestBufferError::BodySize {
                                                         payload_too_large = Some((
                                                             req.upstream_name
                                                                 .clone()
@@ -935,7 +935,7 @@ impl QUICListener {
                                                     } else {
                                                         shed_due_to_buffer_pressure = true;
                                                         metrics.inc_request_buffer_limit_reject();
-                                                        if err == RequestBufferError::GlobalCap {
+                                                        if err == RequestBufferError::Global {
                                                             debug!(
                                                                 "global request buffer cap reached"
                                                             );
@@ -947,8 +947,8 @@ impl QUICListener {
                                         }
                                         Err(RequestBodyGuardrailDecision::Reject {
                                             kind:
-                                                BodyLimitKind::UnknownLengthPrebufferCap
-                                                | BodyLimitKind::BufferedBodyCap,
+                                                BodyLimitKind::UnknownLengthPrebuffer
+                                                | BodyLimitKind::BufferedBody,
                                         }) => {
                                             shed_due_to_buffer_pressure = true;
                                             metrics.inc_request_buffer_limit_reject();

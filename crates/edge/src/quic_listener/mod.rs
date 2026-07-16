@@ -1840,7 +1840,7 @@ impl QUICListener {
     ) -> Result<(), RequestBufferError> {
         let chunk_len = chunk.len();
         if !metrics.try_reserve_request_buffer(chunk_len, request_buffer_global_cap_bytes) {
-            return Err(RequestBufferError::GlobalCap);
+            return Err(RequestBufferError::Global);
         }
 
         let next_state = checked_request_body_ingress(
@@ -1864,9 +1864,9 @@ impl QUICListener {
             metrics.release_request_buffer(chunk_len);
             return Err(match next_state {
                 Err(RequestBodyGuardrailDecision::Reject {
-                    kind: BodyLimitKind::BodySizeCap,
-                }) => RequestBufferError::BodySizeCap,
-                Err(RequestBodyGuardrailDecision::Reject { .. }) => RequestBufferError::StreamCap,
+                    kind: BodyLimitKind::BodySize,
+                }) => RequestBufferError::BodySize,
+                Err(RequestBodyGuardrailDecision::Reject { .. }) => RequestBufferError::Stream,
                 Err(other) => unreachable!(
                     "request ingress should not timeout in enqueue path: {:?}",
                     other

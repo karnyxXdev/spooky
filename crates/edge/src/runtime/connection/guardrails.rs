@@ -63,9 +63,9 @@ pub(crate) enum BodyTimeoutKind {
 /// Canonical body-size and buffering rejection reasons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BodyLimitKind {
-    BodySizeCap,
-    BufferedBodyCap,
-    UnknownLengthPrebufferCap,
+    BodySize,
+    BufferedBody,
+    UnknownLengthPrebuffer,
 }
 
 /// Policy describing how response body bytes may be emitted downstream.
@@ -156,23 +156,23 @@ fn evaluate_request_body_ingress(
         .is_some_and(|length| !input.exempt_from_body_size_cap && length > config.max_body_bytes)
     {
         return RequestBodyGuardrailDecision::Reject {
-            kind: BodyLimitKind::BodySizeCap,
+            kind: BodyLimitKind::BodySize,
         };
     }
 
     let next_total = input.bytes_received.saturating_add(input.next_chunk_bytes);
     if !input.exempt_from_body_size_cap && next_total > config.max_body_bytes {
         return RequestBodyGuardrailDecision::Reject {
-            kind: BodyLimitKind::BodySizeCap,
+            kind: BodyLimitKind::BodySize,
         };
     }
 
     let next_buffered = input.buffered_bytes.saturating_add(input.next_chunk_bytes);
     if next_buffered > config.max_buffered_bytes {
         let kind = if input.declared_content_length.is_some() {
-            BodyLimitKind::BufferedBodyCap
+            BodyLimitKind::BufferedBody
         } else {
-            BodyLimitKind::UnknownLengthPrebufferCap
+            BodyLimitKind::UnknownLengthPrebuffer
         };
         return RequestBodyGuardrailDecision::Reject { kind };
     }
@@ -197,16 +197,16 @@ pub(crate) fn checked_request_body_ingress(
 
 pub(crate) fn response_body_limit_reason(kind: BodyLimitKind) -> &'static str {
     match kind {
-        BodyLimitKind::BodySizeCap => "upstream response body too large",
-        BodyLimitKind::BufferedBodyCap => "upstream response buffered body limit exceeded",
-        BodyLimitKind::UnknownLengthPrebufferCap => {
+        BodyLimitKind::BodySize => "upstream response body too large",
+        BodyLimitKind::BufferedBody => "upstream response buffered body limit exceeded",
+        BodyLimitKind::UnknownLengthPrebuffer => {
             "unknown-length response prebuffer limit exceeded"
         }
     }
 }
 
 pub(crate) fn is_unknown_length_response_prebuffer_reason(reason: &str) -> bool {
-    reason == response_body_limit_reason(BodyLimitKind::UnknownLengthPrebufferCap)
+    reason == response_body_limit_reason(BodyLimitKind::UnknownLengthPrebuffer)
 }
 
 fn response_wait_timeout(
@@ -262,14 +262,14 @@ fn evaluate_response_body_guardrails(
             .is_some_and(|length| length > config.max_body_bytes)
         {
             return ResponseBodyGuardrailDecision::Reject {
-                kind: BodyLimitKind::BodySizeCap,
+                kind: BodyLimitKind::BodySize,
             };
         }
 
         let next_total = input.bytes_received.saturating_add(input.next_chunk_bytes);
         if next_total > config.max_body_bytes {
             return ResponseBodyGuardrailDecision::Reject {
-                kind: BodyLimitKind::BodySizeCap,
+                kind: BodyLimitKind::BodySize,
             };
         }
 
@@ -280,7 +280,7 @@ fn evaluate_response_body_guardrails(
                 > config.unknown_length_prebuffer_bytes
         {
             return ResponseBodyGuardrailDecision::Reject {
-                kind: BodyLimitKind::UnknownLengthPrebufferCap,
+                kind: BodyLimitKind::UnknownLengthPrebuffer,
             };
         }
     }
@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(
             decision,
             RequestBodyGuardrailDecision::Reject {
-                kind: BodyLimitKind::UnknownLengthPrebufferCap,
+                kind: BodyLimitKind::UnknownLengthPrebuffer,
             }
         );
     }
@@ -479,7 +479,7 @@ mod tests {
         assert_eq!(
             decision,
             RequestBodyGuardrailDecision::Reject {
-                kind: BodyLimitKind::BodySizeCap,
+                kind: BodyLimitKind::BodySize,
             }
         );
     }
@@ -507,7 +507,7 @@ mod tests {
         assert_eq!(
             decision,
             RequestBodyGuardrailDecision::Reject {
-                kind: BodyLimitKind::BodySizeCap,
+                kind: BodyLimitKind::BodySize,
             }
         );
     }
@@ -605,7 +605,7 @@ mod tests {
         assert_eq!(
             decision,
             ResponseBodyGuardrailDecision::Reject {
-                kind: BodyLimitKind::BodySizeCap,
+                kind: BodyLimitKind::BodySize,
             }
         );
     }
@@ -637,7 +637,7 @@ mod tests {
         assert_eq!(
             decision,
             ResponseBodyGuardrailDecision::Reject {
-                kind: BodyLimitKind::UnknownLengthPrebufferCap,
+                kind: BodyLimitKind::UnknownLengthPrebuffer,
             }
         );
     }

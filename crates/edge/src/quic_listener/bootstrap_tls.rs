@@ -723,7 +723,7 @@ impl QUICListener {
                                 if matches!(
                                     request_size_decision,
                                     Err(RequestBodyGuardrailDecision::Reject {
-                                        kind: BodyLimitKind::BodySizeCap,
+                                        kind: BodyLimitKind::BodySize,
                                     })
                                 ) {
                                     return Ok(Response::builder()
@@ -1158,7 +1158,7 @@ impl QUICListener {
                                 if matches!(
                                     response_size_decision,
                                     Err(ResponseBodyGuardrailDecision::Reject {
-                                        kind: BodyLimitKind::BodySizeCap,
+                                        kind: BodyLimitKind::BodySize,
                                     })
                                 ) {
                                     return Ok(Response::builder()

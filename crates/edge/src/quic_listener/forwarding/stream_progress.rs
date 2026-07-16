@@ -15,18 +15,18 @@ fn response_body_guardrail_error(decision: ResponseBodyGuardrailDecision) -> Opt
         ResponseBodyGuardrailDecision::Continue { .. } => None,
         ResponseBodyGuardrailDecision::Timeout { .. } => Some(ProxyError::Timeout),
         ResponseBodyGuardrailDecision::Reject {
-            kind: BodyLimitKind::BodySizeCap,
+            kind: BodyLimitKind::BodySize,
         } => Some(ProxyError::Pool(PoolError::BackendOverloaded(
-            response_body_limit_reason(BodyLimitKind::BodySizeCap).into(),
+            response_body_limit_reason(BodyLimitKind::BodySize).into(),
         ))),
         ResponseBodyGuardrailDecision::Reject {
-            kind: BodyLimitKind::UnknownLengthPrebufferCap,
+            kind: BodyLimitKind::UnknownLengthPrebuffer,
         } => Some(ProxyError::Pool(PoolError::BackendOverloaded(
-            response_body_limit_reason(BodyLimitKind::UnknownLengthPrebufferCap).into(),
+            response_body_limit_reason(BodyLimitKind::UnknownLengthPrebuffer).into(),
         ))),
         ResponseBodyGuardrailDecision::Reject { .. } => {
             Some(ProxyError::Pool(PoolError::BackendOverloaded(
-                response_body_limit_reason(BodyLimitKind::BufferedBodyCap).into(),
+                response_body_limit_reason(BodyLimitKind::BufferedBody).into(),
             )))
         }
     }
@@ -370,7 +370,7 @@ impl QUICListener {
                         if matches!(
                             preflight_guardrail,
                             Err(ResponseBodyGuardrailDecision::Reject {
-                                kind: BodyLimitKind::BodySizeCap,
+                                kind: BodyLimitKind::BodySize,
                             })
                         ) {
                             if let Some(req) = streams.get(&stream_id) {
@@ -542,10 +542,8 @@ impl QUICListener {
                                 let deferred_status = status;
                                 let deferred_headers = owned_h3_headers.clone();
                                 let tunnel_mode = tunnel_response;
-                                let response_guardrails = response_guardrails;
                                 let progressive_emission_allowed =
                                     progressive_body_emission_allowed;
-                                let body_forwarding_enabled = body_forwarding_enabled;
                                 let fut = async move {
                                     use http_body_util::BodyExt;
                                     let Some(mut body) = response_body else {

@@ -89,7 +89,7 @@ use crate::{
             guardrails::{
                 BodyLimitKind, REQUEST_BODY_TOO_LARGE_BODY, RequestBodyGuardrailConfig,
                 RequestBodyGuardrailDecision, RequestBodyGuardrailInput,
-                evaluate_request_body_ingress,
+                checked_request_body_ingress,
             },
             quic::{QuicConnection, QuicConnectionErrorSnapshot},
             request::RequestEnvelope,
@@ -1810,7 +1810,7 @@ impl QUICListener {
             return Err(RequestBufferError::GlobalCap);
         }
 
-        let decision = evaluate_request_body_ingress(
+        let next_state = checked_request_body_ingress(
             RequestBodyGuardrailConfig {
                 idle_timeout: Duration::ZERO,
                 total_timeout: Duration::ZERO,
@@ -1827,11 +1827,11 @@ impl QUICListener {
                 exempt_from_body_size_cap: false,
             },
         );
-        if !matches!(decision, RequestBodyGuardrailDecision::Continue) {
+        let Ok(next_state) = next_state else {
             metrics.release_request_buffer(chunk_len);
             return Err(RequestBufferError::StreamCap);
-        }
-        req.body_buf_bytes = req.body_buf_bytes.saturating_add(chunk_len);
+        };
+        req.body_buf_bytes = next_state.buffered_bytes;
         req.body_buf.push_back(chunk);
         Ok(())
     }

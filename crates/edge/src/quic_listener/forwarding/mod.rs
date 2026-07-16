@@ -878,7 +878,7 @@ impl QUICListener {
                                     ));
                                 }
                                 if reject_body_for_bodyless.is_none() {
-                                    let decision = evaluate_request_body_ingress(
+                                    let next_state = checked_request_body_ingress(
                                         RequestBodyGuardrailConfig {
                                             idle_timeout: Duration::ZERO,
                                             total_timeout: Duration::ZERO,
@@ -898,40 +898,53 @@ impl QUICListener {
                                             ),
                                         },
                                     );
-                                    if matches!(
-                                        decision,
-                                        RequestBodyGuardrailDecision::Reject {
+                                    match next_state {
+                                        Err(RequestBodyGuardrailDecision::Reject {
                                             kind: BodyLimitKind::BodySizeCap,
+                                        }) => {
+                                            payload_too_large = Some((
+                                                req.upstream_name
+                                                    .clone()
+                                                    .unwrap_or_else(|| "unrouted".to_string()),
+                                                req.start.elapsed(),
+                                            ));
                                         }
-                                    ) {
-                                        payload_too_large = Some((
-                                            req.upstream_name
-                                                .clone()
-                                                .unwrap_or_else(|| "unrouted".to_string()),
-                                            req.start.elapsed(),
-                                        ));
-                                    } else {
-                                        req.body_bytes_received =
-                                            req.body_bytes_received.saturating_add(read);
+                                        Ok(next_state) => {
+                                            req.body_bytes_received = next_state.bytes_received;
 
-                                        for chunk_slice in
-                                            body_buf[..read].chunks(REQUEST_CHUNK_BYTES_LIMIT)
-                                        {
-                                            let chunk = Bytes::copy_from_slice(chunk_slice);
-                                            if let Err(err) = Self::enqueue_request_chunk(
-                                                req,
-                                                chunk,
-                                                &metrics,
-                                                max_request_body_bytes,
-                                                request_buffer_global_cap_bytes,
-                                            ) {
-                                                shed_due_to_buffer_pressure = true;
-                                                metrics.inc_request_buffer_limit_reject();
-                                                if err == RequestBufferError::GlobalCap {
-                                                    debug!("global request buffer cap reached");
+                                            for chunk_slice in
+                                                body_buf[..read].chunks(REQUEST_CHUNK_BYTES_LIMIT)
+                                            {
+                                                let chunk = Bytes::copy_from_slice(chunk_slice);
+                                                if let Err(err) = Self::enqueue_request_chunk(
+                                                    req,
+                                                    chunk,
+                                                    &metrics,
+                                                    max_request_body_bytes,
+                                                    request_buffer_global_cap_bytes,
+                                                ) {
+                                                    shed_due_to_buffer_pressure = true;
+                                                    metrics.inc_request_buffer_limit_reject();
+                                                    if err == RequestBufferError::GlobalCap {
+                                                        debug!("global request buffer cap reached");
+                                                    }
+                                                    break;
                                                 }
-                                                break;
                                             }
+                                        }
+                                        Err(RequestBodyGuardrailDecision::Reject {
+                                            kind:
+                                                BodyLimitKind::UnknownLengthPrebufferCap
+                                                | BodyLimitKind::BufferedBodyCap,
+                                        }) => {
+                                            shed_due_to_buffer_pressure = true;
+                                            metrics.inc_request_buffer_limit_reject();
+                                        }
+                                        Err(other) => {
+                                            unreachable!(
+                                                "request ingress should not timeout in data path: {:?}",
+                                                other
+                                            );
                                         }
                                     }
                                 }

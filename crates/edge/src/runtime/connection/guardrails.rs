@@ -103,6 +103,27 @@ pub struct ResponseStreamingPolicy {
     pub wait_timeout: Duration,
 }
 
+/// Canonical request-body accounting state after an ingress step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestBodyIngressState {
+    pub bytes_received: usize,
+    pub buffered_bytes: usize,
+}
+
+/// Canonical response-body accounting state after an egress step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseBodyEgressState {
+    pub bytes_received: usize,
+    pub prebuffered_bytes: usize,
+}
+
+/// Shared result for a validated response-body streaming step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvaluatedResponseBodyGuardrail {
+    pub streaming: ResponseStreamingPolicy,
+    pub next_state: ResponseBodyEgressState,
+}
+
 pub(crate) fn evaluate_request_body_timeouts(
     config: RequestBodyGuardrailConfig,
     input: RequestBodyGuardrailInput,
@@ -153,6 +174,21 @@ pub(crate) fn evaluate_request_body_ingress(
     }
 
     RequestBodyGuardrailDecision::Continue
+}
+
+pub(crate) fn checked_request_body_ingress(
+    config: RequestBodyGuardrailConfig,
+    input: RequestBodyGuardrailInput,
+) -> Result<RequestBodyIngressState, RequestBodyGuardrailDecision> {
+    let decision = evaluate_request_body_ingress(config, input);
+    if !matches!(decision, RequestBodyGuardrailDecision::Continue) {
+        return Err(decision);
+    }
+
+    Ok(RequestBodyIngressState {
+        bytes_received: input.bytes_received.saturating_add(input.next_chunk_bytes),
+        buffered_bytes: input.buffered_bytes.saturating_add(input.next_chunk_bytes),
+    })
 }
 
 pub(crate) fn response_body_limit_reason(kind: BodyLimitKind) -> &'static str {
@@ -260,6 +296,33 @@ pub(crate) fn evaluate_response_body_guardrails(
             wait_timeout: response_wait_timeout(config, input),
         },
     }
+}
+
+pub(crate) fn checked_response_body_guardrails(
+    config: ResponseBodyGuardrailConfig,
+    input: ResponseBodyGuardrailInput,
+) -> Result<EvaluatedResponseBodyGuardrail, ResponseBodyGuardrailDecision> {
+    let decision = evaluate_response_body_guardrails(config, input);
+    let ResponseBodyGuardrailDecision::Continue { streaming } = decision else {
+        return Err(decision);
+    };
+
+    let next_bytes_received = input.bytes_received.saturating_add(input.next_chunk_bytes);
+    let next_prebuffered_bytes = match streaming.emission {
+        ProgressiveEmissionPolicy::PrebufferUntilValidated => input
+            .prebuffered_bytes
+            .saturating_add(input.next_chunk_bytes),
+        ProgressiveEmissionPolicy::StreamProgressively
+        | ProgressiveEmissionPolicy::SuppressBody => 0,
+    };
+
+    Ok(EvaluatedResponseBodyGuardrail {
+        streaming,
+        next_state: ResponseBodyEgressState {
+            bytes_received: next_bytes_received,
+            prebuffered_bytes: next_prebuffered_bytes,
+        },
+    })
 }
 
 pub(crate) fn response_chunk_ranges(

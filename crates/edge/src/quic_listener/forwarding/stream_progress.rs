@@ -5,8 +5,8 @@ use crate::runtime::connection::{
         BodyLimitKind, BodyTimeoutKind, ProgressiveEmissionPolicy, RESPONSE_BODY_TOO_LARGE_BODY,
         RequestBodyGuardrailConfig, RequestBodyGuardrailDecision, RequestBodyGuardrailInput,
         ResponseBodyGuardrailConfig, ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput,
-        evaluate_request_body_timeouts, evaluate_response_body_guardrails,
-        response_body_limit_reason, response_chunk_ranges,
+        checked_response_body_guardrails, evaluate_request_body_timeouts,
+        evaluate_response_body_guardrails, response_body_limit_reason, response_chunk_ranges,
     },
 };
 
@@ -562,7 +562,7 @@ impl QUICListener {
                                     let mut buffered_trailers: Option<Vec<(Vec<u8>, Vec<u8>)>> =
                                         None;
                                     loop {
-                                        let wait_decision = evaluate_response_body_guardrails(
+                                        let wait_decision = checked_response_body_guardrails(
                                             response_guardrails,
                                             ResponseBodyGuardrailInput {
                                                 elapsed: body_started_at.elapsed(),
@@ -579,12 +579,11 @@ impl QUICListener {
                                             },
                                         );
                                         let streaming = match wait_decision {
-                                            ResponseBodyGuardrailDecision::Continue {
-                                                streaming,
-                                            } => streaming,
+                                            Ok(evaluated) => evaluated.streaming,
                                             other => {
-                                                if let Some(err) =
-                                                    response_body_guardrail_error(other)
+                                                if let Err(other) = other
+                                                    && let Some(err) =
+                                                        response_body_guardrail_error(other)
                                                 {
                                                     let _ = chunk_tx
                                                         .send(ResponseChunk::Error(err))
@@ -611,7 +610,7 @@ impl QUICListener {
                                                             tokio::time::Instant::now();
                                                     }
                                                     let data_decision =
-                                                        evaluate_response_body_guardrails(
+                                                        checked_response_body_guardrails(
                                                             response_guardrails,
                                                             ResponseBodyGuardrailInput {
                                                                 elapsed: body_started_at.elapsed(),
@@ -627,33 +626,26 @@ impl QUICListener {
                                                                 exempt_from_body_size_cap: tunnel_mode,
                                                             },
                                                         );
-                                                    let streaming = match data_decision {
-                                                        ResponseBodyGuardrailDecision::Continue {
-                                                            streaming,
-                                                        } => streaming,
-                                                        other => {
-                                                            if let Some(err) =
+                                                    let evaluated =
+                                                        match data_decision {
+                                                            Ok(evaluated) => evaluated,
+                                                            other => {
+                                                                if let Err(other) = other
+                                                                && let Some(err) =
                                                                 response_body_guardrail_error(other)
                                                             {
                                                                 let _ = chunk_tx
                                                                     .send(ResponseChunk::Error(err))
                                                                     .await;
                                                             }
-                                                            return;
-                                                        }
-                                                    };
+                                                                return;
+                                                            }
+                                                        };
+                                                    let streaming = evaluated.streaming;
                                                     response_bytes_received =
-                                                        response_bytes_received
-                                                            .saturating_add(data.len());
-                                                    if matches!(
-                                                        streaming.emission,
-                                                        ProgressiveEmissionPolicy::PrebufferUntilValidated
-                                                    ) {
-                                                        prebuffered_bytes = prebuffered_bytes
-                                                            .saturating_add(data.len());
-                                                    } else {
-                                                        prebuffered_bytes = 0;
-                                                    }
+                                                        evaluated.next_state.bytes_received;
+                                                    prebuffered_bytes =
+                                                        evaluated.next_state.prebuffered_bytes;
                                                     for (start, end) in response_chunk_ranges(
                                                         data.len(),
                                                         streaming.chunk_emission,

@@ -89,7 +89,8 @@ use crate::{
             guardrails::{
                 BodyLimitKind, REQUEST_BODY_TOO_LARGE_BODY, RequestBodyGuardrailConfig,
                 RequestBodyGuardrailDecision, RequestBodyGuardrailInput,
-                checked_request_body_ingress,
+                ResponseBodyGuardrailConfig, ResponseBodyGuardrailInput,
+                checked_request_body_ingress, checked_response_body_guardrails,
             },
             quic::{QuicConnection, QuicConnectionErrorSnapshot},
             request::RequestEnvelope,
@@ -335,8 +336,10 @@ type LbHeaderLookup<'a> = dyn Fn(&str) -> Option<String> + 'a;
 
 struct BootstrapStreamingBody {
     inner: Incoming,
-    max_bytes: Option<usize>,
+    guardrails: Option<ResponseBodyGuardrailConfig>,
+    declared_content_length: Option<usize>,
     bytes_seen: usize,
+    prebuffered_bytes: usize,
     capped: bool,
 }
 
@@ -344,17 +347,31 @@ impl BootstrapStreamingBody {
     fn new(inner: Incoming) -> Self {
         Self {
             inner,
-            max_bytes: None,
+            guardrails: None,
+            declared_content_length: None,
             bytes_seen: 0,
+            prebuffered_bytes: 0,
             capped: false,
         }
     }
 
-    fn with_max_bytes(inner: Incoming, max_bytes: usize) -> Self {
+    fn with_response_guardrails(
+        inner: Incoming,
+        max_body_bytes: usize,
+        declared_content_length: Option<usize>,
+    ) -> Self {
         Self {
             inner,
-            max_bytes: Some(max_bytes),
+            guardrails: Some(ResponseBodyGuardrailConfig {
+                idle_timeout: Duration::MAX,
+                total_timeout: Duration::MAX,
+                max_body_bytes,
+                unknown_length_prebuffer_bytes: max_body_bytes,
+                chunk_bytes: usize::MAX,
+            }),
+            declared_content_length,
             bytes_seen: 0,
+            prebuffered_bytes: 0,
             capped: false,
         }
     }
@@ -374,11 +391,27 @@ impl Body for BootstrapStreamingBody {
 
         match Pin::new(&mut self.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                if let Some(limit) = self.max_bytes
+                if let Some(guardrails) = self.guardrails
                     && let Some(data) = frame.data_ref()
                 {
-                    self.bytes_seen = self.bytes_seen.saturating_add(data.len());
-                    if self.bytes_seen > limit {
+                    if let Ok(next_state) = checked_response_body_guardrails(
+                        guardrails,
+                        ResponseBodyGuardrailInput {
+                            elapsed: Duration::ZERO,
+                            idle_for: Duration::ZERO,
+                            bytes_received: self.bytes_seen,
+                            prebuffered_bytes: self.prebuffered_bytes,
+                            next_chunk_bytes: data.len(),
+                            declared_content_length: self.declared_content_length,
+                            headers_emitted: true,
+                            progressive_emission_allowed: true,
+                            body_forwarding_enabled: true,
+                            exempt_from_body_size_cap: false,
+                        },
+                    ) {
+                        self.bytes_seen = next_state.next_state.bytes_received;
+                        self.prebuffered_bytes = next_state.next_state.prebuffered_bytes;
+                    } else {
                         self.capped = true;
                         return Poll::Ready(None);
                     }

@@ -1233,9 +1233,10 @@ impl QUICListener {
                                 ) {
                                     boxed_full(Bytes::new())
                                 } else {
-                                    BootstrapStreamingBody::with_max_bytes(
+                                    BootstrapStreamingBody::with_response_guardrails(
                                         upstream_resp.into_body(),
                                         max_response_body_bytes,
+                                        upstream_content_length,
                                     )
                                     .map_err(|never| match never {})
                                     .boxed()

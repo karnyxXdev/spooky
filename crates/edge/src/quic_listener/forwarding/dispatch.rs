@@ -1,13 +1,14 @@
 use spooky_errors::{
     HedgeOutcomeTelemetryReason, HedgePolicyDecision, HedgePolicyFacts, HedgePrimaryState,
-    RetryAttemptTelemetryReason, RetryPolicyDecision, RetryPolicyDenialReason, RetryPolicyFacts,
-    evaluate_hedge_policy, evaluate_retry_policy, is_idempotent_method,
+    RetryPolicyDecision, RetryPolicyFacts, evaluate_hedge_policy, evaluate_retry_policy,
+    is_idempotent_method,
 };
 use spooky_lb::alternate_backend::{
     AlternateBackendDecision, AlternateBackendFailureReason, choose_alternate_backend,
 };
 
 use super::*;
+use crate::runtime::connection::response::ForwardingPolicyTelemetry;
 
 const MAX_UPSTREAM_RETRY_ATTEMPTS: u8 = 1;
 type UpstreamRequest = Request<BoxBody<Bytes, Infallible>>;
@@ -325,11 +326,7 @@ impl QUICListener {
             hedge_tunnel_request,
         );
         let fut = async move {
-            let mut hedge_telemetry =
-                crate::runtime::connection::response::HedgeTelemetry::default();
-            let mut retry_count: u8 = 0;
-            let mut retry_attempt_reason: Option<RetryAttemptTelemetryReason> = None;
-            let mut retry_denial_reason: Option<RetryPolicyDenialReason> = None;
+            let mut policy_telemetry = ForwardingPolicyTelemetry::default();
             let result: ForwardResult = async {
                 retry_budget.mark_primary(&route_name);
 
@@ -411,7 +408,7 @@ impl QUICListener {
                                     retry_budget.allow_retry(&route_name).is_ok(),
                                 ) {
                                     HedgePolicyDecision::Hedge { reason } => {
-                                        hedge_telemetry.trigger_reason = Some(reason);
+                                        policy_telemetry.hedge.record_trigger(reason);
                                         let hedge_fut = send_once(
                                             hedge_backend,
                                             hedge_request,
@@ -421,16 +418,20 @@ impl QUICListener {
                                         tokio::pin!(hedge_fut);
                                         tokio::select! {
                                             result = &mut primary_fut => {
-                                                hedge_telemetry.outcome_reason =
-                                                    Some(HedgeOutcomeTelemetryReason::PrimaryWonAfterTrigger);
+                                                policy_telemetry
+                                                    .hedge
+                                                    .record_outcome(HedgeOutcomeTelemetryReason::PrimaryWonAfterTrigger);
                                                 result?
                                             },
                                             result = &mut hedge_fut => {
-                                                hedge_telemetry.outcome_reason =
-                                                    Some(HedgeOutcomeTelemetryReason::HedgeWon);
+                                                policy_telemetry
+                                                    .hedge
+                                                    .record_outcome(HedgeOutcomeTelemetryReason::HedgeWon);
                                                 let elapsed_ms = primary_started.elapsed().as_millis() as u64;
                                                 let delay_ms = hedge_delay.as_millis() as u64;
-                                                hedge_telemetry.primary_late_ms = elapsed_ms.saturating_sub(delay_ms);
+                                                policy_telemetry
+                                                    .hedge
+                                                    .observe_primary_late_ms(elapsed_ms.saturating_sub(delay_ms));
                                                 result?
                                             },
                                         }
@@ -472,7 +473,7 @@ impl QUICListener {
                                 Err(primary_err) => {
                                     let retry_decision = policy.retry_after_error(
                                         &primary_err,
-                                        retry_count,
+                                        policy_telemetry.retry.count,
                                         MAX_UPSTREAM_RETRY_ATTEMPTS,
                                         retry_budget.allow_retry(&route_name).is_ok(),
                                         alternate_backend.as_ref(),
@@ -480,7 +481,7 @@ impl QUICListener {
                                     let retry_reason = match retry_decision {
                                         RetryPolicyDecision::Retry { reason } => reason.into(),
                                         RetryPolicyDecision::DoNotRetry { denial } => {
-                                            retry_denial_reason = denial;
+                                            policy_telemetry.retry.record_denial(denial);
                                             debug!(
                                                 "request_id={} retry denied: route={} reason={:?}",
                                                 request_id, route_name, denial
@@ -496,8 +497,7 @@ impl QUICListener {
                                         backend_endpoints.as_ref(),
                                         pending_forward_for_upstream.as_ref(),
                                     ) {
-                                        retry_count = retry_count.saturating_add(1);
-                                        retry_attempt_reason = Some(retry_reason);
+                                        policy_telemetry.retry.record_attempt(retry_reason);
                                         info!(
                                             "request_id={} retrying request on alternate backend: route={} reason={:?}",
                                             request_id, route_name, retry_reason
@@ -532,7 +532,7 @@ impl QUICListener {
                                 Err(primary_err) => {
                                     let retry_decision = policy.retry_after_error(
                                         &primary_err,
-                                        retry_count,
+                                        policy_telemetry.retry.count,
                                         MAX_UPSTREAM_RETRY_ATTEMPTS,
                                         retry_budget.allow_retry(&route_name).is_ok(),
                                         alternate_backend.as_ref(),
@@ -540,7 +540,7 @@ impl QUICListener {
                                 let retry_reason = match retry_decision {
                                     RetryPolicyDecision::Retry { reason } => reason.into(),
                                     RetryPolicyDecision::DoNotRetry { denial } => {
-                                        retry_denial_reason = denial;
+                                        policy_telemetry.retry.record_denial(denial);
                                         debug!(
                                             "request_id={} retry denied: route={} reason={:?}",
                                             request_id, route_name, denial
@@ -556,8 +556,7 @@ impl QUICListener {
                                         backend_endpoints.as_ref(),
                                         pending_forward_for_upstream.as_ref(),
                                     ) {
-                                        retry_count = retry_count.saturating_add(1);
-                                        retry_attempt_reason = Some(retry_reason);
+                                        policy_telemetry.retry.record_attempt(retry_reason);
                                         info!(
                                             "request_id={} retrying request on alternate backend: route={} reason={:?}",
                                             request_id, route_name, retry_reason
@@ -589,10 +588,7 @@ impl QUICListener {
             .await;
             let _ = result_tx.send(UpstreamResult {
                 forward: result,
-                hedge: hedge_telemetry,
-                retry_count,
-                retry_attempt_reason,
-                retry_denial_reason,
+                policy: policy_telemetry,
             });
         };
         let spawned = match trace_span_for_upstream {

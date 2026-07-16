@@ -20,14 +20,35 @@ pub enum ForwardSuccess {
 
 pub type ForwardResult = Result<ForwardSuccess, ProxyError>;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RetryTelemetry {
+    pub count: u8,
+    pub attempt_reason: Option<RetryAttemptTelemetryReason>,
+    pub denial_reason: Option<RetryPolicyDenialReason>,
+}
+
+impl RetryTelemetry {
+    pub fn record_attempt(&mut self, reason: RetryAttemptTelemetryReason) {
+        self.count = self.count.saturating_add(1);
+        self.attempt_reason = Some(reason);
+    }
+
+    pub fn record_denial(&mut self, denial_reason: Option<RetryPolicyDenialReason>) {
+        if self.denial_reason.is_none() {
+            self.denial_reason = denial_reason;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ForwardingPolicyTelemetry {
+    pub hedge: HedgeTelemetry,
+    pub retry: RetryTelemetry,
+}
+
 pub struct UpstreamResult {
     pub forward: ForwardResult,
-    pub hedge: HedgeTelemetry,
-    pub retry_count: u8,
-    /// Set when a retry was attempted; the shared policy reason that triggered it.
-    pub retry_attempt_reason: Option<RetryAttemptTelemetryReason>,
-    /// Set when a retry was denied; the first shared policy denial encountered.
-    pub retry_denial_reason: Option<RetryPolicyDenialReason>,
+    pub policy: ForwardingPolicyTelemetry,
 }
 
 /// A chunk of the upstream response being streamed back to the client.
@@ -52,4 +73,18 @@ pub struct HedgeTelemetry {
     pub trigger_reason: Option<HedgeTriggerTelemetryReason>,
     pub outcome_reason: Option<HedgeOutcomeTelemetryReason>,
     pub primary_late_ms: u64,
+}
+
+impl HedgeTelemetry {
+    pub fn record_trigger(&mut self, reason: HedgeTriggerTelemetryReason) {
+        self.trigger_reason = Some(reason);
+    }
+
+    pub fn record_outcome(&mut self, reason: HedgeOutcomeTelemetryReason) {
+        self.outcome_reason = Some(reason);
+    }
+
+    pub fn observe_primary_late_ms(&mut self, late_ms: u64) {
+        self.primary_late_ms = late_ms;
+    }
 }

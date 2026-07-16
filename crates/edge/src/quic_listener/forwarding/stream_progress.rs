@@ -146,10 +146,22 @@ impl QUICListener {
                         kind: BodyTimeoutKind::Idle,
                     }
                 ) {
-                    metrics.inc_failure();
                     metrics.inc_timeout();
-                    let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
-                    metrics.record_route(route_label, req.start.elapsed(), RouteOutcome::Timeout);
+                    let _ = crate::runtime::connection::outcome::observe_proxy_error_outcome(
+                        metrics,
+                        crate::runtime::connection::outcome::OutcomeRouteTarget {
+                            route: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                        },
+                        Some(crate::runtime::connection::outcome::OutcomeBackendTarget {
+                            upstream: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                            backend_addr: req.backend_addr.as_deref(),
+                            backend_index: req.backend_index,
+                        }),
+                        req.start.elapsed(),
+                        Some(http::StatusCode::REQUEST_TIMEOUT),
+                        &ProxyError::Timeout,
+                        None,
+                    );
                     let _ = Self::send_simple_response(
                         h3,
                         quic,
@@ -370,16 +382,22 @@ impl QUICListener {
                             })
                         ) {
                             if let Some(req) = streams.get(&stream_id) {
-                                metrics.inc_failure();
-                                metrics.inc_overload_shed_reason(
-                                    OverloadShedReason::ResponsePrebufferCap,
-                                );
-                                let route_label =
-                                    req.upstream_name.as_deref().unwrap_or("unrouted");
-                                metrics.record_route(
-                                    route_label,
+                                let _ = crate::runtime::connection::outcome::observe_proxy_error_outcome(
+                                    metrics,
+                                    crate::runtime::connection::outcome::OutcomeRouteTarget {
+                                        route: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                                    },
+                                    Some(crate::runtime::connection::outcome::OutcomeBackendTarget {
+                                        upstream: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                                        backend_addr: req.backend_addr.as_deref(),
+                                        backend_index: req.backend_index,
+                                    }),
                                     req.start.elapsed(),
-                                    RouteOutcome::OverloadShed,
+                                    Some(http::StatusCode::SERVICE_UNAVAILABLE),
+                                    &ProxyError::Pool(PoolError::BackendOverloaded(
+                                        "response prebuffer cap".into(),
+                                    )),
+                                    Some(OverloadShedReason::ResponsePrebufferCap),
                                 );
                                 resilience
                                     .adaptive_admission
@@ -758,42 +776,25 @@ impl QUICListener {
 
                         if let Some(req) = streams.get(&stream_id) {
                             if let (Some(addr), Some(idx)) = (&req.backend_addr, req.backend_index)
-                                && let Some(pool) = req.upstream_pool.as_ref()
                             {
-                                let transition = pool.write().ok().and_then(|mut p| {
-                                    match outcome_from_status(status) {
-                                        crate::runtime::health::HealthClassification::Success => {
-                                            p.pool.mark_success(idx)
-                                        }
-                                        crate::runtime::health::HealthClassification::Failure => {
-                                            p.pool.mark_request_failure(
-                                                idx,
-                                                HealthFailureReason::HttpStatus5xx,
-                                            )
-                                        }
-                                        crate::runtime::health::HealthClassification::Neutral => {
-                                            None
-                                        }
-                                    }
-                                });
+                                let transition = crate::runtime::connection::outcome::observe_backend_response_status(
+                                    crate::runtime::connection::outcome::BackendHealthObservationInput {
+                                        backend_addr: addr,
+                                        backend_index: idx,
+                                        upstream_pool: req.upstream_pool.as_ref(),
+                                        status,
+                                    },
+                                );
                                 if let Some(t) = transition {
-                                    Self::log_health_transition(addr, t);
+                                    crate::runtime::connection::outcome::log_backend_health_transition(addr, t);
                                 }
                             }
-                            let (is_success, route_outcome) =
-                                Self::request_metrics_outcome_for_status(status);
-                            if is_success {
-                                metrics.inc_success();
-                            } else {
-                                metrics.inc_failure();
-                            }
-                            let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
-                            metrics.record_route(route_label, req.start.elapsed(), route_outcome);
-                            Self::record_request_observation(
+                            let _ = crate::runtime::connection::outcome::observe_status_outcome(
                                 metrics,
-                                req,
-                                Some(status.as_u16()),
-                                route_outcome,
+                                Self::request_outcome_route_target(req),
+                                Self::request_outcome_backend_target(req),
+                                req.start.elapsed(),
+                                status,
                             );
                             resilience
                                 .adaptive_admission

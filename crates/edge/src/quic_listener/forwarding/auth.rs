@@ -16,6 +16,9 @@ use crate::runtime::connection::{
         oidc_authorization_check, oidc_discovery_target, oidc_scope_satisfied,
         validate_oidc_provider_metadata,
     },
+    outcome::{
+        AdmissionOutcomeClass, OutcomeBackendTarget, OutcomeRouteTarget, observe_admission_outcome,
+    },
     request::PendingForward,
     stream::StreamAdmissionState,
 };
@@ -473,13 +476,21 @@ impl QUICListener {
             ExternalAuthCompletion::Respond(decision) => {
                 req.admission_state = StreamAdmissionState::Denied;
                 req.response_status = Some(decision.status().as_u16());
-                metrics.inc_failure();
                 metrics.inc_policy_denied();
                 metrics.inc_external_auth_denied();
-                metrics.record_route(
-                    req.upstream_name.as_deref().unwrap_or("unrouted"),
+                let _ = observe_admission_outcome(
+                    metrics,
+                    OutcomeRouteTarget {
+                        route: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                    },
+                    Some(OutcomeBackendTarget {
+                        upstream: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                        backend_addr: req.backend_addr.as_deref(),
+                        backend_index: req.backend_index,
+                    }),
                     req.start.elapsed(),
-                    RouteOutcome::Failure,
+                    decision.status(),
+                    AdmissionOutcomeClass::AuthDenied,
                 );
                 warn!(
                     "request_id={} route={} external auth denied with status={}",
@@ -530,16 +541,22 @@ impl QUICListener {
                         );
                     }
                 }
-                metrics.inc_failure();
-                let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
-                let route_outcome = if timed_out {
-                    RouteOutcome::Timeout
-                } else {
-                    RouteOutcome::Failure
-                };
                 req.admission_state = StreamAdmissionState::Denied;
                 req.response_status = Some(status.as_u16());
-                metrics.record_route(route_label, req.start.elapsed(), route_outcome);
+                let _ = observe_admission_outcome(
+                    metrics,
+                    OutcomeRouteTarget {
+                        route: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                    },
+                    Some(OutcomeBackendTarget {
+                        upstream: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                        backend_addr: req.backend_addr.as_deref(),
+                        backend_index: req.backend_index,
+                    }),
+                    req.start.elapsed(),
+                    status,
+                    AdmissionOutcomeClass::Failed { timed_out },
+                );
                 Self::send_simple_response(h3, quic, stream_id, status, body)?;
                 Ok(false)
             }

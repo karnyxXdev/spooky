@@ -55,9 +55,7 @@ use spooky_config::{
     },
 };
 use spooky_errors::{PoolError, ProxyError};
-use spooky_lb::{
-    backend::HealthTransition, health::HealthFailureReason, upstream_pool::UpstreamPool,
-};
+use spooky_lb::{health::HealthFailureReason, upstream_pool::UpstreamPool};
 use spooky_transport::{
     h2_client::{SharedDnsResolver, TlsClientConfig},
     transport_pool::{BackendTransportKind, UpstreamTransportPool},
@@ -341,6 +339,15 @@ struct BootstrapStreamingBody {
     bytes_seen: usize,
     prebuffered_bytes: usize,
     capped: bool,
+    backend_accounting: Option<BootstrapBackendAccounting>,
+}
+
+struct BootstrapBackendAccounting {
+    upstream_pool: Arc<RwLock<UpstreamPool>>,
+    backend_index: usize,
+    start: Instant,
+    status: Option<u16>,
+    finished: bool,
 }
 
 impl BootstrapStreamingBody {
@@ -352,6 +359,7 @@ impl BootstrapStreamingBody {
             bytes_seen: 0,
             prebuffered_bytes: 0,
             capped: false,
+            backend_accounting: None,
         }
     }
 
@@ -359,6 +367,10 @@ impl BootstrapStreamingBody {
         inner: Incoming,
         max_body_bytes: usize,
         declared_content_length: Option<usize>,
+        upstream_pool: Arc<RwLock<UpstreamPool>>,
+        backend_index: usize,
+        start: Instant,
+        status: Option<u16>,
     ) -> Self {
         Self {
             inner,
@@ -373,6 +385,30 @@ impl BootstrapStreamingBody {
             bytes_seen: 0,
             prebuffered_bytes: 0,
             capped: false,
+            backend_accounting: Some(BootstrapBackendAccounting {
+                upstream_pool,
+                backend_index,
+                start,
+                status,
+                finished: false,
+            }),
+        }
+    }
+
+    fn finish_backend_accounting(&mut self) {
+        if let Some(accounting) = self.backend_accounting.as_mut() {
+            if accounting.finished {
+                return;
+            }
+            crate::runtime::connection::outcome::finish_backend_request_accounting(
+                crate::runtime::connection::outcome::BackendRequestFinishInput {
+                    upstream_pool: Some(&accounting.upstream_pool),
+                    backend_index: Some(accounting.backend_index),
+                    elapsed: accounting.start.elapsed(),
+                    status: accounting.status,
+                },
+            );
+            accounting.finished = true;
         }
     }
 }
@@ -413,15 +449,28 @@ impl Body for BootstrapStreamingBody {
                         self.prebuffered_bytes = next_state.next_state.prebuffered_bytes;
                     } else {
                         self.capped = true;
+                        self.finish_backend_accounting();
                         return Poll::Ready(None);
                     }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(_))) => Poll::Ready(None),
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(_))) => {
+                self.finish_backend_accounting();
+                Poll::Ready(None)
+            }
+            Poll::Ready(None) => {
+                self.finish_backend_accounting();
+                Poll::Ready(None)
+            }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+impl Drop for BootstrapStreamingBody {
+    fn drop(&mut self) {
+        self.finish_backend_accounting();
     }
 }
 

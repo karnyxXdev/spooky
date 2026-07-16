@@ -16,20 +16,24 @@ pub(in crate::quic_listener) use self::resolve::BootstrapResolutionInput;
 #[cfg(test)]
 pub(in crate::quic_listener) use self::resolve::RouteResolutionRequest as TestRouteResolutionRequest;
 use super::*;
-use crate::runtime::connection::{request::PendingForward, stream::StreamAdmissionState};
+use crate::runtime::connection::{
+    outcome::{
+        BackendRequestFinishInput, OutcomeBackendTarget, OutcomeRouteTarget,
+        finish_backend_request_accounting, observe_admission_outcome, observe_proxy_error_outcome,
+    },
+    request::PendingForward,
+    stream::StreamAdmissionState,
+};
 
 pub(super) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> StreamPhase {
     let phase = req.phase.clone();
     if req.backend_request_started && !req.backend_request_finished {
-        if let (Some(pool), Some(index)) = (&req.upstream_pool, req.backend_index)
-            && let Ok(mut guard) = pool.write()
-        {
-            guard.finish_request(
-                index,
-                req.start.elapsed(),
-                req.response_status.or(Some(503)),
-            );
-        }
+        finish_backend_request_accounting(BackendRequestFinishInput {
+            upstream_pool: req.upstream_pool.as_ref(),
+            backend_index: req.backend_index,
+            elapsed: req.start.elapsed(),
+            status: req.response_status.or(Some(503)),
+        });
         req.backend_request_finished = true;
     }
     if req.body_buf_bytes > 0 {
@@ -119,49 +123,11 @@ impl QUICListener {
         }
     }
 
-    pub(super) fn mark_classified_upstream_health_failure(
-        metrics_phase: &str,
-        backend_addr: &str,
-        backend_index: usize,
-        upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
-        metrics: &Metrics,
-        classified: &ClassifiedUpstreamProxyError,
-    ) {
-        let Some(health_mapping) = classified.health_failure else {
-            return;
-        };
-
-        metrics.inc_health_failure(health_mapping.failure_reason);
-        if health_mapping.failure_reason == HealthFailureReason::Tls {
-            metrics.record_upstream_tls_failure(
-                backend_addr,
-                metrics_phase,
-                health_mapping.metrics_reason,
-            );
-        }
-        if let Some(pool) = upstream_pool
-            && let Some(transition) = pool.write().ok().and_then(|mut p| {
-                p.pool
-                    .mark_request_failure(backend_index, health_mapping.failure_reason)
-            })
-        {
-            Self::log_health_transition(backend_addr, transition);
-        }
-    }
-
     fn is_internal_pool_control_error(error: &PoolError) -> bool {
         matches!(
             error,
             PoolError::InflightLimiterClosed | PoolError::UnknownBackend(_)
         )
-    }
-
-    fn request_metrics_outcome_for_status(status: StatusCode) -> (bool, RouteOutcome) {
-        if status.is_server_error() {
-            (false, RouteOutcome::Failure)
-        } else {
-            (true, RouteOutcome::Success)
-        }
     }
 
     fn log_access(req: &RequestEnvelope, status: u16) {
@@ -248,19 +214,20 @@ impl QUICListener {
         }
     }
 
-    fn record_request_observation(
-        metrics: &Metrics,
-        req: &RequestEnvelope,
-        status: Option<u16>,
-        outcome: RouteOutcome,
-    ) {
-        metrics.record_request_result(
-            req.upstream_name.as_deref().unwrap_or("unrouted"),
-            req.backend_addr.as_deref(),
-            status,
-            outcome,
-            req.start.elapsed(),
-        );
+    fn request_outcome_route_target(req: &RequestEnvelope) -> OutcomeRouteTarget<'_> {
+        OutcomeRouteTarget {
+            route: req.upstream_name.as_deref().unwrap_or("unrouted"),
+        }
+    }
+
+    fn request_outcome_backend_target(req: &RequestEnvelope) -> Option<OutcomeBackendTarget<'_>> {
+        req.upstream_name
+            .as_deref()
+            .map(|upstream| OutcomeBackendTarget {
+                upstream,
+                backend_addr: req.backend_addr.as_deref(),
+                backend_index: req.backend_index,
+            })
     }
 
     fn materialize_forward_after_auth(
@@ -274,7 +241,15 @@ impl QUICListener {
         let metrics = shared_ctx.metrics.as_ref();
         let resilience = shared_ctx.resilience;
         let Some(pending_forward) = req.pending_forward.as_ref().cloned() else {
-            metrics.inc_failure();
+            let _ = observe_proxy_error_outcome(
+                metrics,
+                OutcomeRouteTarget::UNROUTED,
+                None,
+                req.start.elapsed(),
+                Some(http::StatusCode::INTERNAL_SERVER_ERROR),
+                &ProxyError::Transport("missing deferred forward snapshot".into()),
+                None,
+            );
             Self::send_simple_response(
                 h3,
                 quic,
@@ -285,7 +260,15 @@ impl QUICListener {
             return Ok(false);
         };
         let Some(upstream_name) = req.upstream_name.clone() else {
-            metrics.inc_failure();
+            let _ = observe_proxy_error_outcome(
+                metrics,
+                OutcomeRouteTarget::UNROUTED,
+                None,
+                req.start.elapsed(),
+                Some(http::StatusCode::INTERNAL_SERVER_ERROR),
+                &ProxyError::Transport("missing upstream route".into()),
+                None,
+            );
             Self::send_simple_response(
                 h3,
                 quic,
@@ -332,12 +315,21 @@ impl QUICListener {
             crate::quic_listener::admission::PostAuthAdmissionExecution::Rejected(
                 crate::quic_listener::admission::PostAuthAdmissionRejection::Overloaded(decision),
             ) => {
-                metrics.inc_failure();
-                metrics.inc_overload_shed_reason(decision.reason.metrics_reason());
-                metrics.record_route(
-                    &upstream_name,
+                let _ = observe_admission_outcome(
+                    metrics,
+                    OutcomeRouteTarget {
+                        route: &upstream_name,
+                    },
+                    Some(OutcomeBackendTarget {
+                        upstream: &upstream_name,
+                        backend_addr: Some(pending_forward.backend_addr.as_ref()),
+                        backend_index: Some(pending_forward.backend_index),
+                    }),
                     req.start.elapsed(),
-                    RouteOutcome::OverloadShed,
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    crate::runtime::connection::outcome::AdmissionOutcomeClass::OverloadShed {
+                        reason: Some(decision.reason.metrics_reason()),
+                    },
                 );
                 Self::send_overload_response(
                     h3,
@@ -354,13 +346,29 @@ impl QUICListener {
             crate::quic_listener::admission::PostAuthAdmissionExecution::Rejected(
                 crate::quic_listener::admission::PostAuthAdmissionRejection::Failed(decision),
             ) => {
-                metrics.inc_failure();
-                if let Some(reason) = decision.overload_reason {
-                    metrics.inc_overload_shed_reason(reason.metrics_reason());
-                }
-                if let Some(route_outcome) = decision.route_outcome {
-                    metrics.record_route(&upstream_name, req.start.elapsed(), route_outcome);
-                }
+                let outcome = if let Some(reason) = decision.overload_reason {
+                    crate::runtime::connection::outcome::AdmissionOutcomeClass::OverloadShed {
+                        reason: Some(reason.metrics_reason()),
+                    }
+                } else {
+                    crate::runtime::connection::outcome::AdmissionOutcomeClass::Failed {
+                        timed_out: matches!(decision.route_outcome, Some(RouteOutcome::Timeout)),
+                    }
+                };
+                let _ = observe_admission_outcome(
+                    metrics,
+                    OutcomeRouteTarget {
+                        route: &upstream_name,
+                    },
+                    Some(OutcomeBackendTarget {
+                        upstream: &upstream_name,
+                        backend_addr: Some(pending_forward.backend_addr.as_ref()),
+                        backend_index: Some(pending_forward.backend_index),
+                    }),
+                    req.start.elapsed(),
+                    decision.status,
+                    outcome,
+                );
                 Self::send_simple_response(h3, quic, stream_id, decision.status, decision.body)?;
                 if decision.observe_adaptive_overload {
                     resilience
@@ -376,11 +384,27 @@ impl QUICListener {
             .get(pending_forward.backend_addr.as_ref())
             .cloned()
         else {
-            if let Ok(mut guard) = upstream_pool.write() {
-                guard.finish_request(backend_index, req.start.elapsed(), Some(503));
-            }
-            metrics.inc_failure();
-            metrics.record_route(&upstream_name, req.start.elapsed(), RouteOutcome::Failure);
+            finish_backend_request_accounting(BackendRequestFinishInput {
+                upstream_pool: Some(&upstream_pool),
+                backend_index: Some(backend_index),
+                elapsed: req.start.elapsed(),
+                status: Some(503),
+            });
+            let _ = observe_proxy_error_outcome(
+                metrics,
+                OutcomeRouteTarget {
+                    route: &upstream_name,
+                },
+                Some(OutcomeBackendTarget {
+                    upstream: &upstream_name,
+                    backend_addr: Some(pending_forward.backend_addr.as_ref()),
+                    backend_index: Some(backend_index),
+                }),
+                req.start.elapsed(),
+                Some(http::StatusCode::BAD_GATEWAY),
+                &ProxyError::Transport("unknown backend endpoint".into()),
+                None,
+            );
             Self::send_simple_response(
                 h3,
                 quic,
@@ -415,14 +439,27 @@ impl QUICListener {
             ) {
                 Ok(request) => Some(request),
                 Err(err) => {
-                    if let Ok(mut guard) = upstream_pool.write() {
-                        guard.finish_request(backend_index, req.start.elapsed(), Some(503));
-                    }
-                    metrics.inc_failure();
-                    metrics.record_route(
-                        &upstream_name,
+                    let err_text = err.to_string();
+                    finish_backend_request_accounting(BackendRequestFinishInput {
+                        upstream_pool: Some(&upstream_pool),
+                        backend_index: Some(backend_index),
+                        elapsed: req.start.elapsed(),
+                        status: Some(503),
+                    });
+                    let _ = observe_proxy_error_outcome(
+                        metrics,
+                        OutcomeRouteTarget {
+                            route: &upstream_name,
+                        },
+                        Some(OutcomeBackendTarget {
+                            upstream: &upstream_name,
+                            backend_addr: Some(pending_forward.backend_addr.as_ref()),
+                            backend_index: Some(backend_index),
+                        }),
                         req.start.elapsed(),
-                        RouteOutcome::Failure,
+                        Some(http::StatusCode::BAD_REQUEST),
+                        &err,
+                        None,
                     );
                     Self::send_simple_response(
                         h3,
@@ -431,7 +468,7 @@ impl QUICListener {
                         http::StatusCode::BAD_REQUEST,
                         b"invalid request\n",
                     )?;
-                    error!("failed to build upstream request after auth: {}", err);
+                    error!("failed to build upstream request after auth: {}", err_text);
                     resilience
                         .adaptive_admission
                         .observe(req.start.elapsed(), true);
@@ -451,11 +488,27 @@ impl QUICListener {
         ) {
             Ok(result_rx) => result_rx,
             Err(err) => {
-                if let Ok(mut guard) = upstream_pool.write() {
-                    guard.finish_request(backend_index, req.start.elapsed(), Some(503));
-                }
-                metrics.inc_failure();
-                metrics.record_route(&upstream_name, req.start.elapsed(), RouteOutcome::Failure);
+                finish_backend_request_accounting(BackendRequestFinishInput {
+                    upstream_pool: Some(&upstream_pool),
+                    backend_index: Some(backend_index),
+                    elapsed: req.start.elapsed(),
+                    status: Some(503),
+                });
+                let _ = observe_proxy_error_outcome(
+                    metrics,
+                    OutcomeRouteTarget {
+                        route: &upstream_name,
+                    },
+                    Some(OutcomeBackendTarget {
+                        upstream: &upstream_name,
+                        backend_addr: Some(pending_forward.backend_addr.as_ref()),
+                        backend_index: Some(backend_index),
+                    }),
+                    req.start.elapsed(),
+                    Some(http::StatusCode::SERVICE_UNAVAILABLE),
+                    &ProxyError::Transport("upstream runtime unavailable".into()),
+                    None,
+                );
                 Self::send_simple_response(
                     h3,
                     quic,
@@ -523,17 +576,6 @@ impl QUICListener {
 
         if packet_count > 0 {
             debug!("Sent {} packets", packet_count);
-        }
-    }
-
-    pub(crate) fn log_health_transition(addr: &str, transition: HealthTransition) {
-        match transition {
-            HealthTransition::BecameHealthy => {
-                info!("Backend {} became healthy", addr);
-            }
-            HealthTransition::BecameUnhealthy => {
-                error!("Backend {} became unhealthy", addr);
-            }
         }
     }
 }
@@ -611,15 +653,18 @@ impl QUICListener {
                     let request = match validate_request_headers(&list, resilience) {
                         Ok(request) => request,
                         Err((status, body, is_policy)) => {
-                            metrics.inc_failure();
                             metrics.inc_request_validation_reject();
                             if is_policy {
                                 metrics.inc_policy_denied();
                             }
-                            metrics.record_route(
-                                "unrouted",
+                            let _ = observe_proxy_error_outcome(
+                                &metrics,
+                                OutcomeRouteTarget::UNROUTED,
+                                None,
                                 Duration::from_millis(0),
-                                RouteOutcome::Failure,
+                                Some(status),
+                                &ProxyError::Bridge(spooky_errors::BridgeError::InvalidHeader),
+                                None,
                             );
                             let _ = Self::send_simple_response(
                                 h3,
@@ -651,13 +696,18 @@ impl QUICListener {
                         if resilience.early_data_allowed_for(&method) {
                             metrics.inc_early_data_accepted();
                         } else {
-                            metrics.inc_failure();
                             metrics.inc_early_data_rejected();
                             metrics.inc_policy_denied();
-                            metrics.record_route(
-                                "unrouted",
+                            let _ = observe_proxy_error_outcome(
+                                &metrics,
+                                OutcomeRouteTarget::UNROUTED,
+                                None,
                                 request_start.elapsed(),
-                                RouteOutcome::Failure,
+                                Some(http::StatusCode::TOO_EARLY),
+                                &ProxyError::Transport(
+                                    "request blocked by early-data policy".into(),
+                                ),
+                                None,
                             );
                             Self::send_simple_response(
                                 h3,
@@ -963,8 +1013,17 @@ impl QUICListener {
                                 }
                             }
                             if let Some((route_label, elapsed)) = reject_body_for_bodyless {
-                                metrics.inc_failure();
-                                metrics.record_route(&route_label, elapsed, RouteOutcome::Failure);
+                                let _ = observe_proxy_error_outcome(
+                                    &metrics,
+                                    OutcomeRouteTarget {
+                                        route: &route_label,
+                                    },
+                                    None,
+                                    elapsed,
+                                    Some(http::StatusCode::BAD_REQUEST),
+                                    &ProxyError::Bridge(spooky_errors::BridgeError::InvalidHeader),
+                                    None,
+                                );
                                 Self::send_simple_response(
                                     h3,
                                     &mut connection.quic,
@@ -980,8 +1039,17 @@ impl QUICListener {
                                 break;
                             }
                             if let Some((route_label, elapsed)) = payload_too_large {
-                                metrics.inc_failure();
-                                metrics.record_route(&route_label, elapsed, RouteOutcome::Failure);
+                                let _ = observe_proxy_error_outcome(
+                                    &metrics,
+                                    OutcomeRouteTarget {
+                                        route: &route_label,
+                                    },
+                                    None,
+                                    elapsed,
+                                    Some(http::StatusCode::PAYLOAD_TOO_LARGE),
+                                    &ProxyError::Transport("request body too large".into()),
+                                    None,
+                                );
                                 Self::send_simple_response(
                                     h3,
                                     &mut connection.quic,
@@ -999,15 +1067,25 @@ impl QUICListener {
                             if shed_due_to_buffer_pressure
                                 && let Some(req) = connection.streams.get(&stream_id)
                             {
-                                metrics.inc_failure();
-                                metrics
-                                    .inc_overload_shed_reason(OverloadShedReason::RequestBufferCap);
-                                let route_label =
-                                    req.upstream_name.as_deref().unwrap_or("unrouted");
-                                metrics.record_route(
-                                    route_label,
+                                let _ = observe_proxy_error_outcome(
+                                    &metrics,
+                                    OutcomeRouteTarget {
+                                        route: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                                    },
+                                    Some(OutcomeBackendTarget {
+                                        upstream: req
+                                            .upstream_name
+                                            .as_deref()
+                                            .unwrap_or("unrouted"),
+                                        backend_addr: req.backend_addr.as_deref(),
+                                        backend_index: req.backend_index,
+                                    }),
                                     req.start.elapsed(),
-                                    RouteOutcome::OverloadShed,
+                                    Some(http::StatusCode::SERVICE_UNAVAILABLE),
+                                    &ProxyError::Pool(PoolError::BackendOverloaded(
+                                        "request body backpressure overload".into(),
+                                    )),
+                                    Some(OverloadShedReason::RequestBufferCap),
                                 );
                                 Self::send_overload_response(
                                     h3,
@@ -1036,13 +1114,26 @@ impl QUICListener {
                                 err
                             );
                             if let Some(req) = connection.streams.get(&stream_id) {
-                                metrics.inc_failure();
-                                let route_label =
-                                    req.upstream_name.as_deref().unwrap_or("unrouted");
-                                metrics.record_route(
-                                    route_label,
+                                let _ = observe_proxy_error_outcome(
+                                    &metrics,
+                                    OutcomeRouteTarget {
+                                        route: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                                    },
+                                    Some(OutcomeBackendTarget {
+                                        upstream: req
+                                            .upstream_name
+                                            .as_deref()
+                                            .unwrap_or("unrouted"),
+                                        backend_addr: req.backend_addr.as_deref(),
+                                        backend_index: req.backend_index,
+                                    }),
                                     req.start.elapsed(),
-                                    RouteOutcome::Failure,
+                                    Some(http::StatusCode::BAD_GATEWAY),
+                                    &ProxyError::Protocol(format!(
+                                        "recv_body protocol error on stream {}",
+                                        stream_id
+                                    )),
+                                    None,
                                 );
                                 resilience
                                     .adaptive_admission
@@ -1272,28 +1363,6 @@ mod tests {
             spooky_errors::classify_upstream_error_detail("request timed out", false),
             spooky_errors::UpstreamErrorClassification::timeout()
         );
-    }
-
-    #[test]
-    fn request_metrics_treat_server_error_as_failure() {
-        let (is_success, route_outcome) =
-            QUICListener::request_metrics_outcome_for_status(StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(!is_success);
-        match route_outcome {
-            RouteOutcome::Failure => {}
-            _ => panic!("unexpected route outcome"),
-        }
-    }
-
-    #[test]
-    fn request_metrics_treat_success_response_as_success() {
-        let (is_success, route_outcome) =
-            QUICListener::request_metrics_outcome_for_status(StatusCode::OK);
-        assert!(is_success);
-        match route_outcome {
-            RouteOutcome::Success => {}
-            _ => panic!("unexpected route outcome"),
-        }
     }
 
     #[test]

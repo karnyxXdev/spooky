@@ -18,6 +18,10 @@ use crate::{
             ExternalAuthCompletion, ExternalAuthFailureDisposition, ExternalAuthTaskConfig,
             apply_auth_request_mutations, evaluate_external_auth_completion,
         },
+        outcome::{
+            AdmissionOutcomeClass, OutcomeBackendTarget, OutcomeRouteTarget,
+            observe_admission_outcome,
+        },
         request::PendingForward,
     },
 };
@@ -240,12 +244,20 @@ impl QUICListener {
                 match admission {
                     AdmissionPolicyDecision::AdmitReady => {}
                     AdmissionPolicyDecision::Unauthorized(_) => {
-                        metrics.inc_failure();
                         metrics.inc_policy_denied();
-                        metrics.record_route(
-                            &upstream_name,
+                        let _ = observe_admission_outcome(
+                            metrics,
+                            OutcomeRouteTarget {
+                                route: &upstream_name,
+                            },
+                            Some(OutcomeBackendTarget {
+                                upstream: &upstream_name,
+                                backend_addr: Some(backend_addr.as_str()),
+                                backend_index: Some(backend_index),
+                            }),
                             request_start.elapsed(),
-                            RouteOutcome::Failure,
+                            http::StatusCode::UNAUTHORIZED,
+                            AdmissionOutcomeClass::AuthDenied,
                         );
                         warn!(
                             "request_id=unassigned route={} denied by local auth policy",
@@ -269,12 +281,20 @@ impl QUICListener {
                         return Ok(None);
                     }
                     AdmissionPolicyDecision::RateLimited(decision) => {
-                        metrics.inc_failure();
                         metrics.inc_request_rate_limited();
-                        metrics.record_route(
-                            &upstream_name,
+                        let _ = observe_admission_outcome(
+                            metrics,
+                            OutcomeRouteTarget {
+                                route: &upstream_name,
+                            },
+                            Some(OutcomeBackendTarget {
+                                upstream: &upstream_name,
+                                backend_addr: Some(backend_addr.as_str()),
+                                backend_index: Some(backend_index),
+                            }),
                             request_start.elapsed(),
-                            RouteOutcome::RateLimited,
+                            http::StatusCode::TOO_MANY_REQUESTS,
+                            AdmissionOutcomeClass::RateLimited,
                         );
                         warn!(
                             "request_id=unassigned route={} scoped rate limit exceeded by rule={}",
@@ -298,12 +318,21 @@ impl QUICListener {
                         return Ok(None);
                     }
                     AdmissionPolicyDecision::Overloaded(decision) => {
-                        metrics.inc_failure();
-                        metrics.inc_overload_shed_reason(decision.reason.metrics_reason());
-                        metrics.record_route(
-                            &upstream_name,
+                        let _ = observe_admission_outcome(
+                            metrics,
+                            OutcomeRouteTarget {
+                                route: &upstream_name,
+                            },
+                            Some(OutcomeBackendTarget {
+                                upstream: &upstream_name,
+                                backend_addr: Some(backend_addr.as_str()),
+                                backend_index: Some(backend_index),
+                            }),
                             request_start.elapsed(),
-                            RouteOutcome::OverloadShed,
+                            http::StatusCode::SERVICE_UNAVAILABLE,
+                            AdmissionOutcomeClass::OverloadShed {
+                                reason: Some(decision.reason.metrics_reason()),
+                            },
                         );
                         let Some(response) = rejection_response.as_ref() else {
                             warn!(
@@ -477,16 +506,20 @@ impl QUICListener {
                             timed_out,
                             error,
                         } => {
-                            metrics.inc_failure();
                             metrics.inc_external_auth_error();
-                            metrics.record_route(
-                                &request.upstream_name,
-                                request_start.elapsed(),
-                                if timed_out {
-                                    RouteOutcome::Timeout
-                                } else {
-                                    RouteOutcome::Failure
+                            let _ = observe_admission_outcome(
+                                metrics,
+                                OutcomeRouteTarget {
+                                    route: &request.upstream_name,
                                 },
+                                Some(OutcomeBackendTarget {
+                                    upstream: &request.upstream_name,
+                                    backend_addr: Some(request.backend_addr.as_str()),
+                                    backend_index: Some(request.backend_index),
+                                }),
+                                request_start.elapsed(),
+                                status,
+                                AdmissionOutcomeClass::Failed { timed_out },
                             );
                             if let Some(error) = error {
                                 error!(

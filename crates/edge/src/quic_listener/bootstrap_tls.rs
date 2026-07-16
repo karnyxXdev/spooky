@@ -6,7 +6,7 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -37,7 +37,7 @@ use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
     runtime::{ListenerRuntimeConfig, RuntimeUpstreamPolicy},
 };
-use spooky_errors::{ProxyError, classify_upstream_proxy_error};
+use spooky_errors::{BridgeError, ProxyError, classify_upstream_proxy_error};
 use spooky_lb::upstream_pool::UpstreamPool;
 use spooky_transport::transport_pool::UpstreamTransportPool;
 
@@ -52,7 +52,7 @@ use super::{
     runtime_handle, spawn_supervised_async_task, validate_http_request,
 };
 use crate::{
-    Metrics, REQUEST_ID_COUNTER, RouteOutcome,
+    Metrics, REQUEST_ID_COUNTER,
     resilience::runtime::RuntimeResilience,
     routing::index::RouteIndex,
     runtime::{
@@ -63,6 +63,11 @@ use crate::{
             RequestBodyGuardrailConfig, RequestBodyGuardrailDecision, RequestBodyGuardrailInput,
             ResponseBodyGuardrailConfig, ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput,
             checked_request_body_ingress, checked_response_body_guardrails,
+        },
+        connection::outcome::{
+            AdmissionOutcomeClass, OutcomeBackendTarget, OutcomeRouteTarget,
+            observe_admission_outcome, observe_backend_response_status,
+            observe_proxy_error_outcome, observe_status_outcome,
         },
         shared_state::SharedRuntimeState,
         tls::store::ListenerTlsReloadStore,
@@ -147,6 +152,22 @@ fn bootstrap_request_build_input<'a>(
             traceparent,
         },
         forwarded: RequestForwardedContext { client_addr: peer },
+    }
+}
+
+fn bootstrap_route_target<'a>(route: &'a str) -> OutcomeRouteTarget<'a> {
+    OutcomeRouteTarget { route }
+}
+
+fn bootstrap_backend_target<'a>(
+    upstream_name: &'a str,
+    backend_addr: &'a str,
+    backend_index: usize,
+) -> OutcomeBackendTarget<'a> {
+    OutcomeBackendTarget {
+        upstream: upstream_name,
+        backend_addr: Some(backend_addr),
+        backend_index: Some(backend_index),
     }
 }
 
@@ -398,6 +419,7 @@ impl QUICListener {
                             let peer = peer;
 
                             Box::pin(async move {
+                                let request_start = Instant::now();
                                 let is_websocket_upgrade =
                                     is_websocket_upgrade_request(&req, use_h2);
                                 let client_upgrade = if is_websocket_upgrade {
@@ -409,15 +431,18 @@ impl QUICListener {
                                 let request = match validate_http_request(&req, &resilience) {
                                     Ok(request) => request,
                                     Err((status, body, is_policy)) => {
-                                        metrics.inc_failure();
                                         metrics.inc_request_validation_reject();
                                         if is_policy {
                                             metrics.inc_policy_denied();
                                         }
-                                        metrics.record_route(
-                                            "unrouted",
-                                            Duration::from_millis(0),
-                                            RouteOutcome::Failure,
+                                        let _ = observe_proxy_error_outcome(
+                                            metrics.as_ref(),
+                                            OutcomeRouteTarget::UNROUTED,
+                                            None,
+                                            request_start.elapsed(),
+                                            Some(status),
+                                            &ProxyError::Bridge(BridgeError::InvalidHeader),
+                                            None,
                                         );
                                         return Ok(Response::builder()
                                             .status(status)
@@ -510,12 +535,18 @@ impl QUICListener {
                                 match admission {
                                     AdmissionPolicyDecision::AdmitReady => {}
                                     AdmissionPolicyDecision::Unauthorized(_) => {
-                                        metrics.inc_failure();
                                         metrics.inc_policy_denied();
-                                        metrics.record_route(
-                                            &upstream_name,
-                                            Duration::from_millis(0),
-                                            RouteOutcome::Failure,
+                                        let _ = observe_admission_outcome(
+                                            metrics.as_ref(),
+                                            bootstrap_route_target(&upstream_name),
+                                            Some(bootstrap_backend_target(
+                                                &upstream_name,
+                                                &backend_addr,
+                                                backend_index,
+                                            )),
+                                            request_start.elapsed(),
+                                            StatusCode::UNAUTHORIZED,
+                                            AdmissionOutcomeClass::AuthDenied,
                                         );
                                         warn!(
                                             "Bootstrap request route={} denied by auth policy",
@@ -567,12 +598,18 @@ impl QUICListener {
                                             }));
                                     }
                                     AdmissionPolicyDecision::RateLimited(decision) => {
-                                        metrics.inc_failure();
                                         metrics.inc_request_rate_limited();
-                                        metrics.record_route(
-                                            &upstream_name,
-                                            Duration::from_millis(0),
-                                            RouteOutcome::RateLimited,
+                                        let _ = observe_admission_outcome(
+                                            metrics.as_ref(),
+                                            bootstrap_route_target(&upstream_name),
+                                            Some(bootstrap_backend_target(
+                                                &upstream_name,
+                                                &backend_addr,
+                                                backend_index,
+                                            )),
+                                            request_start.elapsed(),
+                                            StatusCode::TOO_MANY_REQUESTS,
+                                            AdmissionOutcomeClass::RateLimited,
                                         );
                                         warn!(
                                             "Bootstrap request route={} scoped rate limit exceeded by rule={}",
@@ -626,18 +663,23 @@ impl QUICListener {
                                             }));
                                     }
                                     AdmissionPolicyDecision::Overloaded(decision) => {
-                                        metrics.inc_failure();
-                                        metrics.inc_overload_shed_reason(
-                                            decision.reason.metrics_reason(),
-                                        );
-                                        metrics.record_route(
-                                            &upstream_name,
-                                            Duration::from_millis(0),
-                                            RouteOutcome::OverloadShed,
+                                        let _ = observe_admission_outcome(
+                                            metrics.as_ref(),
+                                            bootstrap_route_target(&upstream_name),
+                                            Some(bootstrap_backend_target(
+                                                &upstream_name,
+                                                &backend_addr,
+                                                backend_index,
+                                            )),
+                                            request_start.elapsed(),
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                            AdmissionOutcomeClass::OverloadShed {
+                                                reason: Some(decision.reason.metrics_reason()),
+                                            },
                                         );
                                         resilience
                                             .adaptive_admission
-                                            .observe(Duration::from_millis(0), true);
+                                            .observe(request_start.elapsed(), true);
                                         let Some(response) = rejection_response.as_ref() else {
                                             warn!(
                                                 "Bootstrap request route={} missing admission rejection response for overload decision",
@@ -690,6 +732,19 @@ impl QUICListener {
                                 let endpoint = match backend_endpoints.get(&backend_addr) {
                                     Some(ep) => ep.clone(),
                                     None => {
+                                        let _ = observe_proxy_error_outcome(
+                                            metrics.as_ref(),
+                                            bootstrap_route_target(&upstream_name),
+                                            Some(bootstrap_backend_target(
+                                                &upstream_name,
+                                                &backend_addr,
+                                                backend_index,
+                                            )),
+                                            request_start.elapsed(),
+                                            Some(StatusCode::BAD_GATEWAY),
+                                            &ProxyError::Transport("no endpoint".into()),
+                                            None,
+                                        );
                                         return Ok(Response::builder()
                                             .status(StatusCode::BAD_GATEWAY)
                                             .header("alt-svc", &alt)
@@ -726,6 +781,19 @@ impl QUICListener {
                                         kind: BodyLimitKind::BodySize,
                                     })
                                 ) {
+                                    let _ = observe_proxy_error_outcome(
+                                        metrics.as_ref(),
+                                        bootstrap_route_target(&upstream_name),
+                                        Some(bootstrap_backend_target(
+                                            &upstream_name,
+                                            &backend_addr,
+                                            backend_index,
+                                        )),
+                                        request_start.elapsed(),
+                                        Some(StatusCode::PAYLOAD_TOO_LARGE),
+                                        &ProxyError::Transport("request body too large".into()),
+                                        None,
+                                    );
                                     return Ok(Response::builder()
                                         .status(StatusCode::PAYLOAD_TOO_LARGE)
                                         .header("alt-svc", &alt)
@@ -776,6 +844,20 @@ impl QUICListener {
                                                     b"invalid request\n".as_slice(),
                                                 ),
                                             };
+                                            let proxy_err = ProxyError::from(err);
+                                            let _ = observe_proxy_error_outcome(
+                                                metrics.as_ref(),
+                                                bootstrap_route_target(&upstream_name),
+                                                Some(bootstrap_backend_target(
+                                                    &upstream_name,
+                                                    &backend_addr,
+                                                    backend_index,
+                                                )),
+                                                request_start.elapsed(),
+                                                Some(status),
+                                                &proxy_err,
+                                                None,
+                                            );
                                             return Ok(Response::builder()
                                                 .status(status)
                                                 .header("alt-svc", &alt)
@@ -826,6 +908,20 @@ impl QUICListener {
                                         Ok(request) => request,
                                         Err(err) => {
                                             warn!("Bootstrap request build failed: {}", err);
+                                            let proxy_err = ProxyError::from(err);
+                                            let _ = observe_proxy_error_outcome(
+                                                metrics.as_ref(),
+                                                bootstrap_route_target(&upstream_name),
+                                                Some(bootstrap_backend_target(
+                                                    &upstream_name,
+                                                    &backend_addr,
+                                                    backend_index,
+                                                )),
+                                                request_start.elapsed(),
+                                                Some(StatusCode::BAD_REQUEST),
+                                                &proxy_err,
+                                                None,
+                                            );
                                             return Ok(Response::builder()
                                                 .status(StatusCode::BAD_REQUEST)
                                                 .header("alt-svc", &alt)
@@ -952,6 +1048,19 @@ impl QUICListener {
                                         Ok(Ok(resp)) => resp,
                                         Ok(Err(err)) => {
                                             let proxy_err = ProxyError::Transport(err.to_string());
+                                            let _ = observe_proxy_error_outcome(
+                                                metrics.as_ref(),
+                                                bootstrap_route_target(&upstream_name),
+                                                Some(bootstrap_backend_target(
+                                                    &upstream_name,
+                                                    &backend_addr,
+                                                    backend_index,
+                                                )),
+                                                request_start.elapsed(),
+                                                Some(StatusCode::BAD_GATEWAY),
+                                                &proxy_err,
+                                                None,
+                                            );
                                             if let Some(classified) =
                                                 classify_upstream_proxy_error(&proxy_err)
                                             {
@@ -989,6 +1098,19 @@ impl QUICListener {
                                                 }));
                                         }
                                         Err(_) => {
+                                            let _ = observe_proxy_error_outcome(
+                                                metrics.as_ref(),
+                                                bootstrap_route_target(&upstream_name),
+                                                Some(bootstrap_backend_target(
+                                                    &upstream_name,
+                                                    &backend_addr,
+                                                    backend_index,
+                                                )),
+                                                request_start.elapsed(),
+                                                Some(StatusCode::GATEWAY_TIMEOUT),
+                                                &ProxyError::Timeout,
+                                                None,
+                                            );
                                             if let Some(classified) =
                                                 classify_upstream_proxy_error(&ProxyError::Timeout)
                                             {
@@ -1031,6 +1153,19 @@ impl QUICListener {
                                         Ok(Ok(resp)) => resp,
                                         Ok(Err(err)) => {
                                             let proxy_err = ProxyError::Pool(err);
+                                            let _ = observe_proxy_error_outcome(
+                                                metrics.as_ref(),
+                                                bootstrap_route_target(&upstream_name),
+                                                Some(bootstrap_backend_target(
+                                                    &upstream_name,
+                                                    &backend_addr,
+                                                    backend_index,
+                                                )),
+                                                request_start.elapsed(),
+                                                Some(StatusCode::BAD_GATEWAY),
+                                                &proxy_err,
+                                                None,
+                                            );
                                             if let Some(classified) =
                                                 classify_upstream_proxy_error(&proxy_err)
                                             {
@@ -1068,6 +1203,19 @@ impl QUICListener {
                                                 }));
                                         }
                                         Err(_) => {
+                                            let _ = observe_proxy_error_outcome(
+                                                metrics.as_ref(),
+                                                bootstrap_route_target(&upstream_name),
+                                                Some(bootstrap_backend_target(
+                                                    &upstream_name,
+                                                    &backend_addr,
+                                                    backend_index,
+                                                )),
+                                                request_start.elapsed(),
+                                                Some(StatusCode::GATEWAY_TIMEOUT),
+                                                &ProxyError::Timeout,
+                                                None,
+                                            );
                                             if let Some(classified) =
                                                 classify_upstream_proxy_error(&ProxyError::Timeout)
                                             {
@@ -1161,6 +1309,21 @@ impl QUICListener {
                                         kind: BodyLimitKind::BodySize,
                                     })
                                 ) {
+                                    let _ = observe_proxy_error_outcome(
+                                        metrics.as_ref(),
+                                        bootstrap_route_target(&upstream_name),
+                                        Some(bootstrap_backend_target(
+                                            &upstream_name,
+                                            &backend_addr,
+                                            backend_index,
+                                        )),
+                                        request_start.elapsed(),
+                                        Some(StatusCode::SERVICE_UNAVAILABLE),
+                                        &ProxyError::Pool(spooky_errors::PoolError::BackendOverloaded(
+                                            "response prebuffer cap".into(),
+                                        )),
+                                        Some(crate::OverloadShedReason::ResponsePrebufferCap),
+                                    );
                                     return Ok(Response::builder()
                                         .status(StatusCode::SERVICE_UNAVAILABLE)
                                         .header("alt-svc", &alt)
@@ -1172,6 +1335,27 @@ impl QUICListener {
                                                 b"error\n",
                                             )))
                                         }));
+                                }
+                                let _ = observe_status_outcome(
+                                    metrics.as_ref(),
+                                    bootstrap_route_target(&upstream_name),
+                                    Some(bootstrap_backend_target(
+                                        &upstream_name,
+                                        &backend_addr,
+                                        backend_index,
+                                    )),
+                                    request_start.elapsed(),
+                                    status,
+                                );
+                                if let Some(transition) = observe_backend_response_status(
+                                    crate::runtime::connection::outcome::BackendHealthObservationInput {
+                                        backend_addr: &backend_addr,
+                                        backend_index,
+                                        upstream_pool: Some(&upstream_pool),
+                                        status,
+                                    },
+                                ) {
+                                    Self::log_health_transition(&backend_addr, transition);
                                 }
                                 let mut resp_builder =
                                     Response::builder().status(normalized_response.head.status);
@@ -1221,6 +1405,14 @@ impl QUICListener {
                                         )
                                         .await;
                                     });
+                                    crate::runtime::connection::outcome::finish_backend_request_accounting(
+                                        crate::runtime::connection::outcome::BackendRequestFinishInput {
+                                            upstream_pool: Some(&upstream_pool),
+                                            backend_index: Some(backend_index),
+                                            elapsed: request_start.elapsed(),
+                                            status: Some(status.as_u16()),
+                                        },
+                                    );
                                     return Ok(resp_builder
                                         .body(boxed_full(Bytes::new()))
                                         .unwrap_or_else(|_| {
@@ -1231,12 +1423,24 @@ impl QUICListener {
                                     normalized_response.emission.body,
                                     ResponseBodyPolicy::Suppress
                                 ) {
+                                    crate::runtime::connection::outcome::finish_backend_request_accounting(
+                                        crate::runtime::connection::outcome::BackendRequestFinishInput {
+                                            upstream_pool: Some(&upstream_pool),
+                                            backend_index: Some(backend_index),
+                                            elapsed: request_start.elapsed(),
+                                            status: Some(status.as_u16()),
+                                        },
+                                    );
                                     boxed_full(Bytes::new())
                                 } else {
                                     BootstrapStreamingBody::with_response_guardrails(
                                         upstream_resp.into_body(),
                                         max_response_body_bytes,
                                         upstream_content_length,
+                                        Arc::clone(&upstream_pool),
+                                        backend_index,
+                                        request_start,
+                                        Some(status.as_u16()),
                                     )
                                     .map_err(|never| match never {})
                                     .boxed()

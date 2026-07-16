@@ -1,226 +1,78 @@
 use super::*;
 
-type RouteMatcherKey = (Option<String>, Option<String>, Option<String>);
-
-fn runtime_external_auth_request_headers(
-    headers: &[crate::config::ExternalAuthRequestHeader],
-) -> Vec<RuntimeExternalAuthRequestHeader> {
-    headers
-        .iter()
-        .map(|header| RuntimeExternalAuthRequestHeader {
-            name: header.name.clone(),
-            value: header.value.clone(),
-        })
-        .collect()
-}
-
-fn runtime_external_auth_failure_mode(
-    mode: crate::config::ExternalAuthFailureMode,
-) -> RuntimeExternalAuthFailureMode {
-    match mode {
-        crate::config::ExternalAuthFailureMode::FailOpen => {
-            RuntimeExternalAuthFailureMode::FailOpen
-        }
-        crate::config::ExternalAuthFailureMode::FailClosed => {
-            RuntimeExternalAuthFailureMode::FailClosed
-        }
-    }
-}
-
-fn config_external_auth_failure_mode(
-    mode: RuntimeExternalAuthFailureMode,
-) -> crate::config::ExternalAuthFailureMode {
-    match mode {
-        RuntimeExternalAuthFailureMode::FailOpen => {
-            crate::config::ExternalAuthFailureMode::FailOpen
-        }
-        RuntimeExternalAuthFailureMode::FailClosed => {
-            crate::config::ExternalAuthFailureMode::FailClosed
-        }
-    }
-}
-
-fn runtime_auth_policy(auth: &crate::config::RouteAuth) -> RuntimeAuthPolicy {
-    let api_key = auth.api_key.as_ref().map(|api_key| RuntimeApiKeyAuth {
-        header_name: api_key.header_name.clone(),
-        keys: api_key.keys.clone(),
-    });
-    let jwt = auth.jwt.as_ref().map(|jwt| RuntimeJwtAuth {
-        secret: jwt.secret.clone(),
-        issuer: jwt.issuer.clone(),
-        audience: jwt.audience.clone(),
-        clock_skew_secs: jwt.clock_skew_secs,
-    });
-    let external_auth = auth
-        .external_auth
-        .as_ref()
-        .map(|external_auth| match external_auth {
-            crate::config::ExternalAuth::Http {
-                endpoint,
-                request_headers,
-                response_header_allowlist,
-                timeout_ms,
-                failure_mode,
-            } => RuntimeExternalAuth::Http {
-                endpoint: endpoint.clone(),
-                request_headers: runtime_external_auth_request_headers(request_headers),
-                response_header_allowlist: response_header_allowlist.clone(),
-                timeout_ms: *timeout_ms,
-                failure_mode: runtime_external_auth_failure_mode(*failure_mode),
-            },
-            crate::config::ExternalAuth::Oidc {
-                discovery_url,
-                issuer_url,
-                client_id,
-                client_secret,
-                audience,
-                scopes,
-                request_headers,
-                response_header_allowlist,
-                timeout_ms,
-                failure_mode,
-            } => RuntimeExternalAuth::Oidc {
-                discovery_url: discovery_url.clone(),
-                issuer_url: issuer_url.clone(),
-                client_id: client_id.clone(),
-                client_secret: client_secret.clone(),
-                audience: audience.clone(),
-                scopes: scopes.clone(),
-                request_headers: runtime_external_auth_request_headers(request_headers),
-                response_header_allowlist: response_header_allowlist.clone(),
-                timeout_ms: *timeout_ms,
-                failure_mode: runtime_external_auth_failure_mode(*failure_mode),
-            },
-        });
-
-    RuntimeAuthPolicy {
-        api_key,
-        jwt,
-        external_auth,
-        required_scopes: auth.required_scopes.clone(),
-        required_roles: auth.required_roles.clone(),
-    }
-}
-
-fn config_external_auth_request_headers(
-    headers: &[RuntimeExternalAuthRequestHeader],
-) -> Vec<crate::config::ExternalAuthRequestHeader> {
-    headers
-        .iter()
-        .map(|header| crate::config::ExternalAuthRequestHeader {
-            name: header.name.clone(),
-            value: header.value.clone(),
-        })
-        .collect()
-}
-
-fn config_route_auth(auth: &RuntimeAuthPolicy) -> crate::config::RouteAuth {
-    let api_key = auth
-        .api_key
-        .as_ref()
-        .map(|api_key| crate::config::ApiKeyAuth {
-            header_name: api_key.header_name.clone(),
-            keys: api_key.keys.clone(),
-        });
-    let jwt = auth.jwt.as_ref().map(|jwt| crate::config::JwtAuth {
-        secret: jwt.secret.clone(),
-        issuer: jwt.issuer.clone(),
-        audience: jwt.audience.clone(),
-        clock_skew_secs: jwt.clock_skew_secs,
-    });
-    let external_auth = auth
-        .external_auth
-        .as_ref()
-        .map(|external_auth| match external_auth {
-            RuntimeExternalAuth::Http {
-                endpoint,
-                request_headers,
-                response_header_allowlist,
-                timeout_ms,
-                failure_mode,
-            } => crate::config::ExternalAuth::Http {
-                endpoint: endpoint.clone(),
-                request_headers: config_external_auth_request_headers(request_headers),
-                response_header_allowlist: response_header_allowlist.clone(),
-                timeout_ms: *timeout_ms,
-                failure_mode: config_external_auth_failure_mode(*failure_mode),
-            },
-            RuntimeExternalAuth::Oidc {
-                discovery_url,
-                issuer_url,
-                client_id,
-                client_secret,
-                audience,
-                scopes,
-                request_headers,
-                response_header_allowlist,
-                timeout_ms,
-                failure_mode,
-            } => crate::config::ExternalAuth::Oidc {
-                discovery_url: discovery_url.clone(),
-                issuer_url: issuer_url.clone(),
-                client_id: client_id.clone(),
-                client_secret: client_secret.clone(),
-                audience: audience.clone(),
-                scopes: scopes.clone(),
-                request_headers: config_external_auth_request_headers(request_headers),
-                response_header_allowlist: response_header_allowlist.clone(),
-                timeout_ms: *timeout_ms,
-                failure_mode: config_external_auth_failure_mode(*failure_mode),
-            },
-        });
-
-    crate::config::RouteAuth {
-        api_key,
-        jwt,
-        external_auth,
-        required_scopes: auth.required_scopes.clone(),
-        required_roles: auth.required_roles.clone(),
-    }
-}
+type RouteMatcherKey = RuntimeRouteMatchPolicy;
 
 impl RuntimeUpstream {
-    pub(super) fn from_config(config: &Config, name: &str, upstream: &Upstream) -> Self {
+    pub(super) fn from_config(
+        config: &Config,
+        name: &str,
+        upstream: &Upstream,
+        base_policies: &RuntimePolicySet,
+    ) -> Result<Self, RuntimeConfigError> {
         let effective_tls = upstream
             .tls
             .clone()
             .unwrap_or_else(|| config.upstream_tls.clone());
-
-        Self {
+        let upstream_transport = RuntimeUpstreamTransportPolicy::from_effective_tls(
+            &effective_tls,
+            &base_policies.transport,
+        );
+        let load_balancing = RuntimeLoadBalancingPolicy::normalize(&upstream.load_balancing)?;
+        let route = RuntimeRouteMatchPolicy::normalize(name, &upstream.route)?;
+        let policy = RuntimeUpstreamPolicy {
+            upstream_auth: RuntimeAuthPolicy::normalize(&upstream.auth, name)?,
+            host: RuntimeHostPolicy(upstream.host_policy.clone()),
+            forwarded_headers: RuntimeForwardedHeaderPolicy(upstream.forwarded_headers.clone()),
+            protocol: base_policies.admission.protocol.clone(),
+        };
+        let mut runtime_upstream = Self {
             name: name.to_string(),
-            load_balancing: upstream.load_balancing.clone(),
-            route: upstream.route.clone(),
-            policy: RuntimeUpstreamPolicy {
-                upstream_auth: runtime_auth_policy(&upstream.auth),
+            load_balancing: load_balancing.clone(),
+            route: route.clone(),
+            policy,
+            policy_set: RuntimeUpstreamPolicySet {
+                timeouts: base_policies.timeouts.clone(),
+                auth: RuntimeAuthPolicy::default(),
+                rate_limits: base_policies.rate_limits.clone(),
+                load_balancing,
+                admission: base_policies.admission.clone(),
+                transport: upstream_transport,
                 host: RuntimeHostPolicy(upstream.host_policy.clone()),
                 forwarded_headers: RuntimeForwardedHeaderPolicy(upstream.forwarded_headers.clone()),
-                protocol: RuntimeProtocolPolicy(config.resilience.protocol.clone()),
+                protocol: base_policies.admission.protocol.clone(),
             },
             effective_tls: effective_tls.clone(),
             backends: upstream
                 .backends
                 .iter()
-                .cloned()
-                .map(|backend| RuntimeBackend {
-                    backend,
-                    effective_tls: effective_tls.clone(),
-                })
-                .collect(),
-        }
+                .map(|backend| RuntimeBackend::normalize(name, backend))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        runtime_upstream.policy_set.auth = runtime_upstream.policy.upstream_auth.clone();
+
+        Ok(runtime_upstream)
     }
 
-    pub fn as_config_upstream(&self) -> Upstream {
+    #[cfg(test)]
+    pub(crate) fn as_config_upstream(&self) -> Upstream {
         Upstream {
-            load_balancing: self.load_balancing.clone(),
-            auth: config_route_auth(&self.policy.upstream_auth),
+            load_balancing: self.load_balancing.as_config(),
+            auth: self.policy.upstream_auth.as_config(),
             host_policy: self.policy.host.0.clone(),
             forwarded_headers: self.policy.forwarded_headers.0.clone(),
             tls: Some(self.effective_tls.clone()),
-            route: self.route.clone(),
+            route: self.route.as_config(),
             backends: self
                 .backends
                 .iter()
-                .map(|backend| backend.backend.clone())
+                .map(|backend| {
+                    let mut config_backend = backend.backend.clone();
+                    config_backend.health_check = backend
+                        .health_check
+                        .as_ref()
+                        .map(RuntimeBackendHealthCheck::as_config);
+                    config_backend
+                })
                 .collect(),
         }
     }
@@ -228,6 +80,7 @@ impl RuntimeUpstream {
 
 pub(super) fn normalize_upstreams(
     config: &Config,
+    base_policies: &RuntimePolicySet,
 ) -> Result<HashMap<String, RuntimeUpstream>, RuntimeConfigError> {
     if config.upstream.is_empty() {
         return Err(RuntimeConfigError::ConfigInvalid(
@@ -244,60 +97,38 @@ pub(super) fn normalize_upstreams(
     for (upstream_name, upstream) in &config.upstream {
         validate_upstream_policy(config, upstream_name, upstream)?;
 
-        let route_key = (
-            upstream.route.host.as_deref().map(normalize_route_host),
-            upstream.route.path_prefix.clone(),
-            normalized_route_method(upstream.route.method.as_deref()),
-        );
+        let route_key = RuntimeRouteMatchPolicy::normalize(upstream_name, &upstream.route)?;
         if let Some(existing) = seen_route_matchers.insert(route_key.clone(), upstream_name.clone())
         {
             return Err(RuntimeConfigError::DuplicateRouteAmbiguity {
                 upstream: upstream_name.clone(),
                 existing_upstream: existing,
-                host: route_key.0.clone(),
-                path_prefix: route_key.1.clone(),
-                method: route_key.2.clone(),
+                host: route_key.host.clone(),
+                path_prefix: route_key.path_prefix.clone(),
+                method: route_key.method.clone(),
             });
         }
 
         let runtime_upstream =
-            RuntimeUpstream::from_config(config, upstream_name.as_str(), upstream);
+            RuntimeUpstream::from_config(config, upstream_name.as_str(), upstream, base_policies)?;
         let mut upstream_uses_https_backends = false;
 
         for backend in &runtime_upstream.backends {
-            if backend.backend.id.trim().is_empty() {
-                return Err(RuntimeConfigError::ConfigInvalid(format!(
-                    "upstream '{upstream_name}' contains an empty backend id"
-                )));
-            }
-            if backend.backend.address.trim().is_empty() {
-                return Err(RuntimeConfigError::ConfigInvalid(format!(
-                    "backend '{}' in upstream '{}' has an empty address",
-                    backend.backend.id, upstream_name
-                )));
-            }
-
-            let endpoint = BackendEndpoint::parse(&backend.backend.address).map_err(|err| {
-                RuntimeConfigError::BackendAddressInvalid {
-                    upstream: upstream_name.clone(),
-                    backend: backend.backend.id.clone(),
-                    address: backend.backend.address.clone(),
-                    reason: err,
-                }
-            })?;
-            if endpoint.scheme() == crate::backend_endpoint::BackendScheme::Https {
+            if matches!(
+                backend.endpoint.transport_kind,
+                RuntimeBackendTransportKind::H2
+            ) {
                 upstream_uses_https_backends = true;
             }
 
-            let origin = endpoint.origin();
             if let Some((existing_upstream, existing_backend)) = seen_backend_origins.insert(
-                origin.clone(),
+                backend.endpoint.origin.clone(),
                 (upstream_name.clone(), backend.backend.id.clone()),
             ) {
                 return Err(RuntimeConfigError::BackendAddressInvalid {
                     upstream: upstream_name.clone(),
                     backend: backend.backend.id.clone(),
-                    address: origin,
+                    address: backend.endpoint.origin.clone(),
                     reason: format!(
                         "conflicts with upstream '{}' backend '{}'",
                         existing_upstream, existing_backend
@@ -307,13 +138,55 @@ pub(super) fn normalize_upstreams(
         }
 
         if upstream_uses_https_backends {
-            validate_runtime_upstream_tls(upstream_name, &runtime_upstream.effective_tls)?;
+            validate_runtime_upstream_tls(
+                upstream_name,
+                &runtime_upstream.policy_set.transport.tls.as_upstream_tls(),
+            )?;
         }
 
         normalized.insert(upstream_name.clone(), runtime_upstream);
     }
 
     Ok(normalized)
+}
+
+impl RuntimeBackend {
+    pub(super) fn normalize(
+        upstream_name: &str,
+        backend: &Backend,
+    ) -> Result<Self, RuntimeConfigError> {
+        if backend.id.trim().is_empty() {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' contains an empty backend id"
+            )));
+        }
+        if backend.address.trim().is_empty() {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "backend '{}' in upstream '{}' has an empty address",
+                backend.id, upstream_name
+            )));
+        }
+
+        Ok(Self {
+            backend: backend.clone(),
+            endpoint: RuntimeBackendEndpoint::normalize(
+                upstream_name,
+                backend.id.as_str(),
+                backend.address.as_str(),
+            )?,
+            health_check: backend
+                .health_check
+                .as_ref()
+                .map(|health_check| {
+                    RuntimeBackendHealthCheck::normalize(
+                        upstream_name,
+                        backend.id.as_str(),
+                        health_check,
+                    )
+                })
+                .transpose()?,
+        })
+    }
 }
 
 fn validate_protocol_policy(policy: &ProtocolPolicy) -> Result<(), RuntimeConfigError> {
@@ -718,26 +591,6 @@ fn validate_runtime_upstream_tls(
         )));
     }
     Ok(())
-}
-
-fn normalize_route_host(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let host = if let Some(rest) = trimmed.strip_prefix('[') {
-        if let Some(end) = rest.find(']') {
-            &rest[..end]
-        } else {
-            trimmed
-        }
-    } else if let Some((candidate_host, candidate_port)) = trimmed.rsplit_once(':') {
-        if !candidate_host.contains(':') && candidate_port.chars().all(|c| c.is_ascii_digit()) {
-            candidate_host
-        } else {
-            trimmed
-        }
-    } else {
-        trimmed
-    };
-    host.trim_end_matches('.').to_ascii_lowercase()
 }
 
 fn normalized_route_method(method: Option<&str>) -> Option<String> {

@@ -4,21 +4,38 @@ use crate::{
     backend_endpoint::BackendEndpoint,
     config::{
         Backend, ClientAuth, Config, ForwardedHeaderPolicy, Listen, LoadBalancing, Observability,
-        Performance, ProtocolPolicy, Resilience, RouteMatch, Security, TlsCertificate, Upstream,
+        Performance, ProtocolPolicy, Resilience, Security, TlsCertificate, Upstream,
         UpstreamHostPolicy, UpstreamHostPolicyMode, UpstreamTls,
     },
 };
 
 #[path = "runtime/listeners.rs"]
 mod listeners;
+#[path = "runtime/policies.rs"]
+mod policies;
 #[path = "runtime/upstreams.rs"]
 mod upstreams;
+
+pub use policies::{
+    RuntimeAdmissionPolicy, RuntimeAlternateBackendPolicy, RuntimeApiKeyAuth, RuntimeAuthPolicy,
+    RuntimeBackendAddressKind, RuntimeBackendConnectionPolicy, RuntimeBackendDnsPolicy,
+    RuntimeBackendEndpoint, RuntimeBackendHealthCheck, RuntimeBackendTlsPolicy,
+    RuntimeBackendTransportKind, RuntimeBrownoutPolicy, RuntimeCircuitBreakerPolicy,
+    RuntimeConnectionLimits, RuntimeExternalAuth, RuntimeExternalAuthFailureMode,
+    RuntimeExternalAuthRequestHeader, RuntimeHedgingPolicy, RuntimeJwtAuth,
+    RuntimeListenerPolicySet, RuntimeLoadBalancingPolicy, RuntimeLoadBalancingStrategy,
+    RuntimePolicySet, RuntimeRateLimitPolicy, RuntimeRequestKeySpec, RuntimeRetryBudgetPolicy,
+    RuntimeRouteHostPattern, RuntimeRouteMatchPolicy, RuntimeRouteQueuePolicy,
+    RuntimeScopedRateLimitPolicy, RuntimeTimeoutPolicy, RuntimeTransportPolicy,
+    RuntimeUpstreamPolicySet, RuntimeUpstreamTransportPolicy, RuntimeWatchdogPolicy,
+};
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub version: u32,
     pub listeners: Vec<RuntimeListener>,
     pub upstreams: HashMap<String, RuntimeUpstream>,
+    pub policies: RuntimePolicySet,
     pub performance: Performance,
     pub observability: Observability,
     pub resilience: Resilience,
@@ -27,10 +44,12 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     pub fn from_config(config: &Config) -> Result<Self, RuntimeConfigError> {
+        let policies = RuntimePolicySet::from_config(config)?;
         Ok(Self {
             version: config.version,
             listeners: listeners::runtime_listeners(config)?,
-            upstreams: upstreams::normalize_upstreams(config)?,
+            upstreams: upstreams::normalize_upstreams(config, &policies)?,
+            policies,
             performance: config.performance.clone(),
             observability: config.observability.clone(),
             resilience: config.resilience.clone(),
@@ -43,6 +62,11 @@ impl RuntimeConfig {
             .iter()
             .cloned()
             .map(|listen| ListenerRuntimeConfig {
+                policies: RuntimeListenerPolicySet {
+                    timeouts: self.policies.timeouts.clone(),
+                    transport: self.policies.transport.clone(),
+                    tls: listen.tls.clone(),
+                },
                 listen,
                 performance: self.performance.clone(),
                 observability: self.observability.clone(),
@@ -54,10 +78,23 @@ impl RuntimeConfig {
         self.listener_runtime_configs().into_iter().next()
     }
 
-    pub fn upstreams_as_config(&self) -> HashMap<String, Upstream> {
+    #[cfg(test)]
+    pub(crate) fn upstreams_as_config(&self) -> HashMap<String, Upstream> {
         self.upstreams
             .iter()
             .map(|(name, upstream)| (name.clone(), upstream.as_config_upstream()))
+            .collect()
+    }
+
+    pub fn policies(&self) -> RuntimePolicySet {
+        self.policies.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn upstream_policy_sets(&self) -> HashMap<String, RuntimeUpstreamPolicySet> {
+        self.upstreams
+            .iter()
+            .map(|(name, upstream)| (name.clone(), upstream.policy_set.clone()))
             .collect()
     }
 }
@@ -170,8 +207,15 @@ pub struct RuntimeListener {
 #[derive(Debug, Clone)]
 pub struct ListenerRuntimeConfig {
     pub listen: RuntimeListener,
+    pub policies: RuntimeListenerPolicySet,
     pub performance: Performance,
     pub observability: Observability,
+}
+
+impl ListenerRuntimeConfig {
+    pub fn policies(&self) -> RuntimeListenerPolicySet {
+        RuntimeListenerPolicySet::from_listener_runtime_config(self)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,9 +240,10 @@ pub struct RuntimeTlsIdentity {
 #[derive(Debug, Clone)]
 pub struct RuntimeUpstream {
     pub name: String,
-    pub load_balancing: LoadBalancing,
-    pub route: RouteMatch,
+    pub load_balancing: RuntimeLoadBalancingPolicy,
+    pub route: RuntimeRouteMatchPolicy,
     pub policy: RuntimeUpstreamPolicy,
+    pub policy_set: RuntimeUpstreamPolicySet,
     pub effective_tls: UpstreamTls,
     pub backends: Vec<RuntimeBackend>,
 }
@@ -206,7 +251,8 @@ pub struct RuntimeUpstream {
 #[derive(Debug, Clone)]
 pub struct RuntimeBackend {
     pub backend: Backend,
-    pub effective_tls: UpstreamTls,
+    pub endpoint: RuntimeBackendEndpoint,
+    pub health_check: Option<RuntimeBackendHealthCheck>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -219,65 +265,6 @@ pub struct RuntimeForwardedHeaderPolicy(pub ForwardedHeaderPolicy);
 pub struct RuntimeProtocolPolicy(pub ProtocolPolicy);
 
 #[derive(Debug, Clone, Default)]
-pub struct RuntimeApiKeyAuth {
-    pub header_name: String,
-    pub keys: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct RuntimeJwtAuth {
-    pub secret: String,
-    pub issuer: Option<String>,
-    pub audience: Option<String>,
-    pub clock_skew_secs: u64,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum RuntimeExternalAuthFailureMode {
-    FailOpen,
-    #[default]
-    FailClosed,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct RuntimeExternalAuthRequestHeader {
-    pub name: String,
-    pub value: String,
-}
-
-#[derive(Debug, Clone)]
-pub enum RuntimeExternalAuth {
-    Http {
-        endpoint: String,
-        request_headers: Vec<RuntimeExternalAuthRequestHeader>,
-        response_header_allowlist: Vec<String>,
-        timeout_ms: u64,
-        failure_mode: RuntimeExternalAuthFailureMode,
-    },
-    Oidc {
-        discovery_url: Option<String>,
-        issuer_url: Option<String>,
-        client_id: String,
-        client_secret: Option<String>,
-        audience: Option<String>,
-        scopes: Vec<String>,
-        request_headers: Vec<RuntimeExternalAuthRequestHeader>,
-        response_header_allowlist: Vec<String>,
-        timeout_ms: u64,
-        failure_mode: RuntimeExternalAuthFailureMode,
-    },
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct RuntimeAuthPolicy {
-    pub api_key: Option<RuntimeApiKeyAuth>,
-    pub jwt: Option<RuntimeJwtAuth>,
-    pub external_auth: Option<RuntimeExternalAuth>,
-    pub required_scopes: Vec<String>,
-    pub required_roles: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default)]
 pub struct RuntimeUpstreamPolicy {
     /// Upstream-owned auth policy selected after route lookup resolves an upstream.
     pub upstream_auth: RuntimeAuthPolicy,
@@ -288,6 +275,8 @@ pub struct RuntimeUpstreamPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{listeners::runtime_listeners, *};
     use crate::config::{
         Config, ForwardedHeaderPolicyMode, Listen, RouteMatch, Tls, TlsCertificate, Upstream,
@@ -322,7 +311,10 @@ mod tests {
         config.upstream.insert(
             "api".to_string(),
             Upstream {
-                load_balancing: LoadBalancing::default(),
+                load_balancing: LoadBalancing {
+                    lb_type: "round-robin".to_string(),
+                    key: None,
+                },
                 auth: Default::default(),
                 host_policy: UpstreamHostPolicy {
                     mode: UpstreamHostPolicyMode::Rewrite,
@@ -377,13 +369,13 @@ mod tests {
                 endpoint,
                 request_headers,
                 response_header_allowlist,
-                timeout_ms,
+                timeout,
                 ..
             }) => {
                 assert_eq!(endpoint, "https://auth.internal/check");
                 assert!(request_headers.is_empty());
                 assert!(response_header_allowlist.is_empty());
-                assert_eq!(*timeout_ms, 1_000);
+                assert_eq!(*timeout, Duration::from_millis(1_000));
             }
             other => panic!("unexpected external_auth contract: {:?}", other),
         }
@@ -431,7 +423,7 @@ mod tests {
                 scopes,
                 request_headers,
                 response_header_allowlist,
-                timeout_ms,
+                timeout,
                 ..
             }) => {
                 assert_eq!(
@@ -445,10 +437,243 @@ mod tests {
                 assert_eq!(scopes, &vec!["openid".to_string(), "profile".to_string()]);
                 assert!(request_headers.is_empty());
                 assert!(response_header_allowlist.is_empty());
-                assert_eq!(*timeout_ms, 1_500);
+                assert_eq!(*timeout, Duration::from_millis(1_500));
             }
             other => panic!("unexpected external_auth contract: {:?}", other),
         }
+    }
+
+    #[test]
+    fn runtime_policy_set_normalizes_timeout_and_transport_knobs() {
+        let mut config = sample_config();
+        config.performance.backend_timeout_ms = 2_500;
+        config.performance.backend_connect_timeout_ms = 400;
+        config.performance.backend_body_idle_timeout_ms = 3_500;
+        config.performance.backend_body_total_timeout_ms = 4_500;
+        config.performance.backend_total_request_timeout_ms = 5_500;
+        config.performance.h2_pool_idle_timeout_ms = 91_000;
+        config.performance.max_active_connections = 1234;
+        config.performance.max_request_body_bytes = 8_000;
+        config.performance.request_buffer_global_cap_bytes = 9_999;
+        config.resilience.route_queue.shed_retry_after_seconds = 17;
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let policies = runtime.policies();
+
+        assert_eq!(
+            policies.timeouts.backend_request,
+            Duration::from_millis(2_500)
+        );
+        assert_eq!(
+            policies.timeouts.backend_connect,
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            policies.timeouts.h2_pool_idle,
+            Duration::from_millis(91_000)
+        );
+        assert_eq!(policies.transport.max_active_connections, 1234);
+        assert_eq!(policies.transport.request_buffer_global_cap_bytes, 9_999);
+        assert_eq!(policies.admission.route_queue.shed_retry_after_seconds, 17);
+    }
+
+    #[test]
+    fn runtime_defaults_produce_listener_and_runtime_policy_parity() {
+        let config = sample_config();
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let listener = runtime
+            .primary_listener_runtime_config()
+            .expect("primary listener");
+
+        assert_eq!(
+            runtime.policies.timeouts.backend_request,
+            Duration::from_millis(config.performance.backend_timeout_ms)
+        );
+        assert_eq!(
+            runtime.policies.timeouts.quic_max_idle,
+            Duration::from_millis(config.performance.quic_max_idle_timeout_ms)
+        );
+        assert_eq!(
+            runtime.policies.transport.connection_limits.global_inflight,
+            config.performance.global_inflight_limit
+        );
+        assert_eq!(
+            runtime.policies.transport.quic_initial_max_data,
+            config.performance.quic_initial_max_data
+        );
+        assert_eq!(
+            runtime.policies.admission.watchdog.check_interval,
+            Duration::from_millis(config.resilience.watchdog.check_interval_ms)
+        );
+        assert_eq!(listener.policies.timeouts, runtime.policies.timeouts);
+        assert_eq!(listener.policies.transport, runtime.policies.transport);
+    }
+
+    #[test]
+    fn runtime_upstream_policy_set_carries_canonical_lb_auth_and_tls_shapes() {
+        let mut config = sample_config();
+        let upstream = config.upstream.get_mut("api").expect("api upstream");
+        upstream.load_balancing = LoadBalancing {
+            lb_type: "sticky-cid".to_string(),
+            key: Some("header:x-user-id".to_string()),
+        };
+        upstream.auth.api_key = Some(crate::config::ApiKeyAuth {
+            header_name: "x-api-key".to_string(),
+            keys: vec!["secret-1".to_string()],
+        });
+        upstream.tls = Some(UpstreamTls {
+            verify_certificates: false,
+            strict_sni: false,
+            ca_file: Some("/tmp/upstream-ca.pem".to_string()),
+            ca_dir: None,
+        });
+        config.resilience.scoped_rate_limits = vec![crate::config::ScopedRateLimit {
+            name: "client-default".to_string(),
+            scope: crate::config::ScopedRateLimitScope::Client,
+            requests_per_sec: 10,
+            burst: 20,
+            key: Some("peer_ip".to_string()),
+            route_allowlist: vec!["api".to_string()],
+            idle_ttl_secs: 30,
+        }];
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let upstream_policies = runtime.upstream_policy_sets();
+        let api = upstream_policies
+            .get("api")
+            .expect("api runtime policy set");
+
+        assert_eq!(
+            api.load_balancing.strategy,
+            RuntimeLoadBalancingStrategy::StickyCid
+        );
+        assert_eq!(api.load_balancing.key.as_deref(), Some("header:x-user-id"));
+        assert_eq!(
+            api.auth
+                .api_key
+                .as_ref()
+                .map(|auth| auth.header_name.as_str()),
+            Some("x-api-key")
+        );
+        assert_eq!(
+            api.transport.tls.ca_file.as_deref(),
+            Some("/tmp/upstream-ca.pem")
+        );
+        assert_eq!(
+            api.transport.connection.max_inflight,
+            runtime
+                .policies
+                .transport
+                .connection_limits
+                .backend_pool_max_inflight
+        );
+        assert_eq!(api.rate_limits.scoped_limits.len(), 1);
+        assert_eq!(
+            api.rate_limits.scoped_limits[0].idle_ttl,
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn runtime_config_normalizes_jwt_and_scoped_rate_limit_shapes() {
+        let mut config = sample_config();
+        let upstream = config.upstream.get_mut("api").expect("api upstream");
+        upstream.auth.jwt = Some(crate::config::JwtAuth {
+            secret: "jwt-secret".to_string(),
+            issuer: Some(" issuer-1 ".to_string()),
+            audience: Some(" spooky-api ".to_string()),
+            clock_skew_secs: 45,
+        });
+        upstream.auth.required_scopes = vec![" read:api ".to_string()];
+        upstream.auth.required_roles = vec![" admin ".to_string()];
+        config.resilience.scoped_rate_limits = vec![crate::config::ScopedRateLimit {
+            name: " tenant-default ".to_string(),
+            scope: crate::config::ScopedRateLimitScope::Tenant,
+            requests_per_sec: 12,
+            burst: 34,
+            key: Some("header:x-tenant-id".to_string()),
+            route_allowlist: vec![" api ".to_string()],
+            idle_ttl_secs: 9,
+        }];
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let api = runtime.upstreams.get("api").expect("api runtime upstream");
+        let jwt = api.policy.upstream_auth.jwt.as_ref().expect("jwt policy");
+        let scoped_limit = runtime
+            .policies
+            .rate_limits
+            .scoped_limits
+            .first()
+            .expect("scoped rate limit");
+
+        assert_eq!(jwt.issuer.as_deref(), Some("issuer-1"));
+        assert_eq!(jwt.audience.as_deref(), Some("spooky-api"));
+        assert_eq!(jwt.clock_skew, Duration::from_secs(45));
+        assert_eq!(
+            api.policy.upstream_auth.required_scopes,
+            vec!["read:api".to_string()]
+        );
+        assert_eq!(
+            api.policy.upstream_auth.required_roles,
+            vec!["admin".to_string()]
+        );
+        assert_eq!(scoped_limit.name, " tenant-default ");
+        assert_eq!(scoped_limit.route_allowlist, vec!["api".to_string()]);
+        assert_eq!(scoped_limit.key.as_deref(), Some("header:x-tenant-id"));
+        assert_eq!(scoped_limit.idle_ttl, Duration::from_secs(9));
+    }
+
+    #[test]
+    fn runtime_upstreams_as_config_canonicalizes_route_and_lb_shapes() {
+        let mut config = sample_config();
+        let upstream = config.upstream.get_mut("api").expect("api upstream");
+        upstream.load_balancing = LoadBalancing {
+            lb_type: "cid_sticky".to_string(),
+            key: Some("header:x-user-id".to_string()),
+        };
+        upstream.route = RouteMatch {
+            host: Some("API.EXAMPLE.COM:443.".to_string()),
+            path_prefix: Some("/v1".to_string()),
+            method: Some("get".to_string()),
+        };
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let runtime_upstream = runtime.upstreams.get("api").expect("api runtime upstream");
+        let exported = runtime
+            .upstreams_as_config()
+            .remove("api")
+            .expect("api exported upstream");
+
+        assert_eq!(
+            runtime_upstream.load_balancing.strategy,
+            RuntimeLoadBalancingStrategy::StickyCid
+        );
+        assert_eq!(
+            runtime_upstream.load_balancing.key_spec,
+            Some(RuntimeRequestKeySpec::Header("x-user-id".to_string()))
+        );
+        assert!(
+            !runtime_upstream
+                .load_balancing
+                .alternate_backend
+                .readonly_lb_pick
+        );
+        assert!(
+            runtime_upstream
+                .load_balancing
+                .alternate_backend
+                .healthy_fallback
+        );
+        assert_eq!(
+            runtime_upstream.route.host.as_deref(),
+            Some("api.example.com:443")
+        );
+        assert_eq!(runtime_upstream.route.method.as_deref(), Some("GET"));
+        assert_eq!(runtime_upstream.route.path_prefix.as_deref(), Some("/v1"));
+        assert_eq!(exported.load_balancing.lb_type, "sticky-cid");
+        assert_eq!(exported.route.host.as_deref(), Some("api.example.com:443"));
+        assert_eq!(exported.route.method.as_deref(), Some("GET"));
+        assert_eq!(exported.route.path_prefix.as_deref(), Some("/v1"));
     }
 
     #[test]
@@ -555,6 +780,16 @@ mod tests {
             upstream.backends[0].backend.address,
             "https://api.internal:8443"
         );
+        assert_eq!(upstream.backends[0].endpoint.authority_host, "api.internal");
+        assert_eq!(upstream.backends[0].endpoint.authority_port, 8443);
+        assert_eq!(
+            upstream.backends[0].endpoint.transport_kind,
+            RuntimeBackendTransportKind::H2
+        );
+        assert_eq!(
+            upstream.policy_set.transport.tls.ca_file.as_deref(),
+            Some("/tmp/roots/upstream.pem")
+        );
         assert_eq!(upstream.policy.host.0.mode, UpstreamHostPolicyMode::Rewrite);
         assert_eq!(
             upstream.policy.forwarded_headers.0.mode,
@@ -611,6 +846,31 @@ mod tests {
             err.to_string()
                 .contains("upstream 'api' has an empty effective upstream_tls.ca_file")
         );
+    }
+
+    #[test]
+    fn runtime_backend_health_check_and_endpoint_are_canonicalized() {
+        let mut config = sample_config();
+        config.upstream.get_mut("api").expect("api").backends[0].health_check =
+            Some(crate::config::HealthCheck {
+                path: String::new(),
+                interval: 2_000,
+                timeout_ms: 250,
+                failure_threshold: 4,
+                success_threshold: 3,
+                cooldown_ms: 5_000,
+            });
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let backend = &runtime.upstreams.get("api").expect("api").backends[0];
+        let health = backend.health_check.as_ref().expect("health check");
+
+        assert_eq!(backend.endpoint.origin, "https://api.internal:8443");
+        assert_eq!(health.path, "/");
+        assert_eq!(health.interval, Duration::from_millis(2_000));
+        assert_eq!(health.timeout, Duration::from_millis(250));
+        assert_eq!(health.failure_threshold, 4);
+        assert_eq!(health.success_threshold, 3);
     }
 
     #[test]
@@ -713,6 +973,36 @@ mod tests {
         let err = RuntimeConfig::from_config(&config).expect_err("duplicate routes");
         assert_eq!(err.category(), "duplicate_route_ambiguity");
         assert!(err.to_string().contains("conflicts with upstream"));
+    }
+
+    #[test]
+    fn runtime_config_rejects_invalid_timeout_ordering() {
+        let mut config = sample_config();
+        config.performance.backend_connect_timeout_ms = 2_000;
+        config.performance.backend_timeout_ms = 1_000;
+
+        let err =
+            RuntimeConfig::from_config(&config).expect_err("timeout ordering must be validated");
+        assert_eq!(err.category(), "config_invalid");
+        assert!(
+            err.to_string()
+                .contains("backend_connect_timeout_ms must be <= backend_timeout_ms")
+        );
+    }
+
+    #[test]
+    fn runtime_config_rejects_invalid_lb_key_spec() {
+        let mut config = sample_config();
+        config
+            .upstream
+            .get_mut("api")
+            .expect("api")
+            .load_balancing
+            .key = Some("header:   ".to_string());
+
+        let err = RuntimeConfig::from_config(&config).expect_err("invalid key spec must fail");
+        assert_eq!(err.category(), "config_invalid");
+        assert!(err.to_string().contains("unsupported request key spec"));
     }
 
     #[test]

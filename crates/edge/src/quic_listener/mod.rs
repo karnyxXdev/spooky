@@ -48,18 +48,15 @@ use spooky_bridge::response::{
 };
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
-    config::{ClientAuth, UpstreamTls},
+    config::ClientAuth,
     runtime::{
-        ListenerRuntimeConfig, RuntimeConfig, RuntimeListenerTls, RuntimeTlsIdentity,
-        RuntimeUpstreamPolicy,
+        ListenerRuntimeConfig, RuntimeBackendAddressKind, RuntimeConfig, RuntimeListenerTls,
+        RuntimeTlsIdentity, RuntimeUpstreamPolicy,
     },
 };
 use spooky_errors::{PoolError, ProxyError};
 use spooky_lb::{health::HealthFailureReason, upstream_pool::UpstreamPool};
-use spooky_transport::{
-    h2_client::{SharedDnsResolver, TlsClientConfig},
-    transport_pool::{BackendTransportKind, UpstreamTransportPool},
-};
+use spooky_transport::{h2_client::SharedDnsResolver, transport_pool::UpstreamTransportPool};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     runtime::Handle,
@@ -136,6 +133,24 @@ use validation::{
     parse_traceparent, validate_http_request, validate_request_headers,
 };
 use x509_parser::{extensions::GeneralName, parse_x509_certificate};
+
+struct ListenerRuntimeSettings {
+    backend_timeout: Duration,
+    backend_body_idle_timeout: Duration,
+    backend_body_total_timeout: Duration,
+    client_body_idle_timeout: Duration,
+    backend_total_request_timeout: Duration,
+    inflight_acquire_wait: Duration,
+    drain_timeout: Duration,
+    max_active_connections: usize,
+    max_streams_per_connection: usize,
+    max_request_body_bytes: usize,
+    max_response_body_bytes: usize,
+    request_buffer_global_cap_bytes: usize,
+    unknown_length_response_prebuffer_bytes: usize,
+    new_connections_per_sec: u32,
+    new_connections_burst: u32,
+}
 
 #[cfg(test)]
 fn connection_header_tokens(headers: &http::HeaderMap) -> HashSet<String> {
@@ -479,6 +494,36 @@ fn boxed_full(body: Bytes) -> http_body_util::combinators::BoxBody<Bytes, Infall
 }
 
 impl QUICListener {
+    fn listener_runtime_settings(config: &ListenerRuntimeConfig) -> ListenerRuntimeSettings {
+        let transport_policy = &config.policies.transport;
+        let timeout_policy = &config.policies.timeouts;
+        ListenerRuntimeSettings {
+            backend_timeout: timeout_policy.backend_request,
+            backend_body_idle_timeout: timeout_policy.backend_body_idle,
+            backend_body_total_timeout: timeout_policy.backend_body_total,
+            client_body_idle_timeout: timeout_policy.client_body_idle,
+            backend_total_request_timeout: timeout_policy.backend_total_request,
+            inflight_acquire_wait: timeout_policy.inflight_acquire_wait,
+            drain_timeout: timeout_policy.shutdown_drain,
+            max_active_connections: transport_policy
+                .connection_limits
+                .max_active_connections
+                .max(1),
+            max_streams_per_connection: usize::try_from(
+                transport_policy.quic_initial_max_streams_bidi,
+            )
+            .unwrap_or(usize::MAX)
+            .max(1),
+            max_request_body_bytes: transport_policy.max_request_body_bytes,
+            max_response_body_bytes: transport_policy.max_response_body_bytes,
+            request_buffer_global_cap_bytes: transport_policy.request_buffer_global_cap_bytes,
+            unknown_length_response_prebuffer_bytes: transport_policy
+                .unknown_length_response_prebuffer_bytes,
+            new_connections_per_sec: transport_policy.new_connections_per_sec,
+            new_connections_burst: transport_policy.new_connections_burst,
+        }
+    }
+
     pub fn new(config: spooky_config::config::Config) -> Result<Self, ProxyError> {
         let runtime_config = RuntimeConfig::from_config(&config)
             .map_err(|err| ProxyError::Transport(err.to_string()))?;
@@ -495,15 +540,6 @@ impl QUICListener {
         Self::new_with_socket_and_shared_state(listener_config, socket, shared_state)
     }
 
-    fn upstream_tls_client_config(tls: &UpstreamTls) -> TlsClientConfig {
-        TlsClientConfig {
-            verify_certificates: tls.verify_certificates,
-            strict_sni: tls.strict_sni,
-            ca_file: tls.ca_file.clone(),
-            ca_dir: tls.ca_dir.clone(),
-        }
-    }
-
     fn record_backend_connect(
         metrics: &Metrics,
         backend: &str,
@@ -514,58 +550,61 @@ impl QUICListener {
     }
 
     pub fn build_shared_state(config: &RuntimeConfig) -> Result<SharedRuntimeState, ProxyError> {
-        let worker_threads = config.performance.worker_threads.max(1);
-        let shard_count = config.performance.packet_shards_per_worker.max(1);
-        let active_worker_threads = if worker_threads > 1 && !config.performance.reuseport {
+        let transport_policy = &config.policies.transport;
+        let timeout_policy = &config.policies.timeouts;
+        let worker_threads = transport_policy.worker_threads.max(1);
+        let shard_count = transport_policy.packet_shards_per_worker.max(1);
+        let active_worker_threads = if worker_threads > 1 && !transport_policy.reuseport {
             1
         } else {
             worker_threads
         };
         let worker_slots = active_worker_threads.saturating_mul(shard_count).max(1);
-        let per_upstream_limit = config.performance.per_upstream_inflight_limit.max(1);
-        let global_inflight_limit = config.performance.global_inflight_limit.max(1);
-        let max_inflight_per_backend = config
-            .performance
-            .per_backend_inflight_limit
-            .saturating_mul(worker_threads);
-
+        let per_upstream_limit = transport_policy
+            .connection_limits
+            .per_upstream_inflight
+            .max(1);
+        let global_inflight_limit = transport_policy.connection_limits.global_inflight.max(1);
         info!(
             "Runtime performance concurrency worker_threads={} control_plane_threads={} packet_shards_per_worker={} reuseport={} pin_workers={}",
             worker_threads,
-            config.performance.control_plane_threads.max(1),
+            transport_policy.control_plane_threads.max(1),
             shard_count,
-            config.performance.reuseport,
-            config.performance.pin_workers,
+            transport_policy.reuseport,
+            transport_policy.pin_workers,
         );
         info!(
             "Runtime performance inflight_limits global_inflight_limit={} per_upstream_inflight_limit={} per_backend_inflight_limit={} max_active_connections={}",
             global_inflight_limit,
             per_upstream_limit,
-            config.performance.per_backend_inflight_limit,
-            config.performance.max_active_connections,
+            transport_policy.connection_limits.per_backend,
+            transport_policy.connection_limits.max_active_connections,
         );
         info!(
             "Runtime performance upstream_timeouts backend_connect_timeout_ms={} backend_timeout_ms={} backend_body_idle_timeout_ms={} backend_body_total_timeout_ms={} backend_total_request_timeout_ms={}",
-            config.performance.backend_connect_timeout_ms,
-            config.performance.backend_timeout_ms,
-            config.performance.backend_body_idle_timeout_ms,
-            config.performance.backend_body_total_timeout_ms,
-            config.performance.backend_total_request_timeout_ms,
+            timeout_policy.backend_connect.as_millis(),
+            timeout_policy.backend_request.as_millis(),
+            timeout_policy.backend_body_idle.as_millis(),
+            timeout_policy.backend_body_total.as_millis(),
+            timeout_policy.backend_total_request.as_millis(),
         );
         info!(
             "Runtime performance request_limits client_body_idle_timeout_ms={} max_request_body_bytes={} max_response_body_bytes={} request_buffer_global_cap_bytes={} unknown_length_response_prebuffer_bytes={}",
-            config.performance.client_body_idle_timeout_ms,
-            config.performance.max_request_body_bytes,
-            config.performance.max_response_body_bytes,
-            config.performance.request_buffer_global_cap_bytes,
-            config.performance.unknown_length_response_prebuffer_bytes,
+            timeout_policy.client_body_idle.as_millis(),
+            transport_policy.max_request_body_bytes,
+            transport_policy.max_response_body_bytes,
+            transport_policy.request_buffer_global_cap_bytes,
+            transport_policy.unknown_length_response_prebuffer_bytes,
         );
         info!(
             "Runtime performance transport_buffers udp_recv_buffer_bytes={} udp_send_buffer_bytes={} h2_pool_max_idle_per_backend={} h2_pool_idle_timeout_ms={}",
-            config.performance.udp_recv_buffer_bytes,
-            config.performance.udp_send_buffer_bytes,
-            config.performance.h2_pool_max_idle_per_backend,
-            config.performance.h2_pool_idle_timeout_ms,
+            transport_policy.udp_recv_buffer_bytes,
+            transport_policy.udp_send_buffer_bytes,
+            transport_policy.backend_connections.max_idle_per_backend,
+            transport_policy
+                .backend_connections
+                .pool_idle_timeout
+                .as_millis(),
         );
 
         let listener_runtime_configs = config
@@ -575,25 +614,14 @@ impl QUICListener {
             .collect::<HashMap<_, _>>();
         let listener_tls_store = Arc::new(Self::build_listener_tls_reload_store(config)?);
 
-        let mut backend_transports = Vec::new();
         let mut backend_resolutions = Vec::new();
         let mut seen_backend_origins: HashMap<String, (String, String)> = HashMap::new();
-        let mut backend_tls_configs: HashMap<String, TlsClientConfig> = HashMap::new();
+        let mut backend_endpoints: HashMap<String, BackendEndpoint> = HashMap::new();
+        let mut backend_health_checks = HashMap::new();
         for (upstream_name, upstream) in &config.upstreams {
-            let upstream_tls_client = Self::upstream_tls_client_config(&upstream.effective_tls);
-
             for backend in &upstream.backends {
-                let endpoint = match BackendEndpoint::parse(&backend.backend.address) {
-                    Ok(endpoint) => endpoint,
-                    Err(err) => {
-                        return Err(ProxyError::Transport(format!(
-                            "invalid backend address '{}' in upstream '{}' (backend '{}'): {}",
-                            backend.backend.address, upstream_name, backend.backend.id, err
-                        )));
-                    }
-                };
-
-                let origin = endpoint.origin();
+                let endpoint = backend.endpoint.canonical.clone();
+                let origin = backend.endpoint.origin.clone();
                 if let Some((existing_upstream, existing_backend)) = seen_backend_origins.insert(
                     origin.clone(),
                     (upstream_name.clone(), backend.backend.id.clone()),
@@ -607,16 +635,12 @@ impl QUICListener {
                         existing_backend
                     )));
                 }
-                backend_transports.push((
-                    backend.backend.address.clone(),
-                    match endpoint.scheme() {
-                        BackendScheme::Http => BackendTransportKind::Http1,
-                        BackendScheme::Https => BackendTransportKind::H2,
-                    },
-                ));
-                let authority_host = endpoint.authority_host().to_string();
-                let authority_port = endpoint.authority_port();
-                let resolution = if endpoint.authority_is_ip_literal() {
+                let authority_host = backend.endpoint.authority_host.clone();
+                let authority_port = backend.endpoint.authority_port;
+                let resolution = if matches!(
+                    backend.endpoint.address_kind,
+                    RuntimeBackendAddressKind::IpLiteral
+                ) {
                     let ip_addr = authority_host.parse::<IpAddr>().map_err(|err| {
                         ProxyError::Transport(format!(
                             "failed to parse IP literal backend '{}' in upstream '{}' (backend '{}'): {}",
@@ -637,31 +661,30 @@ impl QUICListener {
                     )
                 };
                 backend_resolutions.push(resolution);
-                let authority_kind = if endpoint.authority_is_ip_literal() {
-                    "ip_literal"
-                } else {
-                    "hostname"
+                let authority_kind = match backend.endpoint.address_kind {
+                    RuntimeBackendAddressKind::IpLiteral => "ip_literal",
+                    RuntimeBackendAddressKind::Hostname => "hostname",
                 };
                 debug!(
                     "Configured upstream TLS policy backend={} upstream={} verify_certificates={} strict_sni={} ca_file={:?} ca_dir={:?} authority_kind={}",
                     backend.backend.address,
                     upstream_name,
-                    upstream_tls_client.verify_certificates,
-                    upstream_tls_client.strict_sni,
-                    upstream_tls_client.ca_file,
-                    upstream_tls_client.ca_dir,
+                    upstream.policy_set.transport.tls.verify_certificates,
+                    upstream.policy_set.transport.tls.strict_sni,
+                    upstream.policy_set.transport.tls.ca_file,
+                    upstream.policy_set.transport.tls.ca_dir,
                     authority_kind
                 );
-                if endpoint.scheme() == BackendScheme::Https {
-                    backend_tls_configs
-                        .insert(backend.backend.address.clone(), upstream_tls_client.clone());
+                backend_endpoints.insert(backend.backend.address.clone(), endpoint);
+                if let Some(health_check) = backend.health_check.clone() {
+                    backend_health_checks.insert(backend.backend.address.clone(), health_check);
                 }
             }
         }
 
         let mut route_labels = config.upstreams.keys().cloned().collect::<Vec<_>>();
         route_labels.push("unrouted".to_string());
-        let routing_index = Arc::new(RouteIndex::from_upstreams(&config.upstreams_as_config()));
+        let routing_index = Arc::new(RouteIndex::from_runtime_upstreams(&config.upstreams));
         let metrics = Arc::new(Metrics::new(worker_slots, route_labels));
         let backend_dns_resolver = SharedDnsResolver::new();
         let backend_resolution_store =
@@ -678,13 +701,9 @@ impl QUICListener {
             },
         );
         let transport_pool = Arc::new(
-            UpstreamTransportPool::new_with_observer(
-                backend_transports,
-                backend_tls_configs,
-                max_inflight_per_backend,
-                config.performance.h2_pool_max_idle_per_backend,
-                Duration::from_millis(config.performance.h2_pool_idle_timeout_ms),
-                Duration::from_millis(config.performance.backend_connect_timeout_ms),
+            UpstreamTransportPool::from_runtime_upstreams(
+                config.upstreams.values(),
+                &transport_policy.backend_connections,
                 backend_dns_resolver.clone(),
                 Some(connect_observer),
             )
@@ -693,8 +712,8 @@ impl QUICListener {
         let mut upstream_pools = HashMap::new();
         let mut upstream_inflight = HashMap::new();
         for (name, runtime_upstream) in &config.upstreams {
-            let upstream_pool = UpstreamPool::from_upstream(&runtime_upstream.as_config_upstream())
-                .map_err(|err| {
+            let upstream_pool =
+                UpstreamPool::from_runtime_upstream(runtime_upstream).map_err(|err| {
                     ProxyError::Transport(format!(
                         "failed to create upstream pool '{}': {}",
                         name, err
@@ -704,44 +723,48 @@ impl QUICListener {
             upstream_inflight.insert(name.clone(), Arc::new(Semaphore::new(per_upstream_limit)));
         }
 
-        config
-            .resilience
-            .validate()
-            .map_err(|e| ProxyError::Transport(format!("invalid resilience config: {e}")))?;
-        let mut effective_resilience = config.resilience.clone();
+        let mut effective_admission = config.policies.admission.clone();
         let default_route_cap_limit = per_upstream_limit.saturating_mul(2).max(1);
-        if effective_resilience.route_queue.default_cap > default_route_cap_limit {
+        if effective_admission.route_queue.default_cap > default_route_cap_limit {
             warn!(
                 "resilience.route_queue.default_cap={} is above tuned limit {}; clamping for steadier timeout/admission behavior",
-                effective_resilience.route_queue.default_cap, default_route_cap_limit
+                effective_admission.route_queue.default_cap, default_route_cap_limit
             );
-            effective_resilience.route_queue.default_cap = default_route_cap_limit;
         }
         let global_route_cap_limit = global_inflight_limit.saturating_mul(2).max(1);
-        if effective_resilience.route_queue.global_cap > global_route_cap_limit {
+        if effective_admission.route_queue.global_cap > global_route_cap_limit {
             warn!(
                 "resilience.route_queue.global_cap={} is above tuned limit {}; clamping for steadier timeout/admission behavior",
-                effective_resilience.route_queue.global_cap, global_route_cap_limit
+                effective_admission.route_queue.global_cap, global_route_cap_limit
             );
-            effective_resilience.route_queue.global_cap = global_route_cap_limit;
         }
-        for cap in effective_resilience.route_queue.caps.values_mut() {
-            *cap = (*cap).min(default_route_cap_limit).max(1);
-        }
-        let tuned_high_latency =
-            (config.performance.backend_timeout_ms.saturating_mul(7) / 10).max(50);
-        if effective_resilience.adaptive_admission.high_latency_ms > tuned_high_latency {
+        let backend_timeout_ms =
+            u64::try_from(timeout_policy.backend_request.as_millis()).unwrap_or(u64::MAX);
+        let tuned_high_latency = (backend_timeout_ms.saturating_mul(7) / 10).max(50);
+        if effective_admission.adaptive_admission.high_latency
+            > Duration::from_millis(tuned_high_latency)
+        {
             warn!(
                 "resilience.adaptive_admission.high_latency_ms={} is above tuned limit {}; clamping for faster overload reaction",
-                effective_resilience.adaptive_admission.high_latency_ms, tuned_high_latency
+                effective_admission
+                    .adaptive_admission
+                    .high_latency
+                    .as_millis(),
+                tuned_high_latency
             );
-            effective_resilience.adaptive_admission.high_latency_ms = tuned_high_latency;
         }
-        let resilience = Arc::new(RuntimeResilience::from_config(
-            &effective_resilience,
-            global_inflight_limit,
+        effective_admission = effective_admission.with_runtime_overrides(
+            default_route_cap_limit,
+            global_route_cap_limit,
+            Duration::from_millis(tuned_high_latency),
+        );
+        let resilience = Arc::new(RuntimeResilience::from_policies(
+            &effective_admission,
+            &config.policies.rate_limits,
         ));
-        let watchdog = Arc::new(WatchdogCoordinator::new(&config.resilience.watchdog));
+        let watchdog = Arc::new(WatchdogCoordinator::from_runtime_config(
+            &WatchdogRuntimeConfig::from(&config.policies.admission.watchdog),
+        ));
         for (listener_label, inventory) in listener_tls_store.snapshot() {
             Self::update_listener_tls_expiry_metrics(&metrics, &listener_label, &inventory);
         }
@@ -750,18 +773,8 @@ impl QUICListener {
             listener_runtime_configs: Arc::new(listener_runtime_configs),
             listener_tls_store,
             transport_pool,
-            backend_endpoints: Arc::new(
-                config
-                    .upstreams
-                    .values()
-                    .flat_map(|upstream| upstream.backends.iter())
-                    .filter_map(|backend| {
-                        BackendEndpoint::parse(&backend.backend.address)
-                            .ok()
-                            .map(|endpoint| (backend.backend.address.clone(), endpoint))
-                    })
-                    .collect(),
-            ),
+            backend_endpoints: Arc::new(backend_endpoints),
+            backend_health_checks: Arc::new(backend_health_checks),
             backend_resolution_store,
             backend_dns_resolver,
             upstream_policies: Arc::new(
@@ -836,10 +849,11 @@ impl QUICListener {
     ) {
         shared_state.watchdog.set_expected_workers(
             config
-                .performance
+                .policies
+                .transport
                 .worker_threads
                 .max(1)
-                .saturating_mul(config.performance.packet_shards_per_worker.max(1))
+                .saturating_mul(config.policies.transport.packet_shards_per_worker.max(1))
                 .max(1),
         );
         let task_registry = Arc::clone(&shared_state.generation_tasks);
@@ -855,6 +869,7 @@ impl QUICListener {
             shared_state.upstream_pools.clone(),
             Arc::clone(&shared_state.transport_pool),
             Arc::clone(&shared_state.backend_endpoints),
+            Arc::clone(&shared_state.backend_health_checks),
             Arc::clone(&shared_state.backend_resolution_store),
             Arc::clone(&shared_state.metrics),
             Arc::clone(&task_registry),
@@ -885,11 +900,12 @@ impl QUICListener {
         reuse_port: bool,
     ) -> Result<UdpSocket, ProxyError> {
         let bind_addr = Self::resolve_bind_addr(config)?;
+        let transport_policy = &config.policies.transport;
         let socket = Self::create_udp_socket(
             bind_addr,
             reuse_port,
-            config.performance.udp_recv_buffer_bytes,
-            config.performance.udp_send_buffer_bytes,
+            transport_policy.udp_recv_buffer_bytes,
+            transport_policy.udp_send_buffer_bytes,
         )?;
         socket
             .set_read_timeout(Some(Duration::from_millis(UDP_READ_TIMEOUT_MS)))
@@ -929,34 +945,13 @@ impl QUICListener {
             config.enable_extended_connect(true);
             config
         });
-        let backend_timeout = Duration::from_millis(config.performance.backend_timeout_ms);
-        let backend_body_idle_timeout =
-            Duration::from_millis(config.performance.backend_body_idle_timeout_ms);
-        let backend_body_total_timeout =
-            Duration::from_millis(config.performance.backend_body_total_timeout_ms);
-        let client_body_idle_timeout =
-            Duration::from_millis(config.performance.client_body_idle_timeout_ms);
-        let backend_total_request_timeout =
-            Duration::from_millis(config.performance.backend_total_request_timeout_ms);
-        let inflight_acquire_wait =
-            Duration::from_millis(config.performance.inflight_acquire_wait_ms);
-        let drain_timeout = Duration::from_millis(config.performance.shutdown_drain_timeout_ms);
-        let max_active_connections = config.performance.max_active_connections.max(1);
-        let max_streams_per_connection =
-            usize::try_from(config.performance.quic_initial_max_streams_bidi)
-                .unwrap_or(usize::MAX)
-                .max(1);
-        let max_request_body_bytes = config.performance.max_request_body_bytes;
-        let max_response_body_bytes = config.performance.max_response_body_bytes;
-        let request_buffer_global_cap_bytes = config.performance.request_buffer_global_cap_bytes;
-        let unknown_length_response_prebuffer_bytes =
-            config.performance.unknown_length_response_prebuffer_bytes;
+        let settings = Self::listener_runtime_settings(&config);
         let require_client_cert = Self::runtime_listener_tls(&config)?
             .client_auth
             .require_client_cert;
         let conn_rate_limiter = TokenBucket::new(
-            config.performance.new_connections_per_sec,
-            config.performance.new_connections_burst,
+            settings.new_connections_per_sec,
+            settings.new_connections_burst,
         );
 
         Ok(Self {
@@ -983,19 +978,20 @@ impl QUICListener {
             draining: false,
             drain_start: None,
             watchdog_worker_drained: false,
-            drain_timeout,
-            backend_timeout,
-            backend_body_idle_timeout,
-            backend_body_total_timeout,
-            client_body_idle_timeout,
-            backend_total_request_timeout,
-            inflight_acquire_wait,
-            max_active_connections,
-            max_streams_per_connection,
-            max_request_body_bytes,
-            max_response_body_bytes,
-            request_buffer_global_cap_bytes,
-            unknown_length_response_prebuffer_bytes,
+            drain_timeout: settings.drain_timeout,
+            backend_timeout: settings.backend_timeout,
+            backend_body_idle_timeout: settings.backend_body_idle_timeout,
+            backend_body_total_timeout: settings.backend_body_total_timeout,
+            client_body_idle_timeout: settings.client_body_idle_timeout,
+            backend_total_request_timeout: settings.backend_total_request_timeout,
+            inflight_acquire_wait: settings.inflight_acquire_wait,
+            max_active_connections: settings.max_active_connections,
+            max_streams_per_connection: settings.max_streams_per_connection,
+            max_request_body_bytes: settings.max_request_body_bytes,
+            max_response_body_bytes: settings.max_response_body_bytes,
+            request_buffer_global_cap_bytes: settings.request_buffer_global_cap_bytes,
+            unknown_length_response_prebuffer_bytes: settings
+                .unknown_length_response_prebuffer_bytes,
             require_client_cert,
             runtime_bundle: None,
             runtime_generation: 0,

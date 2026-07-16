@@ -47,7 +47,7 @@ impl QUICListener {
         metrics: Arc<Metrics>,
         task_registry: Arc<RuntimeTaskRegistry>,
     ) {
-        if !config.performance.backend_dns_refresh_enabled {
+        if !config.policies.transport.backend_dns.refresh_enabled {
             return;
         }
 
@@ -56,7 +56,15 @@ impl QUICListener {
             return;
         }
 
-        let interval_ms = config.performance.backend_dns_refresh_interval_ms.max(1);
+        let interval_ms: u64 = config
+            .policies
+            .transport
+            .backend_dns
+            .refresh_interval
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+            .max(1);
         let handle = match runtime_handle() {
             Some(handle) => handle,
             None => {

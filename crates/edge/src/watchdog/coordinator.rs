@@ -9,7 +9,7 @@ use std::{
 use log::warn;
 use spooky_config::config::Watchdog as WatchdogConfig;
 
-use crate::watchdog::time::now_millis;
+use crate::watchdog::{config::WatchdogRuntimeConfig, time::now_millis};
 
 pub struct WatchdogCoordinator {
     enabled: bool,
@@ -27,6 +27,10 @@ pub struct WatchdogCoordinator {
 
 impl WatchdogCoordinator {
     pub fn new(config: &WatchdogConfig) -> Self {
+        Self::from_runtime_config(&WatchdogRuntimeConfig::from(config))
+    }
+
+    pub fn from_runtime_config(config: &WatchdogRuntimeConfig) -> Self {
         let now_ms = now_millis();
         Self {
             enabled: config.enabled,

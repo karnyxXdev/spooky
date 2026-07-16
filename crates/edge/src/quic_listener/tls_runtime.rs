@@ -51,6 +51,8 @@ impl QUICListener {
 
     pub(super) fn build_quic_config(config: &ListenerRuntimeConfig) -> Result<Config, ProxyError> {
         let loaded_tls = Self::load_listener_tls_material(config)?;
+        let transport_policy = &config.policies.transport;
+        let timeout_policy = &config.policies.timeouts;
         debug!(
             "Loaded downstream default TLS identity cert='{}' serial={} san_dns={:?} sni_identities={}",
             loaded_tls.default_identity.identity.cert_path,
@@ -71,20 +73,23 @@ impl QUICListener {
             .map_err(|err| {
                 ProxyError::Transport(format!("failed to set ALPN protocols: {:?}", err))
             })?;
-        quic_config.set_max_idle_timeout(config.performance.quic_max_idle_timeout_ms);
+        quic_config.set_max_idle_timeout(
+            timeout_policy
+                .quic_max_idle
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        );
         quic_config.set_max_recv_udp_payload_size(MAX_UDP_PAYLOAD_BYTES);
         quic_config.set_max_send_udp_payload_size(MAX_UDP_PAYLOAD_BYTES);
-        quic_config.set_initial_max_data(config.performance.quic_initial_max_data);
-        quic_config.set_initial_max_stream_data_bidi_local(
-            config.performance.quic_initial_max_stream_data,
-        );
-        quic_config.set_initial_max_stream_data_bidi_remote(
-            config.performance.quic_initial_max_stream_data,
-        );
+        quic_config.set_initial_max_data(transport_policy.quic_initial_max_data);
         quic_config
-            .set_initial_max_stream_data_uni(config.performance.quic_initial_max_stream_data);
-        quic_config.set_initial_max_streams_bidi(config.performance.quic_initial_max_streams_bidi);
-        quic_config.set_initial_max_streams_uni(config.performance.quic_initial_max_streams_uni);
+            .set_initial_max_stream_data_bidi_local(transport_policy.quic_initial_max_stream_data);
+        quic_config
+            .set_initial_max_stream_data_bidi_remote(transport_policy.quic_initial_max_stream_data);
+        quic_config.set_initial_max_stream_data_uni(transport_policy.quic_initial_max_stream_data);
+        quic_config.set_initial_max_streams_bidi(transport_policy.quic_initial_max_streams_bidi);
+        quic_config.set_initial_max_streams_uni(transport_policy.quic_initial_max_streams_uni);
         quic_config.set_disable_active_migration(true);
 
         if loaded_tls.client_auth.enabled {
@@ -337,38 +342,27 @@ impl QUICListener {
         self.metrics = Arc::clone(&runtime.shared_state.metrics);
         self.resilience = Arc::clone(&runtime.shared_state.resilience);
         self.watchdog = Arc::clone(&runtime.shared_state.watchdog);
-        self.backend_timeout = Duration::from_millis(self.config.performance.backend_timeout_ms);
-        self.backend_body_idle_timeout =
-            Duration::from_millis(self.config.performance.backend_body_idle_timeout_ms);
-        self.backend_body_total_timeout =
-            Duration::from_millis(self.config.performance.backend_body_total_timeout_ms);
-        self.client_body_idle_timeout =
-            Duration::from_millis(self.config.performance.client_body_idle_timeout_ms);
-        self.backend_total_request_timeout =
-            Duration::from_millis(self.config.performance.backend_total_request_timeout_ms);
-        self.inflight_acquire_wait =
-            Duration::from_millis(self.config.performance.inflight_acquire_wait_ms);
-        self.drain_timeout =
-            Duration::from_millis(self.config.performance.shutdown_drain_timeout_ms);
-        self.max_active_connections = self.config.performance.max_active_connections.max(1);
-        self.max_streams_per_connection =
-            usize::try_from(self.config.performance.quic_initial_max_streams_bidi)
-                .unwrap_or(usize::MAX)
-                .max(1);
-        self.max_request_body_bytes = self.config.performance.max_request_body_bytes;
-        self.max_response_body_bytes = self.config.performance.max_response_body_bytes;
-        self.request_buffer_global_cap_bytes =
-            self.config.performance.request_buffer_global_cap_bytes;
-        self.unknown_length_response_prebuffer_bytes = self
-            .config
-            .performance
-            .unknown_length_response_prebuffer_bytes;
+        let settings = Self::listener_runtime_settings(&self.config);
+        self.backend_timeout = settings.backend_timeout;
+        self.backend_body_idle_timeout = settings.backend_body_idle_timeout;
+        self.backend_body_total_timeout = settings.backend_body_total_timeout;
+        self.client_body_idle_timeout = settings.client_body_idle_timeout;
+        self.backend_total_request_timeout = settings.backend_total_request_timeout;
+        self.inflight_acquire_wait = settings.inflight_acquire_wait;
+        self.drain_timeout = settings.drain_timeout;
+        self.max_active_connections = settings.max_active_connections;
+        self.max_streams_per_connection = settings.max_streams_per_connection;
+        self.max_request_body_bytes = settings.max_request_body_bytes;
+        self.max_response_body_bytes = settings.max_response_body_bytes;
+        self.request_buffer_global_cap_bytes = settings.request_buffer_global_cap_bytes;
+        self.unknown_length_response_prebuffer_bytes =
+            settings.unknown_length_response_prebuffer_bytes;
         self.require_client_cert = Self::runtime_listener_tls(&self.config)?
             .client_auth
             .require_client_cert;
         self.conn_rate_limiter.reconfigure(
-            self.config.performance.new_connections_per_sec,
-            self.config.performance.new_connections_burst,
+            settings.new_connections_per_sec,
+            settings.new_connections_burst,
         );
         self.quic_config = Self::build_quic_config(&self.config)?;
         self.runtime_generation = runtime.generation;

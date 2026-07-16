@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use spooky_config::config::Upstream;
+use spooky_config::{
+    config::Upstream,
+    runtime::{RuntimeRouteHostPattern, RuntimeUpstream},
+};
 
 use crate::routing::{
     decision::{RouteDecision, RouteDecisionReason, RoutePreference},
@@ -20,59 +23,90 @@ pub struct RouteIndex {
 
 impl RouteIndex {
     pub fn from_upstreams(upstreams: &HashMap<String, Upstream>) -> Self {
+        let mut ordered: Vec<(&String, &Upstream)> = upstreams.iter().collect();
+        ordered.sort_by_key(|(left, _)| *left);
+        Self::from_ordered_routes(ordered.into_iter().enumerate().map(
+            |(order, (name, upstream))| {
+                IndexedRouteSource {
+                    name: name.clone(),
+                    method: upstream
+                        .route
+                        .method
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(|value| value.to_ascii_uppercase()),
+                    path_prefix: upstream.route.path_prefix.clone(),
+                    path_len: upstream
+                        .route
+                        .path_prefix
+                        .as_ref()
+                        .map(|prefix| prefix.len())
+                        .unwrap_or(0),
+                    host_specific: upstream.route.host.is_some(),
+                    method_specific: upstream.route.method.is_some(),
+                    host_pattern: upstream
+                        .route
+                        .host
+                        .as_deref()
+                        .and_then(parse_configured_host_pattern)
+                        .map(RuntimeRouteHostPattern::from),
+                    order,
+                }
+            },
+        ))
+    }
+
+    pub fn from_runtime_upstreams(upstreams: &HashMap<String, RuntimeUpstream>) -> Self {
+        let mut ordered: Vec<(&String, &RuntimeUpstream)> = upstreams.iter().collect();
+        ordered.sort_by_key(|(left, _)| *left);
+        Self::from_ordered_routes(ordered.into_iter().enumerate().map(
+            |(order, (name, upstream))| IndexedRouteSource {
+                name: name.clone(),
+                method: upstream.route.method.clone(),
+                path_prefix: upstream.route.path_prefix.clone(),
+                path_len: upstream.route.path_len,
+                host_specific: upstream.route.host_specific,
+                method_specific: upstream.route.method_specific,
+                host_pattern: upstream.route.host_pattern.clone(),
+                order,
+            },
+        ))
+    }
+
+    fn from_ordered_routes(routes: impl IntoIterator<Item = IndexedRouteSource>) -> Self {
         let mut host_tries = HashMap::new();
         let mut wildcard_host_tries = HashMap::new();
         let mut default_trie = RouteTrie::default();
         let mut default_max_path_len = 0usize;
-        let mut upstream_names = Vec::with_capacity(upstreams.len());
-        let mut upstream_methods = Vec::with_capacity(upstreams.len());
-        // Build a stable route list first. This keeps tie-breaking deterministic even if
-        // upstreams came from a map with non-deterministic iteration order.
-        let mut ordered: Vec<(&String, &Upstream)> = upstreams.iter().collect();
-        ordered.sort_by_key(|(left, _)| *left);
-
-        for (order, (name, upstream)) in ordered.into_iter().enumerate() {
+        let mut upstream_names = Vec::new();
+        let mut upstream_methods = Vec::new();
+        for route_source in routes {
+            let path_prefix = route_source.path_prefix.as_deref();
             let upstream_idx = upstream_names.len();
-            upstream_names.push(name.clone());
-            upstream_methods.push(
-                upstream
-                    .route
-                    .method
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(|value| value.to_ascii_uppercase()),
-            );
-            let path_len = upstream
-                .route
-                .path_prefix
-                .as_ref()
-                .map(|prefix| prefix.len())
-                .unwrap_or(0);
+            upstream_names.push(route_source.name);
+            upstream_methods.push(route_source.method);
 
             let route = IndexedRoute {
                 upstream_idx,
-                path_len,
-                host_specific: upstream.route.host.is_some(),
-                method_specific: upstream.route.method.is_some(),
-                order,
+                path_len: route_source.path_len,
+                host_specific: route_source.host_specific,
+                method_specific: route_source.method_specific,
+                order: route_source.order,
             };
 
-            match upstream.route.host.as_deref() {
-                Some(host) => match parse_configured_host_pattern(host) {
-                    Some(ConfiguredHostPattern::WildcardSuffix(suffix)) => wildcard_host_tries
-                        .entry(suffix)
-                        .or_insert_with(RouteTrie::default)
-                        .insert(upstream.route.path_prefix.as_deref(), route),
-                    Some(ConfiguredHostPattern::Exact(normalized_host)) => host_tries
-                        .entry(normalized_host)
-                        .or_insert_with(RouteTrie::default)
-                        .insert(upstream.route.path_prefix.as_deref(), route),
-                    None => {}
-                },
+            match route_source.host_pattern {
+                Some(RuntimeRouteHostPattern::WildcardSuffix(suffix)) => wildcard_host_tries
+                    .entry(suffix)
+                    .or_insert_with(RouteTrie::default)
+                    .insert(path_prefix, route),
+                Some(RuntimeRouteHostPattern::Exact(normalized_host)) => host_tries
+                    .entry(normalized_host)
+                    .or_insert_with(RouteTrie::default)
+                    .insert(path_prefix, route),
                 None => {
-                    default_max_path_len = default_max_path_len.max(path_len);
-                    default_trie.insert(upstream.route.path_prefix.as_deref(), route);
+                    default_max_path_len = default_max_path_len.max(route_source.path_len);
+                    default_trie.insert(path_prefix, route);
                 }
             }
         }
@@ -288,5 +322,25 @@ impl RouteIndex {
         }
 
         prefer_host_lookup_result(wildcard_best, exact_best)
+    }
+}
+
+struct IndexedRouteSource {
+    name: String,
+    method: Option<String>,
+    path_prefix: Option<String>,
+    path_len: usize,
+    host_specific: bool,
+    method_specific: bool,
+    host_pattern: Option<RuntimeRouteHostPattern>,
+    order: usize,
+}
+
+impl From<ConfiguredHostPattern> for RuntimeRouteHostPattern {
+    fn from(value: ConfiguredHostPattern) -> Self {
+        match value {
+            ConfiguredHostPattern::Exact(host) => Self::Exact(host),
+            ConfiguredHostPattern::WildcardSuffix(suffix) => Self::WildcardSuffix(suffix),
+        }
     }
 }

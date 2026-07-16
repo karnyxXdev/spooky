@@ -181,14 +181,18 @@ impl QUICListener {
         runtime_bundle: Option<Arc<RuntimeBundleHandle>>,
         shutdown_signal: Option<Arc<AtomicBool>>,
     ) -> Result<(), ProxyError> {
+        let transport_policy = &config.policies.transport;
+        let timeout_policy = &config.policies.timeouts;
         let bind = format!(
             "{}:{}",
             config.listen.listen.address, config.listen.listen.port
         );
         let alt_svc_value = format!("h3=\":{}\"; ma=86400", config.listen.listen.port);
-        let max_connections = config.performance.max_active_connections.max(1);
-        let connection_timeout =
-            Duration::from_millis(config.performance.client_body_idle_timeout_ms.max(1));
+        let max_connections = transport_policy
+            .connection_limits
+            .max_active_connections
+            .max(1);
+        let connection_timeout = timeout_policy.client_body_idle;
         let listener_label = Self::listener_label(config);
         shared_state
             .listener_tls_store
@@ -1569,16 +1573,16 @@ impl QUICListener {
 
         Some(BootstrapConnectionState {
             alt_svc_value: format!("h3=\":{}\"; ma=86400", listener_config.listen.listen.port),
-            backend_timeout: Duration::from_millis(listener_config.performance.backend_timeout_ms),
-            max_request_body_bytes: listener_config.performance.max_request_body_bytes,
-            max_response_body_bytes: listener_config.performance.max_response_body_bytes,
-            max_connections: listener_config.performance.max_active_connections.max(1),
-            connection_timeout: Duration::from_millis(
-                listener_config
-                    .performance
-                    .client_body_idle_timeout_ms
-                    .max(1),
-            ),
+            backend_timeout: listener_config.policies.timeouts.backend_request,
+            max_request_body_bytes: listener_config.policies.transport.max_request_body_bytes,
+            max_response_body_bytes: listener_config.policies.transport.max_response_body_bytes,
+            max_connections: listener_config
+                .policies
+                .transport
+                .connection_limits
+                .max_active_connections
+                .max(1),
+            connection_timeout: listener_config.policies.timeouts.client_body_idle,
             listener_tls_store,
             transport_pool,
             backend_endpoints,

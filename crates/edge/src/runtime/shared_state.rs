@@ -5,7 +5,7 @@ use std::{
 
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
-    runtime::{ListenerRuntimeConfig, RuntimeUpstreamPolicy},
+    runtime::{ListenerRuntimeConfig, RuntimeBackendHealthCheck, RuntimeUpstreamPolicy},
 };
 use spooky_lb::upstream_pool::UpstreamPool;
 use spooky_transport::{h2_client::SharedDnsResolver, transport_pool::UpstreamTransportPool};
@@ -27,6 +27,7 @@ pub struct SharedRuntimeState {
     pub(crate) listener_tls_store: Arc<ListenerTlsReloadStore>,
     pub(crate) transport_pool: Arc<UpstreamTransportPool>,
     pub(crate) backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+    pub(crate) backend_health_checks: Arc<HashMap<String, RuntimeBackendHealthCheck>>,
     pub(crate) backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
     pub(crate) backend_dns_resolver: SharedDnsResolver,
     pub(crate) upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,

@@ -1071,14 +1071,21 @@ impl QUICListener {
                                                     &backend_addr,
                                                     &classified,
                                                 );
-                                                Self::mark_classified_upstream_health_failure(
-                                                    "bootstrap",
-                                                    &backend_addr,
-                                                    backend_index,
-                                                    Some(&upstream_pool),
-                                                    metrics.as_ref(),
-                                                    &classified,
-                                                );
+                                                if let Some(transition) = crate::runtime::connection::outcome::observe_classified_backend_failure(
+                                                    crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
+                                                        metrics_phase: "bootstrap",
+                                                        backend_addr: &backend_addr,
+                                                        backend_index,
+                                                        upstream_pool: Some(&upstream_pool),
+                                                        metrics: metrics.as_ref(),
+                                                        classified: &classified,
+                                                    },
+                                                ) {
+                                                    crate::runtime::connection::outcome::log_backend_health_transition(
+                                                        &backend_addr,
+                                                        transition,
+                                                    );
+                                                }
                                             } else {
                                                 warn!(
                                                     "Bootstrap WebSocket upstream error route={} backend={}: {}",
@@ -1121,14 +1128,21 @@ impl QUICListener {
                                                     &backend_addr,
                                                     &classified,
                                                 );
-                                                Self::mark_classified_upstream_health_failure(
-                                                    "bootstrap",
-                                                    &backend_addr,
-                                                    backend_index,
-                                                    Some(&upstream_pool),
-                                                    metrics.as_ref(),
-                                                    &classified,
-                                                );
+                                                if let Some(transition) = crate::runtime::connection::outcome::observe_classified_backend_failure(
+                                                    crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
+                                                        metrics_phase: "bootstrap",
+                                                        backend_addr: &backend_addr,
+                                                        backend_index,
+                                                        upstream_pool: Some(&upstream_pool),
+                                                        metrics: metrics.as_ref(),
+                                                        classified: &classified,
+                                                    },
+                                                ) {
+                                                    crate::runtime::connection::outcome::log_backend_health_transition(
+                                                        &backend_addr,
+                                                        transition,
+                                                    );
+                                                }
                                             }
                                             return Ok(Response::builder()
                                                 .status(StatusCode::GATEWAY_TIMEOUT)
@@ -1176,14 +1190,21 @@ impl QUICListener {
                                                     &backend_addr,
                                                     &classified,
                                                 );
-                                                Self::mark_classified_upstream_health_failure(
-                                                    "bootstrap",
-                                                    &backend_addr,
-                                                    backend_index,
-                                                    Some(&upstream_pool),
-                                                    metrics.as_ref(),
-                                                    &classified,
-                                                );
+                                                if let Some(transition) = crate::runtime::connection::outcome::observe_classified_backend_failure(
+                                                    crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
+                                                        metrics_phase: "bootstrap",
+                                                        backend_addr: &backend_addr,
+                                                        backend_index,
+                                                        upstream_pool: Some(&upstream_pool),
+                                                        metrics: metrics.as_ref(),
+                                                        classified: &classified,
+                                                    },
+                                                ) {
+                                                    crate::runtime::connection::outcome::log_backend_health_transition(
+                                                        &backend_addr,
+                                                        transition,
+                                                    );
+                                                }
                                             } else {
                                                 warn!(
                                                     "Bootstrap proxy upstream error route={} backend={}: {}",
@@ -1226,14 +1247,21 @@ impl QUICListener {
                                                     &backend_addr,
                                                     &classified,
                                                 );
-                                                Self::mark_classified_upstream_health_failure(
-                                                    "bootstrap",
-                                                    &backend_addr,
-                                                    backend_index,
-                                                    Some(&upstream_pool),
-                                                    metrics.as_ref(),
-                                                    &classified,
-                                                );
+                                                if let Some(transition) = crate::runtime::connection::outcome::observe_classified_backend_failure(
+                                                    crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
+                                                        metrics_phase: "bootstrap",
+                                                        backend_addr: &backend_addr,
+                                                        backend_index,
+                                                        upstream_pool: Some(&upstream_pool),
+                                                        metrics: metrics.as_ref(),
+                                                        classified: &classified,
+                                                    },
+                                                ) {
+                                                    crate::runtime::connection::outcome::log_backend_health_transition(
+                                                        &backend_addr,
+                                                        transition,
+                                                    );
+                                                }
                                             }
                                             return Ok(Response::builder()
                                                 .status(StatusCode::GATEWAY_TIMEOUT)
@@ -1355,7 +1383,10 @@ impl QUICListener {
                                         status,
                                     },
                                 ) {
-                                    Self::log_health_transition(&backend_addr, transition);
+                                    crate::runtime::connection::outcome::log_backend_health_transition(
+                                        &backend_addr,
+                                        transition,
+                                    );
                                 }
                                 let mut resp_builder =
                                     Response::builder().status(normalized_response.head.status);

@@ -2,8 +2,7 @@ use spooky_config::runtime::RuntimeUpstreamPolicy;
 
 use super::{lb_key::ResolvedLbKey, *};
 use crate::runtime::connection::outcome::{
-    OutcomeRouteTarget, RequestMetricsObservation, classify_proxy_error_outcome,
-    record_request_metrics_observation,
+    OutcomeRouteTarget, observe_proxy_error_outcome,
 };
 
 pub(in crate::quic_listener) struct RouteResolutionRequest<'a> {
@@ -152,17 +151,14 @@ impl QUICListener {
         metrics: &Metrics,
         elapsed: Duration,
     ) {
-        let observation = classify_proxy_error_outcome(err, None);
-        record_request_metrics_observation(
+        let _ = observe_proxy_error_outcome(
             metrics,
-            RequestMetricsObservation {
-                route_target: OutcomeRouteTarget::UNROUTED,
-                backend_target: None,
-                elapsed,
-                status: None,
-                metrics_outcome: observation.route_outcome.as_metrics_outcome(),
-                overload_reason: observation.overload_reason,
-            },
+            OutcomeRouteTarget::UNROUTED,
+            None,
+            elapsed,
+            None,
+            err,
+            None,
         );
         Self::log_route_resolution_failure(request, err);
     }

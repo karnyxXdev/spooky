@@ -786,20 +786,15 @@ impl QUICListener {
                                     },
                                 );
                                 if let Some(t) = transition {
-                                    Self::log_health_transition(addr, t);
+                                    crate::runtime::connection::outcome::log_backend_health_transition(addr, t);
                                 }
                             }
-                            let (is_success, route_outcome) =
-                                Self::request_metrics_outcome_for_status(status);
-                            if is_success {
-                                metrics.inc_success();
-                            }
-                            Self::record_request_observation(
+                            let _ = crate::runtime::connection::outcome::observe_status_outcome(
                                 metrics,
-                                req,
-                                Some(status.as_u16()),
-                                route_outcome,
-                                None,
+                                Self::request_outcome_route_target(req),
+                                Self::request_outcome_backend_target(req),
+                                req.start.elapsed(),
+                                status,
                             );
                             resilience
                                 .adaptive_admission

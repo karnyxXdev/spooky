@@ -55,9 +55,7 @@ use spooky_config::{
     },
 };
 use spooky_errors::{PoolError, ProxyError};
-use spooky_lb::{
-    backend::HealthTransition, health::HealthFailureReason, upstream_pool::UpstreamPool,
-};
+use spooky_lb::{health::HealthFailureReason, upstream_pool::UpstreamPool};
 use spooky_transport::{
     h2_client::{SharedDnsResolver, TlsClientConfig},
     transport_pool::{BackendTransportKind, UpstreamTransportPool},

@@ -137,14 +137,21 @@ impl QUICListener {
                                         &job.backend_identity,
                                         &classified,
                                     );
-                                    Self::mark_classified_upstream_health_failure(
-                                        "health_check",
-                                        &job.backend_identity,
-                                        job.index,
-                                        Some(&job.upstream_pool),
-                                        task_metrics.as_ref(),
-                                        &classified,
-                                    );
+                                    if let Some(transition) = crate::runtime::connection::outcome::observe_classified_backend_failure(
+                                        crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
+                                            metrics_phase: "health_check",
+                                            backend_addr: &job.backend_identity,
+                                            backend_index: job.index,
+                                            upstream_pool: Some(&job.upstream_pool),
+                                            metrics: task_metrics.as_ref(),
+                                            classified: &classified,
+                                        },
+                                    ) {
+                                        crate::runtime::connection::outcome::log_backend_health_transition(
+                                            &job.backend_identity,
+                                            transition,
+                                        );
+                                    }
                                     HealthClassification::Failure
                                 }
                                 Ok(Err(pool_err)) => {
@@ -159,14 +166,21 @@ impl QUICListener {
                                             &job.backend_identity,
                                             &classified,
                                         );
-                                        Self::mark_classified_upstream_health_failure(
-                                            "health_check",
-                                            &job.backend_identity,
-                                            job.index,
-                                            Some(&job.upstream_pool),
-                                            task_metrics.as_ref(),
-                                            &classified,
-                                        );
+                                        if let Some(transition) = crate::runtime::connection::outcome::observe_classified_backend_failure(
+                                            crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
+                                                metrics_phase: "health_check",
+                                                backend_addr: &job.backend_identity,
+                                                backend_index: job.index,
+                                                upstream_pool: Some(&job.upstream_pool),
+                                                metrics: task_metrics.as_ref(),
+                                                classified: &classified,
+                                            },
+                                        ) {
+                                            crate::runtime::connection::outcome::log_backend_health_transition(
+                                                &job.backend_identity,
+                                                transition,
+                                            );
+                                        }
                                     } else {
                                         task_metrics
                                             .inc_health_failure(HealthFailureReason::Transport);
@@ -184,14 +198,21 @@ impl QUICListener {
                                             &job.backend_identity,
                                             &classified,
                                         );
-                                        Self::mark_classified_upstream_health_failure(
-                                            "health_check",
-                                            &job.backend_identity,
-                                            job.index,
-                                            Some(&job.upstream_pool),
-                                            task_metrics.as_ref(),
-                                            &classified,
-                                        );
+                                        if let Some(transition) = crate::runtime::connection::outcome::observe_classified_backend_failure(
+                                            crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
+                                                metrics_phase: "health_check",
+                                                backend_addr: &job.backend_identity,
+                                                backend_index: job.index,
+                                                upstream_pool: Some(&job.upstream_pool),
+                                                metrics: task_metrics.as_ref(),
+                                                classified: &classified,
+                                            },
+                                        ) {
+                                            crate::runtime::connection::outcome::log_backend_health_transition(
+                                                &job.backend_identity,
+                                                transition,
+                                            );
+                                        }
                                     } else {
                                         task_metrics
                                             .inc_health_failure(HealthFailureReason::Timeout);
@@ -226,7 +247,10 @@ impl QUICListener {
                             job.next_due_at = Instant::now() + Duration::from_millis(delay_ms);
 
                             if let Some(transition) = transition {
-                                Self::log_health_transition(&job.backend_identity, transition);
+                                crate::runtime::connection::outcome::log_backend_health_transition(
+                                    &job.backend_identity,
+                                    transition,
+                                );
                             }
                         }
                     }

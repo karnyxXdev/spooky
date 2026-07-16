@@ -18,12 +18,9 @@ pub(in crate::quic_listener) use self::resolve::RouteResolutionRequest as TestRo
 use super::*;
 use crate::runtime::connection::{
     outcome::{
-        BackendRequestFinishInput, ClassifiedBackendFailureInput,
-        OutcomeBackendTarget, OutcomeRouteTarget, RequestMetricsObservation,
-        classify_status_outcome, finish_backend_request_accounting,
-        log_backend_health_transition, observe_classified_backend_failure,
-        observe_admission_outcome, observe_proxy_error_outcome,
-        record_request_metrics_observation,
+        BackendRequestFinishInput, OutcomeBackendTarget, OutcomeRouteTarget,
+        finish_backend_request_accounting, observe_admission_outcome,
+        observe_proxy_error_outcome,
     },
     request::PendingForward,
     stream::StreamAdmissionState,
@@ -127,38 +124,10 @@ impl QUICListener {
         }
     }
 
-    pub(super) fn mark_classified_upstream_health_failure(
-        metrics_phase: &str,
-        backend_addr: &str,
-        backend_index: usize,
-        upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
-        metrics: &Metrics,
-        classified: &ClassifiedUpstreamProxyError,
-    ) {
-        if let Some(transition) = observe_classified_backend_failure(ClassifiedBackendFailureInput {
-            metrics_phase,
-            backend_addr,
-            backend_index,
-            upstream_pool,
-            metrics,
-            classified,
-        }) {
-            Self::log_health_transition(backend_addr, transition);
-        }
-    }
-
     fn is_internal_pool_control_error(error: &PoolError) -> bool {
         matches!(
             error,
             PoolError::InflightLimiterClosed | PoolError::UnknownBackend(_)
-        )
-    }
-
-    fn request_metrics_outcome_for_status(status: StatusCode) -> (bool, RouteOutcome) {
-        let decision = classify_status_outcome(status);
-        (
-            matches!(decision.route_outcome, crate::runtime::connection::outcome::CanonicalRouteOutcome::Success),
-            decision.route_outcome.as_metrics_outcome(),
         )
     }
 
@@ -246,30 +215,18 @@ impl QUICListener {
         }
     }
 
-    fn record_request_observation(
-        metrics: &Metrics,
-        req: &RequestEnvelope,
-        status: Option<u16>,
-        outcome: RouteOutcome,
-        overload_reason: Option<OverloadShedReason>,
-    ) {
-        record_request_metrics_observation(
-            metrics,
-            RequestMetricsObservation {
-                route_target: OutcomeRouteTarget {
-                    route: req.upstream_name.as_deref().unwrap_or("unrouted"),
-                },
-                backend_target: Some(OutcomeBackendTarget {
-                    upstream: req.upstream_name.as_deref().unwrap_or("unrouted"),
-                    backend_addr: req.backend_addr.as_deref(),
-                    backend_index: req.backend_index,
-                }),
-                elapsed: req.start.elapsed(),
-                status,
-                metrics_outcome: outcome,
-                overload_reason,
-            },
-        );
+    fn request_outcome_route_target(req: &RequestEnvelope) -> OutcomeRouteTarget<'_> {
+        OutcomeRouteTarget {
+            route: req.upstream_name.as_deref().unwrap_or("unrouted"),
+        }
+    }
+
+    fn request_outcome_backend_target(req: &RequestEnvelope) -> Option<OutcomeBackendTarget<'_>> {
+        req.upstream_name.as_deref().map(|upstream| OutcomeBackendTarget {
+            upstream,
+            backend_addr: req.backend_addr.as_deref(),
+            backend_index: req.backend_index,
+        })
     }
 
     fn materialize_forward_after_auth(
@@ -621,9 +578,6 @@ impl QUICListener {
         }
     }
 
-    pub(crate) fn log_health_transition(addr: &str, transition: HealthTransition) {
-        log_backend_health_transition(addr, transition);
-    }
 }
 
 impl QUICListener {
@@ -1399,28 +1353,6 @@ mod tests {
             spooky_errors::classify_upstream_error_detail("request timed out", false),
             spooky_errors::UpstreamErrorClassification::timeout()
         );
-    }
-
-    #[test]
-    fn request_metrics_treat_server_error_as_failure() {
-        let (is_success, route_outcome) =
-            QUICListener::request_metrics_outcome_for_status(StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(!is_success);
-        match route_outcome {
-            RouteOutcome::Failure => {}
-            _ => panic!("unexpected route outcome"),
-        }
-    }
-
-    #[test]
-    fn request_metrics_treat_success_response_as_success() {
-        let (is_success, route_outcome) =
-            QUICListener::request_metrics_outcome_for_status(StatusCode::OK);
-        assert!(is_success);
-        match route_outcome {
-            RouteOutcome::Success => {}
-            _ => panic!("unexpected route outcome"),
-        }
     }
 
     #[test]

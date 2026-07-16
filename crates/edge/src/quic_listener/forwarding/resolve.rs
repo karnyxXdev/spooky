@@ -1,9 +1,7 @@
 use spooky_config::runtime::RuntimeUpstreamPolicy;
 
 use super::{lb_key::ResolvedLbKey, *};
-use crate::runtime::connection::outcome::{
-    OutcomeRouteTarget, observe_proxy_error_outcome,
-};
+use crate::runtime::connection::outcome::{OutcomeRouteTarget, observe_proxy_error_outcome};
 
 pub(in crate::quic_listener) struct RouteResolutionRequest<'a> {
     pub(in crate::quic_listener) method: &'a str,

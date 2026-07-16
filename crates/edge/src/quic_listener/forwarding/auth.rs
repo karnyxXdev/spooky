@@ -17,8 +17,7 @@ use crate::runtime::connection::{
         validate_oidc_provider_metadata,
     },
     outcome::{
-        AdmissionOutcomeClass, OutcomeBackendTarget, OutcomeRouteTarget,
-        observe_admission_outcome,
+        AdmissionOutcomeClass, OutcomeBackendTarget, OutcomeRouteTarget, observe_admission_outcome,
     },
     request::PendingForward,
     stream::StreamAdmissionState,

@@ -94,13 +94,12 @@ impl QUICListener {
                 )
             }
             Err(ProxyError::Pool(PoolError::BackendOverloaded(reason))) => {
-                let overload_reason =
-                    if is_unknown_length_response_prebuffer_reason(&reason) {
-                        metrics.inc_response_prebuffer_limit_reject();
-                        OverloadShedReason::ResponsePrebufferCap
-                    } else {
-                        OverloadShedReason::BackendInflight
-                    };
+                let overload_reason = if is_unknown_length_response_prebuffer_reason(&reason) {
+                    metrics.inc_response_prebuffer_limit_reject();
+                    OverloadShedReason::ResponsePrebufferCap
+                } else {
+                    OverloadShedReason::BackendInflight
+                };
                 let overload_error = ProxyError::Pool(PoolError::BackendOverloaded(reason));
                 let _ = crate::runtime::connection::outcome::observe_proxy_error_outcome(
                     metrics,
@@ -203,16 +202,18 @@ impl QUICListener {
                     backend_addr,
                     &classified,
                 );
-                if let Some(transition) = crate::runtime::connection::outcome::observe_classified_backend_failure(
-                    crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
-                        metrics_phase: "data_plane",
-                        backend_addr,
-                        backend_index,
-                        upstream_pool: upstream_pool.as_ref(),
-                        metrics,
-                        classified: &classified,
-                    },
-                ) {
+                if let Some(transition) =
+                    crate::runtime::connection::outcome::observe_classified_backend_failure(
+                        crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
+                            metrics_phase: "data_plane",
+                            backend_addr,
+                            backend_index,
+                            upstream_pool: upstream_pool.as_ref(),
+                            metrics,
+                            classified: &classified,
+                        },
+                    )
+                {
                     crate::runtime::connection::outcome::log_backend_health_transition(
                         backend_addr,
                         transition,
@@ -686,17 +687,18 @@ impl QUICListener {
                     match err {
                         ProxyError::Timeout => {
                             metrics.inc_timeout();
-                            let _ = crate::runtime::connection::outcome::observe_proxy_error_outcome(
-                                metrics,
-                                Self::request_outcome_route_target(req),
-                                Self::request_outcome_backend_target(req),
-                                req.start.elapsed(),
-                                req.response_status
-                                    .and_then(|status| http::StatusCode::from_u16(status).ok())
-                                    .or(Some(http::StatusCode::SERVICE_UNAVAILABLE)),
-                                &err,
-                                None,
-                            );
+                            let _ =
+                                crate::runtime::connection::outcome::observe_proxy_error_outcome(
+                                    metrics,
+                                    Self::request_outcome_route_target(req),
+                                    Self::request_outcome_backend_target(req),
+                                    req.start.elapsed(),
+                                    req.response_status
+                                        .and_then(|status| http::StatusCode::from_u16(status).ok())
+                                        .or(Some(http::StatusCode::SERVICE_UNAVAILABLE)),
+                                    &err,
+                                    None,
+                                );
                             resilience
                                 .adaptive_admission
                                 .observe(req.start.elapsed(), true);
@@ -716,17 +718,18 @@ impl QUICListener {
                                 };
                             let overload_error =
                                 ProxyError::Pool(PoolError::BackendOverloaded(reason.clone()));
-                            let _ = crate::runtime::connection::outcome::observe_proxy_error_outcome(
-                                metrics,
-                                Self::request_outcome_route_target(req),
-                                Self::request_outcome_backend_target(req),
-                                req.start.elapsed(),
-                                req.response_status
-                                    .and_then(|status| http::StatusCode::from_u16(status).ok())
-                                    .or(Some(http::StatusCode::SERVICE_UNAVAILABLE)),
-                                &overload_error,
-                                Some(overload_reason),
-                            );
+                            let _ =
+                                crate::runtime::connection::outcome::observe_proxy_error_outcome(
+                                    metrics,
+                                    Self::request_outcome_route_target(req),
+                                    Self::request_outcome_backend_target(req),
+                                    req.start.elapsed(),
+                                    req.response_status
+                                        .and_then(|status| http::StatusCode::from_u16(status).ok())
+                                        .or(Some(http::StatusCode::SERVICE_UNAVAILABLE)),
+                                    &overload_error,
+                                    Some(overload_reason),
+                                );
                             resilience
                                 .adaptive_admission
                                 .observe(req.start.elapsed(), true);
@@ -738,17 +741,18 @@ impl QUICListener {
                         }
                         _ => {
                             metrics.inc_backend_error();
-                            let _ = crate::runtime::connection::outcome::observe_proxy_error_outcome(
-                                metrics,
-                                Self::request_outcome_route_target(req),
-                                Self::request_outcome_backend_target(req),
-                                req.start.elapsed(),
-                                req.response_status
-                                    .and_then(|status| http::StatusCode::from_u16(status).ok())
-                                    .or(Some(http::StatusCode::BAD_GATEWAY)),
-                                &err,
-                                None,
-                            );
+                            let _ =
+                                crate::runtime::connection::outcome::observe_proxy_error_outcome(
+                                    metrics,
+                                    Self::request_outcome_route_target(req),
+                                    Self::request_outcome_backend_target(req),
+                                    req.start.elapsed(),
+                                    req.response_status
+                                        .and_then(|status| http::StatusCode::from_u16(status).ok())
+                                        .or(Some(http::StatusCode::BAD_GATEWAY)),
+                                    &err,
+                                    None,
+                                );
                             resilience
                                 .adaptive_admission
                                 .observe(req.start.elapsed(), true);

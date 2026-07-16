@@ -19,8 +19,7 @@ use super::*;
 use crate::runtime::connection::{
     outcome::{
         BackendRequestFinishInput, OutcomeBackendTarget, OutcomeRouteTarget,
-        finish_backend_request_accounting, observe_admission_outcome,
-        observe_proxy_error_outcome,
+        finish_backend_request_accounting, observe_admission_outcome, observe_proxy_error_outcome,
     },
     request::PendingForward,
     stream::StreamAdmissionState,
@@ -222,11 +221,13 @@ impl QUICListener {
     }
 
     fn request_outcome_backend_target(req: &RequestEnvelope) -> Option<OutcomeBackendTarget<'_>> {
-        req.upstream_name.as_deref().map(|upstream| OutcomeBackendTarget {
-            upstream,
-            backend_addr: req.backend_addr.as_deref(),
-            backend_index: req.backend_index,
-        })
+        req.upstream_name
+            .as_deref()
+            .map(|upstream| OutcomeBackendTarget {
+                upstream,
+                backend_addr: req.backend_addr.as_deref(),
+                backend_index: req.backend_index,
+            })
     }
 
     fn materialize_forward_after_auth(
@@ -577,7 +578,6 @@ impl QUICListener {
             debug!("Sent {} packets", packet_count);
         }
     }
-
 }
 
 impl QUICListener {
@@ -1015,7 +1015,9 @@ impl QUICListener {
                             if let Some((route_label, elapsed)) = reject_body_for_bodyless {
                                 let _ = observe_proxy_error_outcome(
                                     &metrics,
-                                    OutcomeRouteTarget { route: &route_label },
+                                    OutcomeRouteTarget {
+                                        route: &route_label,
+                                    },
                                     None,
                                     elapsed,
                                     Some(http::StatusCode::BAD_REQUEST),
@@ -1039,7 +1041,9 @@ impl QUICListener {
                             if let Some((route_label, elapsed)) = payload_too_large {
                                 let _ = observe_proxy_error_outcome(
                                     &metrics,
-                                    OutcomeRouteTarget { route: &route_label },
+                                    OutcomeRouteTarget {
+                                        route: &route_label,
+                                    },
                                     None,
                                     elapsed,
                                     Some(http::StatusCode::PAYLOAD_TOO_LARGE),
@@ -1069,7 +1073,10 @@ impl QUICListener {
                                         route: req.upstream_name.as_deref().unwrap_or("unrouted"),
                                     },
                                     Some(OutcomeBackendTarget {
-                                        upstream: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                                        upstream: req
+                                            .upstream_name
+                                            .as_deref()
+                                            .unwrap_or("unrouted"),
                                         backend_addr: req.backend_addr.as_deref(),
                                         backend_index: req.backend_index,
                                     }),
@@ -1113,7 +1120,10 @@ impl QUICListener {
                                         route: req.upstream_name.as_deref().unwrap_or("unrouted"),
                                     },
                                     Some(OutcomeBackendTarget {
-                                        upstream: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                                        upstream: req
+                                            .upstream_name
+                                            .as_deref()
+                                            .unwrap_or("unrouted"),
                                         backend_addr: req.backend_addr.as_deref(),
                                         backend_index: req.backend_index,
                                     }),

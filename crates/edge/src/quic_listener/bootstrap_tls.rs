@@ -58,16 +58,19 @@ use crate::{
     runtime::{
         backend::store::RuntimeBackendResolutionStore,
         bundle::RuntimeBundleHandle,
-        connection::guardrails::{
-            BodyLimitKind, REQUEST_BODY_TOO_LARGE_BODY, RESPONSE_BODY_TOO_LARGE_BODY,
-            RequestBodyGuardrailConfig, RequestBodyGuardrailDecision, RequestBodyGuardrailInput,
-            ResponseBodyGuardrailConfig, ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput,
-            checked_request_body_ingress, checked_response_body_guardrails,
-        },
-        connection::outcome::{
-            AdmissionOutcomeClass, OutcomeBackendTarget, OutcomeRouteTarget,
-            observe_admission_outcome, observe_backend_response_status,
-            observe_proxy_error_outcome, observe_status_outcome,
+        connection::{
+            guardrails::{
+                BodyLimitKind, REQUEST_BODY_TOO_LARGE_BODY, RESPONSE_BODY_TOO_LARGE_BODY,
+                RequestBodyGuardrailConfig, RequestBodyGuardrailDecision,
+                RequestBodyGuardrailInput, ResponseBodyGuardrailConfig,
+                ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput,
+                checked_request_body_ingress, checked_response_body_guardrails,
+            },
+            outcome::{
+                AdmissionOutcomeClass, OutcomeBackendTarget, OutcomeRouteTarget,
+                observe_admission_outcome, observe_backend_response_status,
+                observe_proxy_error_outcome, observe_status_outcome,
+            },
         },
         shared_state::SharedRuntimeState,
         tls::store::ListenerTlsReloadStore,
@@ -1347,9 +1350,11 @@ impl QUICListener {
                                         )),
                                         request_start.elapsed(),
                                         Some(StatusCode::SERVICE_UNAVAILABLE),
-                                        &ProxyError::Pool(spooky_errors::PoolError::BackendOverloaded(
-                                            "response prebuffer cap".into(),
-                                        )),
+                                        &ProxyError::Pool(
+                                            spooky_errors::PoolError::BackendOverloaded(
+                                                "response prebuffer cap".into(),
+                                            ),
+                                        ),
                                         Some(crate::OverloadShedReason::ResponsePrebufferCap),
                                     );
                                     return Ok(Response::builder()

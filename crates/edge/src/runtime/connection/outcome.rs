@@ -101,12 +101,8 @@ pub(crate) struct RequestMetricsObservation<'a> {
 pub(crate) enum AdmissionOutcomeClass {
     AuthDenied,
     RateLimited,
-    OverloadShed {
-        reason: Option<OverloadShedReason>,
-    },
-    Failed {
-        timed_out: bool,
-    },
+    OverloadShed { reason: Option<OverloadShedReason> },
+    Failed { timed_out: bool },
 }
 
 impl CanonicalRouteOutcome {
@@ -182,9 +178,10 @@ pub(crate) fn classify_proxy_error_outcome(
             (CanonicalRouteOutcome::OverloadShed, HealthEffectHint::None)
         }
         ProxyError::Pool(PoolError::InflightLimiterClosed)
-        | ProxyError::Pool(PoolError::UnknownBackend(_)) => {
-            (CanonicalRouteOutcome::UpstreamFailure, HealthEffectHint::None)
-        }
+        | ProxyError::Pool(PoolError::UnknownBackend(_)) => (
+            CanonicalRouteOutcome::UpstreamFailure,
+            HealthEffectHint::None,
+        ),
         ProxyError::Pool(PoolError::Send(_)) => (
             CanonicalRouteOutcome::UpstreamFailure,
             HealthEffectHint::Failure {
@@ -197,8 +194,14 @@ pub(crate) fn classify_proxy_error_outcome(
                 reason: HealthFailureReason::Transport,
             },
         ),
-        ProxyError::Tls(_) => (CanonicalRouteOutcome::UpstreamFailure, HealthEffectHint::None),
-        ProxyError::Bridge(_) => (CanonicalRouteOutcome::UpstreamFailure, HealthEffectHint::None),
+        ProxyError::Tls(_) => (
+            CanonicalRouteOutcome::UpstreamFailure,
+            HealthEffectHint::None,
+        ),
+        ProxyError::Bridge(_) => (
+            CanonicalRouteOutcome::UpstreamFailure,
+            HealthEffectHint::None,
+        ),
     };
 
     RequestOutcomeDecision {
@@ -404,11 +407,12 @@ pub(crate) fn observe_backend_response_status(
     let pool = upstream_pool?;
     let mut pool = pool.write().ok()?;
     match outcome_from_status(status) {
-        crate::runtime::health::HealthClassification::Success => pool.pool.mark_success(backend_index),
-        crate::runtime::health::HealthClassification::Failure => {
-            pool.pool
-                .mark_request_failure(backend_index, HealthFailureReason::HttpStatus5xx)
+        crate::runtime::health::HealthClassification::Success => {
+            pool.pool.mark_success(backend_index)
         }
+        crate::runtime::health::HealthClassification::Failure => pool
+            .pool
+            .mark_request_failure(backend_index, HealthFailureReason::HttpStatus5xx),
         crate::runtime::health::HealthClassification::Neutral => None,
     }
 }
@@ -453,13 +457,14 @@ pub(crate) fn log_backend_health_transition(addr: &str, transition: HealthTransi
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
 
     use spooky_config::config::{
         Backend, ForwardedHeaderPolicy, HealthCheck, LoadBalancing, RouteAuth, RouteMatch,
         Upstream, UpstreamHostPolicy,
     };
+
+    use super::*;
 
     fn test_metrics() -> Metrics {
         Metrics::new(1, [String::from("api"), String::from("unrouted")])
@@ -564,8 +569,14 @@ mod tests {
             reason: Some(OverloadShedReason::GlobalInflight),
         });
         assert_eq!(decision.route_outcome, CanonicalRouteOutcome::OverloadShed);
-        assert_eq!(decision.backend_outcome, CanonicalBackendOutcome::OverloadShed);
-        assert_eq!(decision.overload_reason, Some(OverloadShedReason::GlobalInflight));
+        assert_eq!(
+            decision.backend_outcome,
+            CanonicalBackendOutcome::OverloadShed
+        );
+        assert_eq!(
+            decision.overload_reason,
+            Some(OverloadShedReason::GlobalInflight)
+        );
     }
 
     #[test]
@@ -585,8 +596,18 @@ mod tests {
         );
 
         assert_eq!(decision.route_outcome, CanonicalRouteOutcome::Success);
-        assert_eq!(metrics.requests_success.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert_eq!(metrics.requests_failure.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .requests_success
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .requests_failure
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         assert_eq!(upstream_request_count(&metrics, "api", "2xx", "success"), 1);
         assert_eq!(
             backend_request_count(&metrics, "api", "backend-a", "2xx", "success"),
@@ -622,10 +643,21 @@ mod tests {
         );
 
         assert_eq!(timeout.route_outcome, CanonicalRouteOutcome::Timeout);
-        assert_eq!(unrouted.route_outcome, CanonicalRouteOutcome::UpstreamFailure);
-        assert_eq!(metrics.requests_failure.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(
+            unrouted.route_outcome,
+            CanonicalRouteOutcome::UpstreamFailure
+        );
+        assert_eq!(
+            metrics
+                .requests_failure
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
         assert_eq!(upstream_request_count(&metrics, "api", "4xx", "timeout"), 1);
-        assert_eq!(upstream_request_count(&metrics, "unrouted", "5xx", "failure"), 1);
+        assert_eq!(
+            upstream_request_count(&metrics, "unrouted", "5xx", "failure"),
+            1
+        );
     }
 
     #[test]
@@ -673,17 +705,31 @@ mod tests {
 
         assert_eq!(overload.route_outcome, CanonicalRouteOutcome::OverloadShed);
         assert_eq!(auth.route_outcome, CanonicalRouteOutcome::AuthDenied);
-        assert_eq!(rate_limited.route_outcome, CanonicalRouteOutcome::RateLimited);
-        assert_eq!(metrics.overload_shed.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            rate_limited.route_outcome,
+            CanonicalRouteOutcome::RateLimited
+        );
+        assert_eq!(
+            metrics
+                .overload_shed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
         assert_eq!(
             metrics
                 .overload_shed_global_inflight
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
-        assert_eq!(upstream_request_count(&metrics, "api", "5xx", "overload_shed"), 1);
+        assert_eq!(
+            upstream_request_count(&metrics, "api", "5xx", "overload_shed"),
+            1
+        );
         assert_eq!(upstream_request_count(&metrics, "api", "4xx", "failure"), 1);
-        assert_eq!(upstream_request_count(&metrics, "api", "4xx", "rate_limited"), 1);
+        assert_eq!(
+            upstream_request_count(&metrics, "api", "4xx", "rate_limited"),
+            1
+        );
     }
 
     #[test]
@@ -733,7 +779,10 @@ mod tests {
             metrics: &metrics,
             classified: &classified,
         });
-        assert!(matches!(transition, Some(HealthTransition::BecameUnhealthy)));
+        assert!(matches!(
+            transition,
+            Some(HealthTransition::BecameUnhealthy)
+        ));
         assert_eq!(
             metrics
                 .health_failure_timeout

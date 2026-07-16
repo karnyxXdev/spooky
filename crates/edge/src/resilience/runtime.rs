@@ -148,9 +148,7 @@ impl RuntimeResilience {
     }
 
     pub fn hedging_allowed_for(&self, method: &str, route: &str, bodyless: bool) -> bool {
-        self.hedging_route_enabled_for(route)
-            && bodyless
-            && self.hedging_method_allowed(method)
+        self.hedging_route_enabled_for(route) && bodyless && self.hedging_method_allowed(method)
     }
 
     pub fn early_data_allowed_for(&self, method: &str) -> bool {

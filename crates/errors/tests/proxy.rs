@@ -1,9 +1,9 @@
 use spooky_errors::{
-    AlternateBackendFailureReason,
-    PoolError, ProxyError, RetryPolicyDecision, RetryPolicyDenialReason, RetryPolicyFacts,
-    UpstreamErrorClassification, UpstreamHealthFailureMapping, UpstreamProxyErrorKind,
-    UpstreamRetryReason, UpstreamRetryability, UpstreamTerminalErrorKind, UpstreamTlsReason,
-    classify_retryability, classify_upstream_proxy_error, evaluate_retry_policy, is_retryable,
+    AlternateBackendFailureReason, PoolError, ProxyError, RetryPolicyDecision,
+    RetryPolicyDenialReason, RetryPolicyFacts, UpstreamErrorClassification,
+    UpstreamHealthFailureMapping, UpstreamProxyErrorKind, UpstreamRetryReason,
+    UpstreamRetryability, UpstreamTerminalErrorKind, UpstreamTlsReason, classify_retryability,
+    classify_upstream_proxy_error, evaluate_retry_policy, is_retryable,
 };
 
 #[test]

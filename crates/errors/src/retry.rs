@@ -1,5 +1,6 @@
-use crate::{PoolError, ProxyError};
 use spooky_lb::alternate_backend::AlternateBackendFailureReason;
+
+use crate::{PoolError, ProxyError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UpstreamRetryReason {
@@ -46,7 +47,9 @@ pub struct RetryPolicyFacts {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetryPolicyDecision {
-    Retry { reason: UpstreamRetryReason },
+    Retry {
+        reason: UpstreamRetryReason,
+    },
     DoNotRetry {
         denial: Option<RetryPolicyDenialReason>,
     },
@@ -165,9 +168,9 @@ pub fn evaluate_retry_policy(input: RetryPolicyFacts) -> RetryPolicyDecision {
             } else if !input.alternate_backend_available {
                 RetryPolicyDecision::DoNotRetry {
                     denial: Some(RetryPolicyDenialReason::AlternateBackendUnavailable(
-                        input.alternate_backend_failure.unwrap_or(
-                            AlternateBackendFailureReason::OnlyExcludedBackendsHealthy,
-                        ),
+                        input
+                            .alternate_backend_failure
+                            .unwrap_or(AlternateBackendFailureReason::OnlyExcludedBackendsHealthy),
                     )),
                 }
             } else {
@@ -205,9 +208,9 @@ pub fn evaluate_hedge_policy(input: HedgePolicyFacts) -> HedgePolicyDecision {
     if !input.alternate_backend_available {
         return HedgePolicyDecision::DoNotHedge {
             denial: HedgePolicyDenialReason::AlternateBackendUnavailable(
-                input.alternate_backend_failure.unwrap_or(
-                    AlternateBackendFailureReason::OnlyExcludedBackendsHealthy,
-                ),
+                input
+                    .alternate_backend_failure
+                    .unwrap_or(AlternateBackendFailureReason::OnlyExcludedBackendsHealthy),
             ),
         };
     }
@@ -432,7 +435,10 @@ mod tests {
         let mut facts = hedge_facts();
         facts.primary_state = HedgePrimaryState::InFlightBeforeDelay;
 
-        assert_eq!(evaluate_hedge_policy(facts), HedgePolicyDecision::WaitForPrimary);
+        assert_eq!(
+            evaluate_hedge_policy(facts),
+            HedgePolicyDecision::WaitForPrimary
+        );
     }
 
     #[test]

@@ -370,7 +370,8 @@ impl QUICListener {
             alternate_backend,
             backend_endpoints,
             pending_forward,
-        ) else {
+        )
+        else {
             return Err(primary_err);
         };
 

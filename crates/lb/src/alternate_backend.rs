@@ -23,7 +23,9 @@ pub enum AlternateBackendFailureReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AlternateBackendDecision {
     Select(AlternateBackendChoice),
-    DoNotSelect { denial: AlternateBackendFailureReason },
+    DoNotSelect {
+        denial: AlternateBackendFailureReason,
+    },
 }
 
 fn is_excluded(index: usize, excluded_indices: &[usize]) -> bool {
@@ -143,11 +145,9 @@ mod tests {
 
     #[test]
     fn falls_back_to_healthy_scan_when_readonly_strategy_is_unavailable() {
-        let pool = UpstreamPool::from_upstream(&upstream(
-            "consistent-hash",
-            &["http://a", "http://b"],
-        ))
-        .expect("pool");
+        let pool =
+            UpstreamPool::from_upstream(&upstream("consistent-hash", &["http://a", "http://b"]))
+                .expect("pool");
 
         let decision = choose_alternate_backend(&pool, &[0], None);
         assert_eq!(
@@ -161,8 +161,8 @@ mod tests {
 
     #[test]
     fn reports_when_only_excluded_backends_are_healthy() {
-        let pool = UpstreamPool::from_upstream(&upstream("round-robin", &["http://a"]))
-            .expect("pool");
+        let pool =
+            UpstreamPool::from_upstream(&upstream("round-robin", &["http://a"])).expect("pool");
 
         let decision = choose_alternate_backend(&pool, &[0], None);
         assert_eq!(
@@ -175,11 +175,9 @@ mod tests {
 
     #[test]
     fn reports_when_no_backends_are_healthy() {
-        let mut pool = UpstreamPool::from_upstream(&upstream(
-            "round-robin",
-            &["http://a", "http://b"],
-        ))
-        .expect("pool");
+        let mut pool =
+            UpstreamPool::from_upstream(&upstream("round-robin", &["http://a", "http://b"]))
+                .expect("pool");
 
         let _ = pool
             .pool

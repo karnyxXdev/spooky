@@ -6,7 +6,7 @@ use crate::runtime::connection::{
         RequestBodyGuardrailConfig, RequestBodyGuardrailDecision, RequestBodyGuardrailInput,
         ResponseBodyGuardrailConfig, ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput,
         checked_response_body_guardrails, evaluate_request_body_timeouts,
-        evaluate_response_body_guardrails, response_body_limit_reason, response_chunk_ranges,
+        response_body_limit_reason, response_chunk_ranges,
     },
 };
 
@@ -352,7 +352,7 @@ impl QUICListener {
                                 .unknown_length_response_prebuffer_bytes,
                             chunk_bytes: RESPONSE_CHUNK_BYTES_LIMIT,
                         };
-                        let preflight_guardrail = evaluate_response_body_guardrails(
+                        let preflight_guardrail = checked_response_body_guardrails(
                             response_guardrails,
                             ResponseBodyGuardrailInput {
                                 elapsed: Duration::ZERO,
@@ -369,9 +369,9 @@ impl QUICListener {
                         );
                         if matches!(
                             preflight_guardrail,
-                            ResponseBodyGuardrailDecision::Reject {
+                            Err(ResponseBodyGuardrailDecision::Reject {
                                 kind: BodyLimitKind::BodySizeCap,
-                            }
+                            })
                         ) {
                             if let Some(req) = streams.get(&stream_id) {
                                 metrics.inc_failure();
@@ -424,7 +424,10 @@ impl QUICListener {
 
                         let defer_headers_until_body_validated = matches!(
                             preflight_guardrail,
-                            ResponseBodyGuardrailDecision::Continue { streaming }
+                            Ok(crate::runtime::connection::guardrails::EvaluatedResponseBodyGuardrail {
+                                streaming,
+                                ..
+                            })
                                 if matches!(
                                     streaming.emission,
                                     ProgressiveEmissionPolicy::PrebufferUntilValidated

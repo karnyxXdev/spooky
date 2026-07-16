@@ -5,7 +5,7 @@ pub(crate) const RESPONSE_BODY_TOO_LARGE_BODY: &[u8] = b"upstream response body 
 
 /// Shared limits for request-body ingress handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RequestBodyGuardrailConfig {
+pub(crate) struct RequestBodyGuardrailConfig {
     pub idle_timeout: Duration,
     pub total_timeout: Duration,
     pub max_body_bytes: usize,
@@ -14,7 +14,7 @@ pub struct RequestBodyGuardrailConfig {
 
 /// Point-in-time request-body state evaluated against ingress guardrails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RequestBodyGuardrailInput {
+pub(crate) struct RequestBodyGuardrailInput {
     pub elapsed: Duration,
     pub idle_for: Duration,
     pub bytes_received: usize,
@@ -26,7 +26,7 @@ pub struct RequestBodyGuardrailInput {
 
 /// Shared limits for response-body egress handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResponseBodyGuardrailConfig {
+pub(crate) struct ResponseBodyGuardrailConfig {
     pub idle_timeout: Duration,
     pub total_timeout: Duration,
     pub max_body_bytes: usize,
@@ -36,7 +36,7 @@ pub struct ResponseBodyGuardrailConfig {
 
 /// Point-in-time response-body state evaluated against egress guardrails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResponseBodyGuardrailInput {
+pub(crate) struct ResponseBodyGuardrailInput {
     pub elapsed: Duration,
     pub idle_for: Duration,
     pub bytes_received: usize,
@@ -51,14 +51,14 @@ pub struct ResponseBodyGuardrailInput {
 
 /// Canonical timeout reasons shared by request and response body handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BodyTimeoutKind {
+pub(crate) enum BodyTimeoutKind {
     Idle,
     Total,
 }
 
 /// Canonical body-size and buffering rejection reasons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BodyLimitKind {
+pub(crate) enum BodyLimitKind {
     BodySizeCap,
     BufferedBodyCap,
     UnknownLengthPrebufferCap,
@@ -66,7 +66,7 @@ pub enum BodyLimitKind {
 
 /// Policy describing how response body bytes may be emitted downstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProgressiveEmissionPolicy {
+pub(crate) enum ProgressiveEmissionPolicy {
     StreamProgressively,
     PrebufferUntilValidated,
     SuppressBody,
@@ -74,7 +74,7 @@ pub enum ProgressiveEmissionPolicy {
 
 /// Canonical decision for request-body ingress guardrails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestBodyGuardrailDecision {
+pub(crate) enum RequestBodyGuardrailDecision {
     Continue,
     Timeout { kind: BodyTimeoutKind },
     Reject { kind: BodyLimitKind },
@@ -82,7 +82,7 @@ pub enum RequestBodyGuardrailDecision {
 
 /// Canonical decision for response-body egress guardrails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResponseBodyGuardrailDecision {
+pub(crate) enum ResponseBodyGuardrailDecision {
     Continue { streaming: ResponseStreamingPolicy },
     Timeout { kind: BodyTimeoutKind },
     Reject { kind: BodyLimitKind },
@@ -90,14 +90,14 @@ pub enum ResponseBodyGuardrailDecision {
 
 /// Explicit chunk-emission sizing policy for progressive downstream writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResponseChunkEmissionPolicy {
+pub(crate) enum ResponseChunkEmissionPolicy {
     Passthrough,
     FixedSize { max_chunk_bytes: usize },
 }
 
 /// Canonical streaming policy for a response body once guardrails pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResponseStreamingPolicy {
+pub(crate) struct ResponseStreamingPolicy {
     pub emission: ProgressiveEmissionPolicy,
     pub chunk_emission: ResponseChunkEmissionPolicy,
     pub wait_timeout: Duration,
@@ -105,21 +105,21 @@ pub struct ResponseStreamingPolicy {
 
 /// Canonical request-body accounting state after an ingress step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RequestBodyIngressState {
+pub(crate) struct RequestBodyIngressState {
     pub bytes_received: usize,
     pub buffered_bytes: usize,
 }
 
 /// Canonical response-body accounting state after an egress step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResponseBodyEgressState {
+pub(crate) struct ResponseBodyEgressState {
     pub bytes_received: usize,
     pub prebuffered_bytes: usize,
 }
 
 /// Shared result for a validated response-body streaming step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EvaluatedResponseBodyGuardrail {
+pub(crate) struct EvaluatedResponseBodyGuardrail {
     pub streaming: ResponseStreamingPolicy,
     pub next_state: ResponseBodyEgressState,
 }
@@ -143,7 +143,7 @@ pub(crate) fn evaluate_request_body_timeouts(
     RequestBodyGuardrailDecision::Continue
 }
 
-pub(crate) fn evaluate_request_body_ingress(
+fn evaluate_request_body_ingress(
     config: RequestBodyGuardrailConfig,
     input: RequestBodyGuardrailInput,
 ) -> RequestBodyGuardrailDecision {
@@ -233,7 +233,7 @@ fn resolve_progressive_emission_policy(
     ProgressiveEmissionPolicy::PrebufferUntilValidated
 }
 
-pub(crate) fn evaluate_response_body_guardrails(
+fn evaluate_response_body_guardrails(
     config: ResponseBodyGuardrailConfig,
     input: ResponseBodyGuardrailInput,
 ) -> ResponseBodyGuardrailDecision {

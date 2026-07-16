@@ -62,7 +62,7 @@ use crate::{
             BodyLimitKind, REQUEST_BODY_TOO_LARGE_BODY, RESPONSE_BODY_TOO_LARGE_BODY,
             RequestBodyGuardrailConfig, RequestBodyGuardrailDecision, RequestBodyGuardrailInput,
             ResponseBodyGuardrailConfig, ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput,
-            evaluate_request_body_ingress, evaluate_response_body_guardrails,
+            checked_request_body_ingress, checked_response_body_guardrails,
         },
         shared_state::SharedRuntimeState,
         tls::store::ListenerTlsReloadStore,
@@ -703,7 +703,7 @@ impl QUICListener {
                                 };
 
                                 let request_path = if path.is_empty() { "/" } else { &path };
-                                let request_size_decision = evaluate_request_body_ingress(
+                                let request_size_decision = checked_request_body_ingress(
                                     RequestBodyGuardrailConfig {
                                         idle_timeout: Duration::ZERO,
                                         total_timeout: Duration::ZERO,
@@ -722,9 +722,9 @@ impl QUICListener {
                                 );
                                 if matches!(
                                     request_size_decision,
-                                    RequestBodyGuardrailDecision::Reject {
+                                    Err(RequestBodyGuardrailDecision::Reject {
                                         kind: BodyLimitKind::BodySizeCap,
-                                    }
+                                    })
                                 ) {
                                     return Ok(Response::builder()
                                         .status(StatusCode::PAYLOAD_TOO_LARGE)
@@ -1128,7 +1128,7 @@ impl QUICListener {
                                     .get(http::header::CONTENT_LENGTH)
                                     .and_then(|v| v.to_str().ok())
                                     .and_then(|s| s.parse::<usize>().ok());
-                                let response_size_decision = evaluate_response_body_guardrails(
+                                let response_size_decision = checked_response_body_guardrails(
                                     ResponseBodyGuardrailConfig {
                                         idle_timeout: Duration::ZERO,
                                         total_timeout: Duration::MAX,
@@ -1157,9 +1157,9 @@ impl QUICListener {
                                 );
                                 if matches!(
                                     response_size_decision,
-                                    ResponseBodyGuardrailDecision::Reject {
+                                    Err(ResponseBodyGuardrailDecision::Reject {
                                         kind: BodyLimitKind::BodySizeCap,
-                                    }
+                                    })
                                 ) {
                                     return Ok(Response::builder()
                                         .status(StatusCode::SERVICE_UNAVAILABLE)

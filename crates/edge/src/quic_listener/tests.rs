@@ -36,7 +36,7 @@ use crate::{
     runtime::connection::{
         guardrails::{
             BodyLimitKind, ResponseBodyGuardrailConfig, ResponseBodyGuardrailDecision,
-            ResponseBodyGuardrailInput, evaluate_response_body_guardrails,
+            ResponseBodyGuardrailInput, checked_response_body_guardrails,
         },
         stream::StreamAdmissionState,
     },
@@ -1175,7 +1175,7 @@ fn response_size_cap_enforced_as_running_total() {
         chunk_bytes: 4,
     };
     assert!(matches!(
-        evaluate_response_body_guardrails(
+        checked_response_body_guardrails(
             config,
             ResponseBodyGuardrailInput {
                 elapsed: Duration::ZERO,
@@ -1190,10 +1190,10 @@ fn response_size_cap_enforced_as_running_total() {
                 exempt_from_body_size_cap: false,
             },
         ),
-        ResponseBodyGuardrailDecision::Continue { .. }
+        Ok(_)
     ));
     assert!(matches!(
-        evaluate_response_body_guardrails(
+        checked_response_body_guardrails(
             config,
             ResponseBodyGuardrailInput {
                 elapsed: Duration::ZERO,
@@ -1208,10 +1208,10 @@ fn response_size_cap_enforced_as_running_total() {
                 exempt_from_body_size_cap: false,
             },
         ),
-        ResponseBodyGuardrailDecision::Continue { .. }
+        Ok(_)
     ));
     assert_eq!(
-        evaluate_response_body_guardrails(
+        checked_response_body_guardrails(
             config,
             ResponseBodyGuardrailInput {
                 elapsed: Duration::ZERO,
@@ -1226,9 +1226,9 @@ fn response_size_cap_enforced_as_running_total() {
                 exempt_from_body_size_cap: false,
             },
         ),
-        ResponseBodyGuardrailDecision::Reject {
+        Err(ResponseBodyGuardrailDecision::Reject {
             kind: BodyLimitKind::BodySizeCap,
-        }
+        })
     );
 }
 

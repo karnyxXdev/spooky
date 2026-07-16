@@ -86,6 +86,10 @@ use crate::{
         backend::{resolution::RuntimeBackendResolution, store::RuntimeBackendResolutionStore},
         bundle::{RuntimeBundle, RuntimeBundleHandle},
         connection::{
+            guardrails::{
+                BodyLimitKind, RequestBodyGuardrailConfig, RequestBodyGuardrailDecision,
+                RequestBodyGuardrailInput, evaluate_request_body_ingress,
+            },
             quic::{QuicConnection, QuicConnectionErrorSnapshot},
             request::RequestEnvelope,
             response::{ForwardResult, ForwardSuccess, ResponseChunk, UpstreamResult},
@@ -1814,12 +1818,28 @@ impl QUICListener {
             return Err(RequestBufferError::GlobalCap);
         }
 
-        let next = req.body_buf_bytes.saturating_add(chunk.len());
-        if next > max_request_body_bytes {
+        let decision = evaluate_request_body_ingress(
+            RequestBodyGuardrailConfig {
+                idle_timeout: Duration::ZERO,
+                total_timeout: Duration::ZERO,
+                max_body_bytes: max_request_body_bytes,
+                max_buffered_bytes: max_request_body_bytes,
+            },
+            RequestBodyGuardrailInput {
+                elapsed: Duration::ZERO,
+                idle_for: Duration::ZERO,
+                bytes_received: req.body_bytes_received,
+                buffered_bytes: req.body_buf_bytes,
+                next_chunk_bytes: chunk_len,
+                declared_content_length: None,
+                exempt_from_body_size_cap: false,
+            },
+        );
+        if !matches!(decision, RequestBodyGuardrailDecision::Continue) {
             metrics.release_request_buffer(chunk_len);
             return Err(RequestBufferError::StreamCap);
         }
-        req.body_buf_bytes = next;
+        req.body_buf_bytes = req.body_buf_bytes.saturating_add(chunk_len);
         req.body_buf.push_back(chunk);
         Ok(())
     }

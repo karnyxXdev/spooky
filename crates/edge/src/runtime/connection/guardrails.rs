@@ -89,3 +89,159 @@ pub enum ResponseChunkEmissionPolicy {
     Passthrough,
     FixedSize { max_chunk_bytes: usize },
 }
+
+pub(crate) fn evaluate_request_body_timeouts(
+    config: RequestBodyGuardrailConfig,
+    input: RequestBodyGuardrailInput,
+) -> RequestBodyGuardrailDecision {
+    if input.elapsed >= config.total_timeout {
+        return RequestBodyGuardrailDecision::Timeout {
+            kind: BodyTimeoutKind::Total,
+        };
+    }
+
+    if input.idle_for >= config.idle_timeout {
+        return RequestBodyGuardrailDecision::Timeout {
+            kind: BodyTimeoutKind::Idle,
+        };
+    }
+
+    RequestBodyGuardrailDecision::Continue
+}
+
+pub(crate) fn evaluate_request_body_ingress(
+    config: RequestBodyGuardrailConfig,
+    input: RequestBodyGuardrailInput,
+) -> RequestBodyGuardrailDecision {
+    let next_total = input.bytes_received.saturating_add(input.next_chunk_bytes);
+    if !input.exempt_from_body_size_cap && next_total > config.max_body_bytes {
+        return RequestBodyGuardrailDecision::Reject {
+            kind: BodyLimitKind::BodySizeCap,
+        };
+    }
+
+    let next_buffered = input.buffered_bytes.saturating_add(input.next_chunk_bytes);
+    if next_buffered > config.max_buffered_bytes {
+        let kind = if input.declared_content_length.is_some() {
+            BodyLimitKind::BufferedBodyCap
+        } else {
+            BodyLimitKind::UnknownLengthPrebufferCap
+        };
+        return RequestBodyGuardrailDecision::Reject { kind };
+    }
+
+    RequestBodyGuardrailDecision::Continue
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_body_idle_timeout_rejects() {
+        let decision = evaluate_request_body_timeouts(
+            RequestBodyGuardrailConfig {
+                idle_timeout: Duration::from_secs(5),
+                total_timeout: Duration::from_secs(30),
+                max_body_bytes: usize::MAX,
+                max_buffered_bytes: usize::MAX,
+            },
+            RequestBodyGuardrailInput {
+                elapsed: Duration::from_secs(4),
+                idle_for: Duration::from_secs(5),
+                bytes_received: 0,
+                buffered_bytes: 0,
+                next_chunk_bytes: 0,
+                declared_content_length: None,
+                exempt_from_body_size_cap: false,
+            },
+        );
+
+        assert_eq!(
+            decision,
+            RequestBodyGuardrailDecision::Timeout {
+                kind: BodyTimeoutKind::Idle,
+            }
+        );
+    }
+
+    #[test]
+    fn request_body_total_timeout_rejects() {
+        let decision = evaluate_request_body_timeouts(
+            RequestBodyGuardrailConfig {
+                idle_timeout: Duration::from_secs(5),
+                total_timeout: Duration::from_secs(30),
+                max_body_bytes: usize::MAX,
+                max_buffered_bytes: usize::MAX,
+            },
+            RequestBodyGuardrailInput {
+                elapsed: Duration::from_secs(30),
+                idle_for: Duration::from_secs(1),
+                bytes_received: 0,
+                buffered_bytes: 0,
+                next_chunk_bytes: 0,
+                declared_content_length: None,
+                exempt_from_body_size_cap: false,
+            },
+        );
+
+        assert_eq!(
+            decision,
+            RequestBodyGuardrailDecision::Timeout {
+                kind: BodyTimeoutKind::Total,
+            }
+        );
+    }
+
+    #[test]
+    fn request_body_size_cap_respects_connect_exemption() {
+        let config = RequestBodyGuardrailConfig {
+            idle_timeout: Duration::from_secs(5),
+            total_timeout: Duration::from_secs(30),
+            max_body_bytes: 16,
+            max_buffered_bytes: usize::MAX,
+        };
+        let input = RequestBodyGuardrailInput {
+            elapsed: Duration::ZERO,
+            idle_for: Duration::ZERO,
+            bytes_received: 12,
+            buffered_bytes: 0,
+            next_chunk_bytes: 8,
+            declared_content_length: None,
+            exempt_from_body_size_cap: true,
+        };
+
+        assert_eq!(
+            evaluate_request_body_ingress(config, input),
+            RequestBodyGuardrailDecision::Continue
+        );
+    }
+
+    #[test]
+    fn request_body_unknown_length_prebuffer_cap_rejects() {
+        let decision = evaluate_request_body_ingress(
+            RequestBodyGuardrailConfig {
+                idle_timeout: Duration::from_secs(5),
+                total_timeout: Duration::from_secs(30),
+                max_body_bytes: usize::MAX,
+                max_buffered_bytes: 10,
+            },
+            RequestBodyGuardrailInput {
+                elapsed: Duration::ZERO,
+                idle_for: Duration::ZERO,
+                bytes_received: 0,
+                buffered_bytes: 6,
+                next_chunk_bytes: 5,
+                declared_content_length: None,
+                exempt_from_body_size_cap: false,
+            },
+        );
+
+        assert_eq!(
+            decision,
+            RequestBodyGuardrailDecision::Reject {
+                kind: BodyLimitKind::UnknownLengthPrebufferCap,
+            }
+        );
+    }
+}

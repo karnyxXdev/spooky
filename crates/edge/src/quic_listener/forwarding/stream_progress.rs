@@ -1,5 +1,11 @@
 use super::*;
-use crate::runtime::connection::auth::ExternalAuthResult;
+use crate::runtime::connection::{
+    auth::ExternalAuthResult,
+    guardrails::{
+        BodyTimeoutKind, RequestBodyGuardrailConfig, RequestBodyGuardrailDecision,
+        RequestBodyGuardrailInput, evaluate_request_body_timeouts,
+    },
+};
 
 impl QUICListener {
     /// Advance all in-flight streams without blocking.
@@ -34,8 +40,92 @@ impl QUICListener {
         let stream_ids: Vec<u64> = streams.keys().copied().collect();
 
         for stream_id in stream_ids {
+            let now = Instant::now();
             if let Some(req) = streams.get(&stream_id)
-                && Instant::now() >= req.total_request_deadline
+                && req.phase == StreamPhase::ReceivingRequest
+                && !req.request_fin_received
+                && !req.bodyless_mode
+            {
+                let timeout_decision = evaluate_request_body_timeouts(
+                    RequestBodyGuardrailConfig {
+                        idle_timeout: progress_config.client_body_idle_timeout,
+                        total_timeout: req
+                            .total_request_deadline
+                            .checked_duration_since(req.start)
+                            .unwrap_or_default(),
+                        max_body_bytes: usize::MAX,
+                        max_buffered_bytes: usize::MAX,
+                    },
+                    RequestBodyGuardrailInput {
+                        elapsed: req.start.elapsed(),
+                        idle_for: now.saturating_duration_since(req.last_body_activity),
+                        bytes_received: req.body_bytes_received,
+                        buffered_bytes: req.body_buf_bytes,
+                        next_chunk_bytes: 0,
+                        declared_content_length: None,
+                        exempt_from_body_size_cap: false,
+                    },
+                );
+
+                if matches!(
+                    timeout_decision,
+                    RequestBodyGuardrailDecision::Timeout {
+                        kind: BodyTimeoutKind::Total,
+                    }
+                ) {
+                    if let Err(protocol_err) = Self::handle_forward_result(
+                        h3,
+                        quic,
+                        stream_id,
+                        req,
+                        Err(ProxyError::Timeout),
+                        shared_ctx,
+                    ) {
+                        error!(
+                            "failed to emit timeout response for stream {}: {:?}",
+                            stream_id, protocol_err
+                        );
+                    }
+                    resilience
+                        .adaptive_admission
+                        .observe(req.start.elapsed(), true);
+                    if let Some(req) = streams.get_mut(&stream_id) {
+                        abort_stream(req, metrics);
+                    }
+                    streams.remove(&stream_id);
+                    continue;
+                }
+
+                if matches!(
+                    timeout_decision,
+                    RequestBodyGuardrailDecision::Timeout {
+                        kind: BodyTimeoutKind::Idle,
+                    }
+                ) {
+                    metrics.inc_failure();
+                    metrics.inc_timeout();
+                    let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
+                    metrics.record_route(route_label, req.start.elapsed(), RouteOutcome::Timeout);
+                    let _ = Self::send_simple_response(
+                        h3,
+                        quic,
+                        stream_id,
+                        http::StatusCode::REQUEST_TIMEOUT,
+                        b"request body idle timeout\n",
+                    );
+                    resilience
+                        .adaptive_admission
+                        .observe(req.start.elapsed(), true);
+                    if let Some(req) = streams.get_mut(&stream_id) {
+                        abort_stream(req, metrics);
+                    }
+                    streams.remove(&stream_id);
+                    continue;
+                }
+            }
+
+            if let Some(req) = streams.get(&stream_id)
+                && now >= req.total_request_deadline
             {
                 if let Err(protocol_err) = Self::handle_forward_result(
                     h3,
@@ -50,34 +140,6 @@ impl QUICListener {
                         stream_id, protocol_err
                     );
                 }
-                resilience
-                    .adaptive_admission
-                    .observe(req.start.elapsed(), true);
-                if let Some(req) = streams.get_mut(&stream_id) {
-                    abort_stream(req, metrics);
-                }
-                streams.remove(&stream_id);
-                continue;
-            }
-
-            if let Some(req) = streams.get(&stream_id)
-                && req.phase == StreamPhase::ReceivingRequest
-                && !req.request_fin_received
-                && !req.bodyless_mode
-                && Instant::now().saturating_duration_since(req.last_body_activity)
-                    >= progress_config.client_body_idle_timeout
-            {
-                metrics.inc_failure();
-                metrics.inc_timeout();
-                let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
-                metrics.record_route(route_label, req.start.elapsed(), RouteOutcome::Timeout);
-                let _ = Self::send_simple_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    http::StatusCode::REQUEST_TIMEOUT,
-                    b"request body idle timeout\n",
-                );
                 resilience
                     .adaptive_admission
                     .observe(req.start.elapsed(), true);

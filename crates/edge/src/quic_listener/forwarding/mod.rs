@@ -878,11 +878,32 @@ impl QUICListener {
                                     ));
                                 }
                                 if reject_body_for_bodyless.is_none() {
-                                    // Enforce cap on total bytes received for the stream,
-                                    // including chunks already forwarded to the H2 body channel.
-                                    let next_total = req.body_bytes_received.saturating_add(read);
-                                    let request_is_connect = is_connect_method(&req.method);
-                                    if !request_is_connect && next_total > max_request_body_bytes {
+                                    let decision = evaluate_request_body_ingress(
+                                        RequestBodyGuardrailConfig {
+                                            idle_timeout: Duration::ZERO,
+                                            total_timeout: Duration::ZERO,
+                                            max_body_bytes: max_request_body_bytes,
+                                            max_buffered_bytes: usize::MAX,
+                                        },
+                                        RequestBodyGuardrailInput {
+                                            elapsed: req.start.elapsed(),
+                                            idle_for: Instant::now()
+                                                .saturating_duration_since(req.last_body_activity),
+                                            bytes_received: req.body_bytes_received,
+                                            buffered_bytes: 0,
+                                            next_chunk_bytes: read,
+                                            declared_content_length: None,
+                                            exempt_from_body_size_cap: is_connect_method(
+                                                &req.method,
+                                            ),
+                                        },
+                                    );
+                                    if matches!(
+                                        decision,
+                                        RequestBodyGuardrailDecision::Reject {
+                                            kind: BodyLimitKind::BodySizeCap,
+                                        }
+                                    ) {
                                         payload_too_large = Some((
                                             req.upstream_name
                                                 .clone()
@@ -890,7 +911,8 @@ impl QUICListener {
                                             req.start.elapsed(),
                                         ));
                                     } else {
-                                        req.body_bytes_received = next_total;
+                                        req.body_bytes_received =
+                                            req.body_bytes_received.saturating_add(read);
 
                                         for chunk_slice in
                                             body_buf[..read].chunks(REQUEST_CHUNK_BYTES_LIMIT)

@@ -2,10 +2,32 @@ use super::*;
 use crate::runtime::connection::{
     auth::ExternalAuthResult,
     guardrails::{
-        BodyTimeoutKind, RequestBodyGuardrailConfig, RequestBodyGuardrailDecision,
-        RequestBodyGuardrailInput, evaluate_request_body_timeouts,
+        BodyLimitKind, BodyTimeoutKind, ProgressiveEmissionPolicy, RequestBodyGuardrailConfig,
+        RequestBodyGuardrailDecision, RequestBodyGuardrailInput, ResponseBodyGuardrailConfig,
+        ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput, evaluate_request_body_timeouts,
+        evaluate_response_body_guardrails, response_chunk_ranges,
     },
 };
+
+fn response_body_guardrail_error(decision: ResponseBodyGuardrailDecision) -> Option<ProxyError> {
+    match decision {
+        ResponseBodyGuardrailDecision::Continue { .. } => None,
+        ResponseBodyGuardrailDecision::Timeout { .. } => Some(ProxyError::Timeout),
+        ResponseBodyGuardrailDecision::Reject {
+            kind: BodyLimitKind::BodySizeCap,
+        } => Some(ProxyError::Pool(PoolError::BackendOverloaded(
+            "upstream response body too large".into(),
+        ))),
+        ResponseBodyGuardrailDecision::Reject {
+            kind: BodyLimitKind::UnknownLengthPrebufferCap,
+        } => Some(ProxyError::Pool(PoolError::BackendOverloaded(
+            "unknown-length response prebuffer limit exceeded".into(),
+        ))),
+        ResponseBodyGuardrailDecision::Reject { .. } => Some(ProxyError::Pool(
+            PoolError::BackendOverloaded("upstream response rejected".into()),
+        )),
+    }
+}
 
 impl QUICListener {
     /// Advance all in-flight streams without blocking.
@@ -298,11 +320,56 @@ impl QUICListener {
                             .get(http::header::CONTENT_LENGTH)
                             .and_then(|v| v.to_str().ok())
                             .and_then(|v| v.parse::<usize>().ok());
-                        if !tunnel_response
-                            && !suppress_downstream_body
-                            && upstream_content_length
-                                .is_some_and(|len| len > progress_config.max_response_body_bytes)
-                        {
+                        let normalized_response =
+                            normalize_upstream_response(ResponseNormalizationInput {
+                                upstream: spooky_bridge::response::UpstreamResponseView {
+                                    status,
+                                    headers: &resp_headers,
+                                    trailers: None,
+                                },
+                                body_mode: response_body_mode,
+                                constraints: ResponseProtocolConstraints {
+                                    protocol: ResponseNormalizationProtocol::Http3,
+                                    strip_connection_headers: true,
+                                    allow_trailers: true,
+                                    preserve_upgrade: false,
+                                },
+                            });
+                        let body_forwarding_enabled = matches!(
+                            normalized_response.emission.body,
+                            ResponseBodyPolicy::Forward
+                        );
+                        let progressive_body_emission_allowed =
+                            !normalized_response.emission.emit_end_stream_on_headers;
+                        let response_guardrails = ResponseBodyGuardrailConfig {
+                            idle_timeout: progress_config.backend_body_idle_timeout,
+                            total_timeout: progress_config.backend_body_total_timeout,
+                            max_body_bytes: progress_config.max_response_body_bytes,
+                            unknown_length_prebuffer_bytes: progress_config
+                                .unknown_length_response_prebuffer_bytes,
+                            chunk_bytes: RESPONSE_CHUNK_BYTES_LIMIT,
+                        };
+                        let preflight_guardrail = evaluate_response_body_guardrails(
+                            response_guardrails,
+                            ResponseBodyGuardrailInput {
+                                elapsed: Duration::ZERO,
+                                idle_for: Duration::ZERO,
+                                bytes_received: 0,
+                                prebuffered_bytes: 0,
+                                next_chunk_bytes: 0,
+                                declared_content_length: upstream_content_length,
+                                headers_emitted: false,
+                                progressive_emission_allowed: progressive_body_emission_allowed,
+                                body_forwarding_enabled,
+                                exempt_from_body_size_cap: tunnel_response,
+                            },
+                        );
+                        if matches!(
+                            preflight_guardrail,
+                            ResponseBodyGuardrailDecision::Reject {
+                                kind: BodyLimitKind::BodySizeCap,
+                            }
+                        ) {
                             if let Some(req) = streams.get(&stream_id) {
                                 metrics.inc_failure();
                                 metrics.inc_overload_shed_reason(
@@ -339,22 +406,6 @@ impl QUICListener {
                             streams.remove(&stream_id);
                             continue;
                         }
-
-                        let normalized_response =
-                            normalize_upstream_response(ResponseNormalizationInput {
-                                upstream: spooky_bridge::response::UpstreamResponseView {
-                                    status,
-                                    headers: &resp_headers,
-                                    trailers: None,
-                                },
-                                body_mode: response_body_mode,
-                                constraints: ResponseProtocolConstraints {
-                                    protocol: ResponseNormalizationProtocol::Http3,
-                                    strip_connection_headers: true,
-                                    allow_trailers: true,
-                                    preserve_upgrade: false,
-                                },
-                            });
                         let mut owned_h3_headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                         for header in &normalized_response.head.headers {
                             owned_h3_headers.push((
@@ -368,13 +419,14 @@ impl QUICListener {
                                 .into_bytes(),
                         ));
 
-                        let defer_headers_until_body_validated = upstream_content_length.is_none()
-                            && !tunnel_response
-                            && matches!(
-                                normalized_response.emission.body,
-                                ResponseBodyPolicy::Forward
-                            )
-                            && !normalized_response.emission.emit_end_stream_on_headers;
+                        let defer_headers_until_body_validated = matches!(
+                            preflight_guardrail,
+                            ResponseBodyGuardrailDecision::Continue { streaming }
+                                if matches!(
+                                    streaming.emission,
+                                    ProgressiveEmissionPolicy::PrebufferUntilValidated
+                                )
+                        );
                         let immediate_end = normalized_response.emission.emit_end_stream_on_headers;
                         let mut immediate_terminal = false;
 
@@ -481,16 +533,13 @@ impl QUICListener {
                                 let (chunk_tx, chunk_rx) =
                                     mpsc::channel::<ResponseChunk>(RESPONSE_CHUNK_CHANNEL_CAPACITY);
                                 let fail_tx = chunk_tx.clone();
-                                let body_idle_timeout = progress_config.backend_body_idle_timeout;
-                                let max_response_body_bytes =
-                                    progress_config.max_response_body_bytes;
-                                let unknown_length_response_prebuffer_bytes =
-                                    progress_config.unknown_length_response_prebuffer_bytes;
-                                let first_byte_deadline = tokio::time::Instant::now()
-                                    + progress_config.backend_body_total_timeout;
                                 let deferred_status = status;
                                 let deferred_headers = owned_h3_headers.clone();
                                 let tunnel_mode = tunnel_response;
+                                let response_guardrails = response_guardrails;
+                                let progressive_emission_allowed =
+                                    progressive_body_emission_allowed;
+                                let body_forwarding_enabled = body_forwarding_enabled;
                                 let fut = async move {
                                     use http_body_util::BodyExt;
                                     let Some(mut body) = response_body else {
@@ -502,29 +551,49 @@ impl QUICListener {
                                             .await;
                                         return;
                                     };
+                                    let body_started_at = tokio::time::Instant::now();
+                                    let mut last_body_progress_at = body_started_at;
                                     let mut response_bytes_received: usize = 0;
+                                    let mut prebuffered_bytes: usize = 0;
                                     let mut buffered_chunks: Vec<Bytes> = Vec::new();
                                     let mut buffered_trailers: Option<Vec<(Vec<u8>, Vec<u8>)>> =
                                         None;
-                                    let mut saw_body_progress = false;
                                     loop {
-                                        let frame_fut = BodyExt::frame(&mut body);
-                                        let now = tokio::time::Instant::now();
-                                        if !saw_body_progress && now >= first_byte_deadline {
-                                            let _ = chunk_tx
-                                                .send(ResponseChunk::Error(ProxyError::Timeout))
-                                                .await;
-                                            return;
-                                        }
-                                        let wait_timeout = if saw_body_progress {
-                                            body_idle_timeout
-                                        } else {
-                                            first_byte_deadline
-                                                .saturating_duration_since(now)
-                                                .min(body_idle_timeout)
+                                        let wait_decision = evaluate_response_body_guardrails(
+                                            response_guardrails,
+                                            ResponseBodyGuardrailInput {
+                                                elapsed: body_started_at.elapsed(),
+                                                idle_for: last_body_progress_at.elapsed(),
+                                                bytes_received: response_bytes_received,
+                                                prebuffered_bytes,
+                                                next_chunk_bytes: 0,
+                                                declared_content_length: upstream_content_length,
+                                                headers_emitted:
+                                                    !defer_headers_until_body_validated,
+                                                progressive_emission_allowed,
+                                                body_forwarding_enabled,
+                                                exempt_from_body_size_cap: tunnel_mode,
+                                            },
+                                        );
+                                        let streaming = match wait_decision {
+                                            ResponseBodyGuardrailDecision::Continue {
+                                                streaming,
+                                            } => streaming,
+                                            other => {
+                                                if let Some(err) =
+                                                    response_body_guardrail_error(other)
+                                                {
+                                                    let _ = chunk_tx
+                                                        .send(ResponseChunk::Error(err))
+                                                        .await;
+                                                }
+                                                return;
+                                            }
                                         };
+                                        let frame_fut = BodyExt::frame(&mut body);
                                         let result =
-                                            tokio::time::timeout(wait_timeout, frame_fut).await;
+                                            tokio::time::timeout(streaming.wait_timeout, frame_fut)
+                                                .await;
                                         match result {
                                             Err(_elapsed) => {
                                                 let _ = chunk_tx
@@ -535,68 +604,72 @@ impl QUICListener {
                                             Ok(Some(Ok(f))) => match f.into_data() {
                                                 Ok(data) => {
                                                     if !data.is_empty() {
-                                                        saw_body_progress = true;
+                                                        last_body_progress_at =
+                                                            tokio::time::Instant::now();
                                                     }
-                                                    if !tunnel_mode
-                                                        && response_size_exceeded_after_chunk(
-                                                            &mut response_bytes_received,
-                                                            data.len(),
-                                                            max_response_body_bytes,
-                                                        )
-                                                    {
-                                                        let _ = chunk_tx
-                                                            .send(ResponseChunk::Error(
-                                                                ProxyError::Pool(
-                                                                    PoolError::BackendOverloaded(
-                                                                        "upstream response body too large"
-                                                                            .into(),
-                                                                    ),
-                                                                ),
-                                                            ))
-                                                            .await;
-                                                        return;
-                                                    }
-                                                    if defer_headers_until_body_validated {
-                                                        if response_bytes_received
-                                                            > unknown_length_response_prebuffer_bytes
-                                                        {
-                                                            let _ = chunk_tx
-                                                                .send(ResponseChunk::Error(
-                                                                    ProxyError::Pool(
-                                                                        PoolError::BackendOverloaded(
-                                                                            "unknown-length response prebuffer limit exceeded"
-                                                                                .into(),
-                                                                        ),
-                                                                    ),
-                                                                ))
-                                                                .await;
+                                                    let data_decision =
+                                                        evaluate_response_body_guardrails(
+                                                            response_guardrails,
+                                                            ResponseBodyGuardrailInput {
+                                                                elapsed: body_started_at.elapsed(),
+                                                                idle_for: last_body_progress_at
+                                                                    .elapsed(),
+                                                                bytes_received: response_bytes_received,
+                                                                prebuffered_bytes,
+                                                                next_chunk_bytes: data.len(),
+                                                                declared_content_length: upstream_content_length,
+                                                                headers_emitted: !defer_headers_until_body_validated,
+                                                                progressive_emission_allowed,
+                                                                body_forwarding_enabled,
+                                                                exempt_from_body_size_cap: tunnel_mode,
+                                                            },
+                                                        );
+                                                    let streaming = match data_decision {
+                                                        ResponseBodyGuardrailDecision::Continue {
+                                                            streaming,
+                                                        } => streaming,
+                                                        other => {
+                                                            if let Some(err) =
+                                                                response_body_guardrail_error(other)
+                                                            {
+                                                                let _ = chunk_tx
+                                                                    .send(ResponseChunk::Error(err))
+                                                                    .await;
+                                                            }
                                                             return;
                                                         }
-                                                        for start in (0..data.len())
-                                                            .step_by(RESPONSE_CHUNK_BYTES_LIMIT)
-                                                        {
-                                                            let end = (start
-                                                                + RESPONSE_CHUNK_BYTES_LIMIT)
-                                                                .min(data.len());
-                                                            buffered_chunks
-                                                                .push(data.slice(start..end));
-                                                        }
+                                                    };
+                                                    response_bytes_received =
+                                                        response_bytes_received
+                                                            .saturating_add(data.len());
+                                                    if matches!(
+                                                        streaming.emission,
+                                                        ProgressiveEmissionPolicy::PrebufferUntilValidated
+                                                    ) {
+                                                        prebuffered_bytes = prebuffered_bytes
+                                                            .saturating_add(data.len());
                                                     } else {
-                                                        for start in (0..data.len())
-                                                            .step_by(RESPONSE_CHUNK_BYTES_LIMIT)
-                                                        {
-                                                            let end = (start
-                                                                + RESPONSE_CHUNK_BYTES_LIMIT)
-                                                                .min(data.len());
-                                                            if chunk_tx
-                                                                .send(ResponseChunk::Data(
-                                                                    data.slice(start..end),
-                                                                ))
-                                                                .await
-                                                                .is_err()
-                                                            {
-                                                                return;
+                                                        prebuffered_bytes = 0;
+                                                    }
+                                                    for (start, end) in response_chunk_ranges(
+                                                        data.len(),
+                                                        streaming.chunk_emission,
+                                                    ) {
+                                                        let chunk = data.slice(start..end);
+                                                        match streaming.emission {
+                                                            ProgressiveEmissionPolicy::PrebufferUntilValidated => {
+                                                                buffered_chunks.push(chunk);
                                                             }
+                                                            ProgressiveEmissionPolicy::StreamProgressively => {
+                                                                if chunk_tx
+                                                                    .send(ResponseChunk::Data(chunk))
+                                                                    .await
+                                                                    .is_err()
+                                                                {
+                                                                    return;
+                                                                }
+                                                            }
+                                                            ProgressiveEmissionPolicy::SuppressBody => {}
                                                         }
                                                     }
                                                 }

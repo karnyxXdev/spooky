@@ -242,6 +242,7 @@ fn should_strip_bootstrap_response_header(
     )
 }
 
+#[cfg(test)]
 fn response_size_exceeded_after_chunk(
     response_bytes_received: &mut usize,
     chunk_len: usize,

@@ -42,6 +42,8 @@ pub struct ResponseBodyGuardrailInput {
     pub declared_content_length: Option<usize>,
     pub headers_emitted: bool,
     pub progressive_emission_allowed: bool,
+    pub body_forwarding_enabled: bool,
+    pub exempt_from_body_size_cap: bool,
 }
 
 /// Canonical timeout reasons shared by request and response body handling.
@@ -78,7 +80,7 @@ pub enum RequestBodyGuardrailDecision {
 /// Canonical decision for response-body egress guardrails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseBodyGuardrailDecision {
-    Continue { emission: ProgressiveEmissionPolicy },
+    Continue { streaming: ResponseStreamingPolicy },
     Timeout { kind: BodyTimeoutKind },
     Reject { kind: BodyLimitKind },
 }
@@ -88,6 +90,14 @@ pub enum ResponseBodyGuardrailDecision {
 pub enum ResponseChunkEmissionPolicy {
     Passthrough,
     FixedSize { max_chunk_bytes: usize },
+}
+
+/// Canonical streaming policy for a response body once guardrails pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseStreamingPolicy {
+    pub emission: ProgressiveEmissionPolicy,
+    pub chunk_emission: ResponseChunkEmissionPolicy,
+    pub wait_timeout: Duration,
 }
 
 pub(crate) fn evaluate_request_body_timeouts(
@@ -131,6 +141,112 @@ pub(crate) fn evaluate_request_body_ingress(
     }
 
     RequestBodyGuardrailDecision::Continue
+}
+
+fn response_wait_timeout(
+    config: ResponseBodyGuardrailConfig,
+    input: ResponseBodyGuardrailInput,
+) -> Duration {
+    config
+        .idle_timeout
+        .saturating_sub(input.idle_for)
+        .min(config.total_timeout.saturating_sub(input.elapsed))
+}
+
+fn resolve_progressive_emission_policy(
+    input: ResponseBodyGuardrailInput,
+) -> ProgressiveEmissionPolicy {
+    if !input.body_forwarding_enabled {
+        return ProgressiveEmissionPolicy::SuppressBody;
+    }
+
+    if !input.progressive_emission_allowed
+        || input.headers_emitted
+        || input.declared_content_length.is_some()
+        || input.exempt_from_body_size_cap
+    {
+        return ProgressiveEmissionPolicy::StreamProgressively;
+    }
+
+    ProgressiveEmissionPolicy::PrebufferUntilValidated
+}
+
+pub(crate) fn evaluate_response_body_guardrails(
+    config: ResponseBodyGuardrailConfig,
+    input: ResponseBodyGuardrailInput,
+) -> ResponseBodyGuardrailDecision {
+    if input.elapsed >= config.total_timeout {
+        return ResponseBodyGuardrailDecision::Timeout {
+            kind: BodyTimeoutKind::Total,
+        };
+    }
+
+    if input.idle_for >= config.idle_timeout {
+        return ResponseBodyGuardrailDecision::Timeout {
+            kind: BodyTimeoutKind::Idle,
+        };
+    }
+
+    let emission = resolve_progressive_emission_policy(input);
+    if input.body_forwarding_enabled && !input.exempt_from_body_size_cap {
+        if input
+            .declared_content_length
+            .is_some_and(|length| length > config.max_body_bytes)
+        {
+            return ResponseBodyGuardrailDecision::Reject {
+                kind: BodyLimitKind::BodySizeCap,
+            };
+        }
+
+        let next_total = input.bytes_received.saturating_add(input.next_chunk_bytes);
+        if next_total > config.max_body_bytes {
+            return ResponseBodyGuardrailDecision::Reject {
+                kind: BodyLimitKind::BodySizeCap,
+            };
+        }
+
+        if matches!(emission, ProgressiveEmissionPolicy::PrebufferUntilValidated)
+            && input
+                .prebuffered_bytes
+                .saturating_add(input.next_chunk_bytes)
+                > config.unknown_length_prebuffer_bytes
+        {
+            return ResponseBodyGuardrailDecision::Reject {
+                kind: BodyLimitKind::UnknownLengthPrebufferCap,
+            };
+        }
+    }
+
+    let chunk_emission = match emission {
+        ProgressiveEmissionPolicy::SuppressBody => ResponseChunkEmissionPolicy::Passthrough,
+        ProgressiveEmissionPolicy::StreamProgressively
+        | ProgressiveEmissionPolicy::PrebufferUntilValidated => {
+            ResponseChunkEmissionPolicy::FixedSize {
+                max_chunk_bytes: config.chunk_bytes.max(1),
+            }
+        }
+    };
+
+    ResponseBodyGuardrailDecision::Continue {
+        streaming: ResponseStreamingPolicy {
+            emission,
+            chunk_emission,
+            wait_timeout: response_wait_timeout(config, input),
+        },
+    }
+}
+
+pub(crate) fn response_chunk_ranges(
+    data_len: usize,
+    policy: ResponseChunkEmissionPolicy,
+) -> Vec<(usize, usize)> {
+    match policy {
+        ResponseChunkEmissionPolicy::Passthrough => vec![(0, data_len)],
+        ResponseChunkEmissionPolicy::FixedSize { max_chunk_bytes } => (0..data_len)
+            .step_by(max_chunk_bytes.max(1))
+            .map(|start| (start, (start + max_chunk_bytes).min(data_len)))
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -242,6 +358,149 @@ mod tests {
             RequestBodyGuardrailDecision::Reject {
                 kind: BodyLimitKind::UnknownLengthPrebufferCap,
             }
+        );
+    }
+
+    #[test]
+    fn response_body_prefers_prebuffer_for_unknown_length_before_headers() {
+        let decision = evaluate_response_body_guardrails(
+            ResponseBodyGuardrailConfig {
+                idle_timeout: Duration::from_secs(5),
+                total_timeout: Duration::from_secs(30),
+                max_body_bytes: 64,
+                unknown_length_prebuffer_bytes: 16,
+                chunk_bytes: 8,
+            },
+            ResponseBodyGuardrailInput {
+                elapsed: Duration::from_secs(1),
+                idle_for: Duration::from_secs(1),
+                bytes_received: 0,
+                prebuffered_bytes: 0,
+                next_chunk_bytes: 0,
+                declared_content_length: None,
+                headers_emitted: false,
+                progressive_emission_allowed: true,
+                body_forwarding_enabled: true,
+                exempt_from_body_size_cap: false,
+            },
+        );
+
+        assert_eq!(
+            decision,
+            ResponseBodyGuardrailDecision::Continue {
+                streaming: ResponseStreamingPolicy {
+                    emission: ProgressiveEmissionPolicy::PrebufferUntilValidated,
+                    chunk_emission: ResponseChunkEmissionPolicy::FixedSize { max_chunk_bytes: 8 },
+                    wait_timeout: Duration::from_secs(4),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn response_body_declared_length_cap_rejects() {
+        let decision = evaluate_response_body_guardrails(
+            ResponseBodyGuardrailConfig {
+                idle_timeout: Duration::from_secs(5),
+                total_timeout: Duration::from_secs(30),
+                max_body_bytes: 16,
+                unknown_length_prebuffer_bytes: 8,
+                chunk_bytes: 8,
+            },
+            ResponseBodyGuardrailInput {
+                elapsed: Duration::ZERO,
+                idle_for: Duration::ZERO,
+                bytes_received: 0,
+                prebuffered_bytes: 0,
+                next_chunk_bytes: 0,
+                declared_content_length: Some(17),
+                headers_emitted: false,
+                progressive_emission_allowed: true,
+                body_forwarding_enabled: true,
+                exempt_from_body_size_cap: false,
+            },
+        );
+
+        assert_eq!(
+            decision,
+            ResponseBodyGuardrailDecision::Reject {
+                kind: BodyLimitKind::BodySizeCap,
+            }
+        );
+    }
+
+    #[test]
+    fn response_body_unknown_length_prebuffer_cap_rejects() {
+        let decision = evaluate_response_body_guardrails(
+            ResponseBodyGuardrailConfig {
+                idle_timeout: Duration::from_secs(5),
+                total_timeout: Duration::from_secs(30),
+                max_body_bytes: 64,
+                unknown_length_prebuffer_bytes: 10,
+                chunk_bytes: 4,
+            },
+            ResponseBodyGuardrailInput {
+                elapsed: Duration::from_secs(1),
+                idle_for: Duration::from_secs(1),
+                bytes_received: 6,
+                prebuffered_bytes: 6,
+                next_chunk_bytes: 5,
+                declared_content_length: None,
+                headers_emitted: false,
+                progressive_emission_allowed: true,
+                body_forwarding_enabled: true,
+                exempt_from_body_size_cap: false,
+            },
+        );
+
+        assert_eq!(
+            decision,
+            ResponseBodyGuardrailDecision::Reject {
+                kind: BodyLimitKind::UnknownLengthPrebufferCap,
+            }
+        );
+    }
+
+    #[test]
+    fn response_body_total_timeout_rejects() {
+        let decision = evaluate_response_body_guardrails(
+            ResponseBodyGuardrailConfig {
+                idle_timeout: Duration::from_secs(5),
+                total_timeout: Duration::from_secs(30),
+                max_body_bytes: 64,
+                unknown_length_prebuffer_bytes: 16,
+                chunk_bytes: 8,
+            },
+            ResponseBodyGuardrailInput {
+                elapsed: Duration::from_secs(30),
+                idle_for: Duration::from_secs(1),
+                bytes_received: 0,
+                prebuffered_bytes: 0,
+                next_chunk_bytes: 0,
+                declared_content_length: None,
+                headers_emitted: false,
+                progressive_emission_allowed: true,
+                body_forwarding_enabled: true,
+                exempt_from_body_size_cap: false,
+            },
+        );
+
+        assert_eq!(
+            decision,
+            ResponseBodyGuardrailDecision::Timeout {
+                kind: BodyTimeoutKind::Total,
+            }
+        );
+    }
+
+    #[test]
+    fn response_chunk_ranges_follow_fixed_size_policy() {
+        assert_eq!(
+            response_chunk_ranges(
+                10,
+                ResponseChunkEmissionPolicy::FixedSize { max_chunk_bytes: 4 }
+            ),
+            vec![(0, 4), (4, 8), (8, 10)]
         );
     }
 }

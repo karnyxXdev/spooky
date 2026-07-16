@@ -1,5 +1,8 @@
 use std::time::Duration;
 
+pub(crate) const REQUEST_BODY_TOO_LARGE_BODY: &[u8] = b"request body too large\n";
+pub(crate) const RESPONSE_BODY_TOO_LARGE_BODY: &[u8] = b"upstream response body too large\n";
+
 /// Shared limits for request-body ingress handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestBodyGuardrailConfig {
@@ -123,6 +126,15 @@ pub(crate) fn evaluate_request_body_ingress(
     config: RequestBodyGuardrailConfig,
     input: RequestBodyGuardrailInput,
 ) -> RequestBodyGuardrailDecision {
+    if input
+        .declared_content_length
+        .is_some_and(|length| !input.exempt_from_body_size_cap && length > config.max_body_bytes)
+    {
+        return RequestBodyGuardrailDecision::Reject {
+            kind: BodyLimitKind::BodySizeCap,
+        };
+    }
+
     let next_total = input.bytes_received.saturating_add(input.next_chunk_bytes);
     if !input.exempt_from_body_size_cap && next_total > config.max_body_bytes {
         return RequestBodyGuardrailDecision::Reject {
@@ -141,6 +153,20 @@ pub(crate) fn evaluate_request_body_ingress(
     }
 
     RequestBodyGuardrailDecision::Continue
+}
+
+pub(crate) fn response_body_limit_reason(kind: BodyLimitKind) -> &'static str {
+    match kind {
+        BodyLimitKind::BodySizeCap => "upstream response body too large",
+        BodyLimitKind::BufferedBodyCap => "upstream response buffered body limit exceeded",
+        BodyLimitKind::UnknownLengthPrebufferCap => {
+            "unknown-length response prebuffer limit exceeded"
+        }
+    }
+}
+
+pub(crate) fn is_unknown_length_response_prebuffer_reason(reason: &str) -> bool {
+    reason == response_body_limit_reason(BodyLimitKind::UnknownLengthPrebufferCap)
 }
 
 fn response_wait_timeout(
@@ -357,6 +383,34 @@ mod tests {
             decision,
             RequestBodyGuardrailDecision::Reject {
                 kind: BodyLimitKind::UnknownLengthPrebufferCap,
+            }
+        );
+    }
+
+    #[test]
+    fn request_body_declared_length_cap_rejects() {
+        let decision = evaluate_request_body_ingress(
+            RequestBodyGuardrailConfig {
+                idle_timeout: Duration::from_secs(5),
+                total_timeout: Duration::from_secs(30),
+                max_body_bytes: 16,
+                max_buffered_bytes: usize::MAX,
+            },
+            RequestBodyGuardrailInput {
+                elapsed: Duration::ZERO,
+                idle_for: Duration::ZERO,
+                bytes_received: 0,
+                buffered_bytes: 0,
+                next_chunk_bytes: 0,
+                declared_content_length: Some(17),
+                exempt_from_body_size_cap: false,
+            },
+        );
+
+        assert_eq!(
+            decision,
+            RequestBodyGuardrailDecision::Reject {
+                kind: BodyLimitKind::BodySizeCap,
             }
         );
     }

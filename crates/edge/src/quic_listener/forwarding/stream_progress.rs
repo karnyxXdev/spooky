@@ -2,10 +2,11 @@ use super::*;
 use crate::runtime::connection::{
     auth::ExternalAuthResult,
     guardrails::{
-        BodyLimitKind, BodyTimeoutKind, ProgressiveEmissionPolicy, RequestBodyGuardrailConfig,
-        RequestBodyGuardrailDecision, RequestBodyGuardrailInput, ResponseBodyGuardrailConfig,
-        ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput, evaluate_request_body_timeouts,
-        evaluate_response_body_guardrails, response_chunk_ranges,
+        BodyLimitKind, BodyTimeoutKind, ProgressiveEmissionPolicy, RESPONSE_BODY_TOO_LARGE_BODY,
+        RequestBodyGuardrailConfig, RequestBodyGuardrailDecision, RequestBodyGuardrailInput,
+        ResponseBodyGuardrailConfig, ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput,
+        evaluate_request_body_timeouts, evaluate_response_body_guardrails,
+        response_body_limit_reason, response_chunk_ranges,
     },
 };
 
@@ -16,16 +17,18 @@ fn response_body_guardrail_error(decision: ResponseBodyGuardrailDecision) -> Opt
         ResponseBodyGuardrailDecision::Reject {
             kind: BodyLimitKind::BodySizeCap,
         } => Some(ProxyError::Pool(PoolError::BackendOverloaded(
-            "upstream response body too large".into(),
+            response_body_limit_reason(BodyLimitKind::BodySizeCap).into(),
         ))),
         ResponseBodyGuardrailDecision::Reject {
             kind: BodyLimitKind::UnknownLengthPrebufferCap,
         } => Some(ProxyError::Pool(PoolError::BackendOverloaded(
-            "unknown-length response prebuffer limit exceeded".into(),
+            response_body_limit_reason(BodyLimitKind::UnknownLengthPrebufferCap).into(),
         ))),
-        ResponseBodyGuardrailDecision::Reject { .. } => Some(ProxyError::Pool(
-            PoolError::BackendOverloaded("upstream response rejected".into()),
-        )),
+        ResponseBodyGuardrailDecision::Reject { .. } => {
+            Some(ProxyError::Pool(PoolError::BackendOverloaded(
+                response_body_limit_reason(BodyLimitKind::BufferedBodyCap).into(),
+            )))
+        }
     }
 }
 
@@ -397,7 +400,7 @@ impl QUICListener {
                                     quic,
                                     stream_id,
                                     http::StatusCode::SERVICE_UNAVAILABLE,
-                                    b"upstream response body too large\n",
+                                    RESPONSE_BODY_TOO_LARGE_BODY,
                                 );
                             }
                             if let Some(req) = streams.get_mut(&stream_id) {

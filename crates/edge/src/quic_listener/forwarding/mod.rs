@@ -961,7 +961,7 @@ impl QUICListener {
                                     &mut connection.quic,
                                     stream_id,
                                     http::StatusCode::PAYLOAD_TOO_LARGE,
-                                    b"request body too large\n",
+                                    REQUEST_BODY_TOO_LARGE_BODY,
                                 )?;
                                 if let Some(req) = connection.streams.get_mut(&stream_id) {
                                     abort_stream(req, &metrics);

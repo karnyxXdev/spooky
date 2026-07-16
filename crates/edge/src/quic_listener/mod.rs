@@ -87,8 +87,9 @@ use crate::{
         bundle::{RuntimeBundle, RuntimeBundleHandle},
         connection::{
             guardrails::{
-                BodyLimitKind, RequestBodyGuardrailConfig, RequestBodyGuardrailDecision,
-                RequestBodyGuardrailInput, evaluate_request_body_ingress,
+                BodyLimitKind, REQUEST_BODY_TOO_LARGE_BODY, RequestBodyGuardrailConfig,
+                RequestBodyGuardrailDecision, RequestBodyGuardrailInput,
+                evaluate_request_body_ingress,
             },
             quic::{QuicConnection, QuicConnectionErrorSnapshot},
             request::RequestEnvelope,
@@ -240,16 +241,6 @@ fn should_strip_bootstrap_response_header(
             preserve_upgrade: false,
         },
     )
-}
-
-#[cfg(test)]
-fn response_size_exceeded_after_chunk(
-    response_bytes_received: &mut usize,
-    chunk_len: usize,
-    max_response_body_bytes: usize,
-) -> bool {
-    *response_bytes_received = response_bytes_received.saturating_add(chunk_len);
-    *response_bytes_received > max_response_body_bytes
 }
 
 fn is_connect_method(method: &str) -> bool {

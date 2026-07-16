@@ -56,8 +56,16 @@ use crate::{
     resilience::runtime::RuntimeResilience,
     routing::index::RouteIndex,
     runtime::{
-        backend::store::RuntimeBackendResolutionStore, bundle::RuntimeBundleHandle,
-        shared_state::SharedRuntimeState, tls::store::ListenerTlsReloadStore,
+        backend::store::RuntimeBackendResolutionStore,
+        bundle::RuntimeBundleHandle,
+        connection::guardrails::{
+            BodyLimitKind, REQUEST_BODY_TOO_LARGE_BODY, RESPONSE_BODY_TOO_LARGE_BODY,
+            RequestBodyGuardrailConfig, RequestBodyGuardrailDecision, RequestBodyGuardrailInput,
+            ResponseBodyGuardrailConfig, ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput,
+            evaluate_request_body_ingress, evaluate_response_body_guardrails,
+        },
+        shared_state::SharedRuntimeState,
+        tls::store::ListenerTlsReloadStore,
     },
 };
 
@@ -695,15 +703,34 @@ impl QUICListener {
                                 };
 
                                 let request_path = if path.is_empty() { "/" } else { &path };
-                                if !is_websocket_upgrade
-                                    && content_length
-                                        .is_some_and(|value| value > max_request_body_bytes)
-                                {
+                                let request_size_decision = evaluate_request_body_ingress(
+                                    RequestBodyGuardrailConfig {
+                                        idle_timeout: Duration::ZERO,
+                                        total_timeout: Duration::ZERO,
+                                        max_body_bytes: max_request_body_bytes,
+                                        max_buffered_bytes: usize::MAX,
+                                    },
+                                    RequestBodyGuardrailInput {
+                                        elapsed: Duration::ZERO,
+                                        idle_for: Duration::ZERO,
+                                        bytes_received: 0,
+                                        buffered_bytes: 0,
+                                        next_chunk_bytes: 0,
+                                        declared_content_length: content_length,
+                                        exempt_from_body_size_cap: is_websocket_upgrade,
+                                    },
+                                );
+                                if matches!(
+                                    request_size_decision,
+                                    RequestBodyGuardrailDecision::Reject {
+                                        kind: BodyLimitKind::BodySizeCap,
+                                    }
+                                ) {
                                     return Ok(Response::builder()
                                         .status(StatusCode::PAYLOAD_TOO_LARGE)
                                         .header("alt-svc", &alt)
                                         .body(boxed_full(Bytes::from_static(
-                                            b"request body too large\n",
+                                            REQUEST_BODY_TOO_LARGE_BODY,
                                         )))
                                         .unwrap_or_else(|_| {
                                             Response::new(boxed_full(Bytes::from_static(
@@ -1075,27 +1102,6 @@ impl QUICListener {
                                     }
                                 };
 
-                                if !suppress_downstream_body
-                                    && let Some(content_length) = upstream_resp
-                                        .headers()
-                                        .get(http::header::CONTENT_LENGTH)
-                                        .and_then(|v| v.to_str().ok())
-                                        .and_then(|s| s.parse::<usize>().ok())
-                                    && content_length > max_response_body_bytes
-                                {
-                                    return Ok(Response::builder()
-                                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                                        .header("alt-svc", &alt)
-                                        .body(boxed_full(Bytes::from_static(
-                                            b"upstream response body too large\n",
-                                        )))
-                                        .unwrap_or_else(|_| {
-                                            Response::new(boxed_full(Bytes::from_static(
-                                                b"error\n",
-                                            )))
-                                        }));
-                                }
-
                                 let status = upstream_resp.status();
                                 let normalized_response =
                                     normalize_upstream_response(ResponseNormalizationInput {
@@ -1117,6 +1123,56 @@ impl QUICListener {
                                                 && status == StatusCode::SWITCHING_PROTOCOLS,
                                         },
                                     });
+                                let upstream_content_length = upstream_resp
+                                    .headers()
+                                    .get(http::header::CONTENT_LENGTH)
+                                    .and_then(|v| v.to_str().ok())
+                                    .and_then(|s| s.parse::<usize>().ok());
+                                let response_size_decision = evaluate_response_body_guardrails(
+                                    ResponseBodyGuardrailConfig {
+                                        idle_timeout: Duration::ZERO,
+                                        total_timeout: Duration::MAX,
+                                        max_body_bytes: max_response_body_bytes,
+                                        unknown_length_prebuffer_bytes: max_response_body_bytes,
+                                        chunk_bytes: 1,
+                                    },
+                                    ResponseBodyGuardrailInput {
+                                        elapsed: Duration::ZERO,
+                                        idle_for: Duration::ZERO,
+                                        bytes_received: 0,
+                                        prebuffered_bytes: 0,
+                                        next_chunk_bytes: 0,
+                                        declared_content_length: upstream_content_length,
+                                        headers_emitted: false,
+                                        progressive_emission_allowed: !normalized_response
+                                            .emission
+                                            .emit_end_stream_on_headers,
+                                        body_forwarding_enabled: matches!(
+                                            normalized_response.emission.body,
+                                            ResponseBodyPolicy::Forward
+                                        ),
+                                        exempt_from_body_size_cap: is_websocket_upgrade
+                                            && status == StatusCode::SWITCHING_PROTOCOLS,
+                                    },
+                                );
+                                if matches!(
+                                    response_size_decision,
+                                    ResponseBodyGuardrailDecision::Reject {
+                                        kind: BodyLimitKind::BodySizeCap,
+                                    }
+                                ) {
+                                    return Ok(Response::builder()
+                                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                                        .header("alt-svc", &alt)
+                                        .body(boxed_full(Bytes::from_static(
+                                            RESPONSE_BODY_TOO_LARGE_BODY,
+                                        )))
+                                        .unwrap_or_else(|_| {
+                                            Response::new(boxed_full(Bytes::from_static(
+                                                b"error\n",
+                                            )))
+                                        }));
+                                }
                                 let mut resp_builder =
                                     Response::builder().status(normalized_response.head.status);
                                 for header in &normalized_response.head.headers {

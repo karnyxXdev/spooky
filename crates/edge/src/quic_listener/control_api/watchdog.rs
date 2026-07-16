@@ -23,7 +23,7 @@ impl QUICListener {
         watchdog: Arc<WatchdogCoordinator>,
         task_registry: Arc<RuntimeTaskRegistry>,
     ) {
-        let watchdog_config = WatchdogRuntimeConfig::from(&config.resilience.watchdog);
+        let watchdog_config = WatchdogRuntimeConfig::from(&config.policies.admission.watchdog);
         if !watchdog_config.enabled || !watchdog.enabled() {
             return;
         }

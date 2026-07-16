@@ -1,4 +1,5 @@
 use spooky_config::config::Watchdog as WatchdogConfig;
+use spooky_config::runtime::RuntimeWatchdogPolicy;
 
 #[derive(Debug, Clone)]
 pub struct WatchdogRuntimeConfig {
@@ -29,6 +30,32 @@ impl From<&WatchdogConfig> for WatchdogRuntimeConfig {
             restart_cooldown_ms: value.restart_cooldown_ms.max(1),
             restart_command: value.restart_command.clone(),
             restart_hook: value.restart_hook.clone(),
+        }
+    }
+}
+
+impl From<&RuntimeWatchdogPolicy> for WatchdogRuntimeConfig {
+    fn from(value: &RuntimeWatchdogPolicy) -> Self {
+        Self {
+            enabled: value.enabled,
+            check_interval_ms: value.check_interval.as_millis().try_into().unwrap_or(u64::MAX),
+            poll_stall_timeout_ms: value
+                .poll_stall_timeout
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            timeout_error_rate_percent: value.timeout_error_rate_percent,
+            min_requests_per_window: value.min_requests_per_window,
+            overload_inflight_percent: value.overload_inflight_percent,
+            unhealthy_consecutive_windows: value.unhealthy_consecutive_windows,
+            drain_grace_ms: value.drain_grace.as_millis().try_into().unwrap_or(u64::MAX),
+            restart_cooldown_ms: value
+                .restart_cooldown
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            restart_command: value.restart_command.clone(),
+            restart_hook: None,
         }
     }
 }

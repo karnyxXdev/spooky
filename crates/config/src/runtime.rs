@@ -453,8 +453,12 @@ mod tests {
         let mut config = sample_config();
         config.performance.backend_timeout_ms = 2_500;
         config.performance.backend_connect_timeout_ms = 400;
+        config.performance.backend_body_idle_timeout_ms = 3_500;
+        config.performance.backend_body_total_timeout_ms = 4_500;
+        config.performance.backend_total_request_timeout_ms = 5_500;
         config.performance.h2_pool_idle_timeout_ms = 91_000;
         config.performance.max_active_connections = 1234;
+        config.performance.max_request_body_bytes = 8_000;
         config.performance.request_buffer_global_cap_bytes = 9_999;
         config.resilience.route_queue.shed_retry_after_seconds = 17;
 
@@ -467,6 +471,38 @@ mod tests {
         assert_eq!(policies.transport.max_active_connections, 1234);
         assert_eq!(policies.transport.request_buffer_global_cap_bytes, 9_999);
         assert_eq!(policies.admission.route_queue.shed_retry_after_seconds, 17);
+    }
+
+    #[test]
+    fn runtime_defaults_produce_listener_and_runtime_policy_parity() {
+        let config = sample_config();
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let listener = runtime
+            .primary_listener_runtime_config()
+            .expect("primary listener");
+
+        assert_eq!(
+            runtime.policies.timeouts.backend_request,
+            Duration::from_millis(config.performance.backend_timeout_ms)
+        );
+        assert_eq!(
+            runtime.policies.timeouts.quic_max_idle,
+            Duration::from_millis(config.performance.quic_max_idle_timeout_ms)
+        );
+        assert_eq!(
+            runtime.policies.transport.connection_limits.global_inflight,
+            config.performance.global_inflight_limit
+        );
+        assert_eq!(
+            runtime.policies.transport.quic_initial_max_data,
+            config.performance.quic_initial_max_data
+        );
+        assert_eq!(
+            runtime.policies.admission.watchdog.check_interval,
+            Duration::from_millis(config.resilience.watchdog.check_interval_ms)
+        );
+        assert_eq!(listener.policies.timeouts, runtime.policies.timeouts);
+        assert_eq!(listener.policies.transport, runtime.policies.transport);
     }
 
     #[test]
@@ -526,6 +562,103 @@ mod tests {
             api.rate_limits.scoped_limits[0].idle_ttl,
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn runtime_config_normalizes_jwt_and_scoped_rate_limit_shapes() {
+        let mut config = sample_config();
+        let upstream = config.upstream.get_mut("api").expect("api upstream");
+        upstream.auth.jwt = Some(crate::config::JwtAuth {
+            secret: "jwt-secret".to_string(),
+            issuer: Some(" issuer-1 ".to_string()),
+            audience: Some(" spooky-api ".to_string()),
+            clock_skew_secs: 45,
+        });
+        upstream.auth.required_scopes = vec![" read:api ".to_string()];
+        upstream.auth.required_roles = vec![" admin ".to_string()];
+        config.resilience.scoped_rate_limits = vec![crate::config::ScopedRateLimit {
+            name: " tenant-default ".to_string(),
+            scope: crate::config::ScopedRateLimitScope::Tenant,
+            requests_per_sec: 12,
+            burst: 34,
+            key: Some("header:x-tenant-id".to_string()),
+            route_allowlist: vec![" api ".to_string()],
+            idle_ttl_secs: 9,
+        }];
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let api = runtime.upstreams.get("api").expect("api runtime upstream");
+        let jwt = api
+            .policy
+            .upstream_auth
+            .jwt
+            .as_ref()
+            .expect("jwt policy");
+        let scoped_limit = runtime
+            .policies
+            .rate_limits
+            .scoped_limits
+            .first()
+            .expect("scoped rate limit");
+
+        assert_eq!(jwt.issuer.as_deref(), Some("issuer-1"));
+        assert_eq!(jwt.audience.as_deref(), Some("spooky-api"));
+        assert_eq!(jwt.clock_skew, Duration::from_secs(45));
+        assert_eq!(
+            api.policy.upstream_auth.required_scopes,
+            vec!["read:api".to_string()]
+        );
+        assert_eq!(
+            api.policy.upstream_auth.required_roles,
+            vec!["admin".to_string()]
+        );
+        assert_eq!(scoped_limit.name, " tenant-default ");
+        assert_eq!(
+            scoped_limit.route_allowlist,
+            vec!["api".to_string()]
+        );
+        assert_eq!(scoped_limit.key.as_deref(), Some("header:x-tenant-id"));
+        assert_eq!(scoped_limit.idle_ttl, Duration::from_secs(9));
+    }
+
+    #[test]
+    fn runtime_upstreams_as_config_canonicalizes_route_and_lb_shapes() {
+        let mut config = sample_config();
+        let upstream = config.upstream.get_mut("api").expect("api upstream");
+        upstream.load_balancing = LoadBalancing {
+            lb_type: "cid_sticky".to_string(),
+            key: Some("header:x-user-id".to_string()),
+        };
+        upstream.route = RouteMatch {
+            host: Some("API.EXAMPLE.COM:443.".to_string()),
+            path_prefix: Some("/v1".to_string()),
+            method: Some("get".to_string()),
+        };
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let runtime_upstream = runtime.upstreams.get("api").expect("api runtime upstream");
+        let exported = runtime
+            .upstreams_as_config()
+            .remove("api")
+            .expect("api exported upstream");
+
+        assert_eq!(
+            runtime_upstream.load_balancing.strategy,
+            RuntimeLoadBalancingStrategy::StickyCid
+        );
+        assert_eq!(
+            runtime_upstream.load_balancing.key_spec,
+            Some(RuntimeRequestKeySpec::Header("x-user-id".to_string()))
+        );
+        assert!(!runtime_upstream.load_balancing.alternate_backend.readonly_lb_pick);
+        assert!(runtime_upstream.load_balancing.alternate_backend.healthy_fallback);
+        assert_eq!(runtime_upstream.route.host.as_deref(), Some("api.example.com:443"));
+        assert_eq!(runtime_upstream.route.method.as_deref(), Some("GET"));
+        assert_eq!(runtime_upstream.route.path_prefix.as_deref(), Some("/v1"));
+        assert_eq!(exported.load_balancing.lb_type, "sticky-cid");
+        assert_eq!(exported.route.host.as_deref(), Some("api.example.com:443"));
+        assert_eq!(exported.route.method.as_deref(), Some("GET"));
+        assert_eq!(exported.route.path_prefix.as_deref(), Some("/v1"));
     }
 
     #[test]
@@ -825,6 +958,32 @@ mod tests {
         let err = RuntimeConfig::from_config(&config).expect_err("duplicate routes");
         assert_eq!(err.category(), "duplicate_route_ambiguity");
         assert!(err.to_string().contains("conflicts with upstream"));
+    }
+
+    #[test]
+    fn runtime_config_rejects_invalid_timeout_ordering() {
+        let mut config = sample_config();
+        config.performance.backend_connect_timeout_ms = 2_000;
+        config.performance.backend_timeout_ms = 1_000;
+
+        let err =
+            RuntimeConfig::from_config(&config).expect_err("timeout ordering must be validated");
+        assert_eq!(err.category(), "config_invalid");
+        assert!(
+            err.to_string()
+                .contains("backend_connect_timeout_ms must be <= backend_timeout_ms")
+        );
+    }
+
+    #[test]
+    fn runtime_config_rejects_invalid_lb_key_spec() {
+        let mut config = sample_config();
+        config.upstream.get_mut("api").expect("api").load_balancing.key =
+            Some("header:   ".to_string());
+
+        let err = RuntimeConfig::from_config(&config).expect_err("invalid key spec must fail");
+        assert_eq!(err.category(), "config_invalid");
+        assert!(err.to_string().contains("unsupported request key spec"));
     }
 
     #[test]

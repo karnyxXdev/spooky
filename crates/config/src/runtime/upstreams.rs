@@ -180,21 +180,37 @@ fn config_route_auth(auth: &RuntimeAuthPolicy) -> crate::config::RouteAuth {
 }
 
 impl RuntimeUpstream {
-    pub(super) fn from_config(config: &Config, name: &str, upstream: &Upstream) -> Self {
+    pub(super) fn from_config(
+        config: &Config,
+        name: &str,
+        upstream: &Upstream,
+        base_policies: &RuntimePolicySet,
+    ) -> Result<Self, RuntimeConfigError> {
         let effective_tls = upstream
             .tls
             .clone()
             .unwrap_or_else(|| config.upstream_tls.clone());
-
-        Self {
+        let policy = RuntimeUpstreamPolicy {
+            upstream_auth: runtime_auth_policy(&upstream.auth),
+            host: RuntimeHostPolicy(upstream.host_policy.clone()),
+            forwarded_headers: RuntimeForwardedHeaderPolicy(upstream.forwarded_headers.clone()),
+            protocol: base_policies.admission.protocol.clone(),
+        };
+        let mut runtime_upstream = Self {
             name: name.to_string(),
             load_balancing: upstream.load_balancing.clone(),
             route: upstream.route.clone(),
-            policy: RuntimeUpstreamPolicy {
-                upstream_auth: runtime_auth_policy(&upstream.auth),
+            policy,
+            policy_set: RuntimeUpstreamPolicySet {
+                timeouts: base_policies.timeouts.clone(),
+                auth: RuntimeAuthPolicy::default(),
+                rate_limits: base_policies.rate_limits.clone(),
+                load_balancing: RuntimeLoadBalancingPolicy::normalize(&upstream.load_balancing)?,
+                admission: base_policies.admission.clone(),
+                transport: RuntimeUpstreamTransportPolicy::from_effective_tls(&effective_tls),
                 host: RuntimeHostPolicy(upstream.host_policy.clone()),
                 forwarded_headers: RuntimeForwardedHeaderPolicy(upstream.forwarded_headers.clone()),
-                protocol: RuntimeProtocolPolicy(config.resilience.protocol.clone()),
+                protocol: base_policies.admission.protocol.clone(),
             },
             effective_tls: effective_tls.clone(),
             backends: upstream
@@ -206,7 +222,10 @@ impl RuntimeUpstream {
                     effective_tls: effective_tls.clone(),
                 })
                 .collect(),
-        }
+        };
+        runtime_upstream.policy_set.auth = runtime_upstream.policy.upstream_auth.clone();
+
+        Ok(runtime_upstream)
     }
 
     pub fn as_config_upstream(&self) -> Upstream {
@@ -228,6 +247,7 @@ impl RuntimeUpstream {
 
 pub(super) fn normalize_upstreams(
     config: &Config,
+    base_policies: &RuntimePolicySet,
 ) -> Result<HashMap<String, RuntimeUpstream>, RuntimeConfigError> {
     if config.upstream.is_empty() {
         return Err(RuntimeConfigError::ConfigInvalid(
@@ -261,7 +281,7 @@ pub(super) fn normalize_upstreams(
         }
 
         let runtime_upstream =
-            RuntimeUpstream::from_config(config, upstream_name.as_str(), upstream);
+            RuntimeUpstream::from_config(config, upstream_name.as_str(), upstream, base_policies)?;
         let mut upstream_uses_https_backends = false;
 
         for backend in &runtime_upstream.backends {

@@ -28,6 +28,7 @@ pub struct RuntimeConfig {
     pub version: u32,
     pub listeners: Vec<RuntimeListener>,
     pub upstreams: HashMap<String, RuntimeUpstream>,
+    pub policies: RuntimePolicySet,
     pub performance: Performance,
     pub observability: Observability,
     pub resilience: Resilience,
@@ -36,10 +37,12 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     pub fn from_config(config: &Config) -> Result<Self, RuntimeConfigError> {
+        let policies = RuntimePolicySet::from_config(config)?;
         Ok(Self {
             version: config.version,
             listeners: listeners::runtime_listeners(config)?,
-            upstreams: upstreams::normalize_upstreams(config)?,
+            upstreams: upstreams::normalize_upstreams(config, &policies)?,
+            policies,
             performance: config.performance.clone(),
             observability: config.observability.clone(),
             resilience: config.resilience.clone(),
@@ -52,6 +55,11 @@ impl RuntimeConfig {
             .iter()
             .cloned()
             .map(|listen| ListenerRuntimeConfig {
+                policies: RuntimeListenerPolicySet {
+                    timeouts: self.policies.timeouts.clone(),
+                    transport: self.policies.transport.clone(),
+                    tls: listen.tls.clone(),
+                },
                 listen,
                 performance: self.performance.clone(),
                 observability: self.observability.clone(),
@@ -71,18 +79,13 @@ impl RuntimeConfig {
     }
 
     pub fn policies(&self) -> RuntimePolicySet {
-        RuntimePolicySet::from_runtime_config(self)
+        self.policies.clone()
     }
 
     pub fn upstream_policy_sets(&self) -> HashMap<String, RuntimeUpstreamPolicySet> {
         self.upstreams
             .iter()
-            .map(|(name, upstream)| {
-                (
-                    name.clone(),
-                    upstream.policy_set(&self.performance, &self.resilience),
-                )
-            })
+            .map(|(name, upstream)| (name.clone(), upstream.policy_set.clone()))
             .collect()
     }
 }
@@ -195,6 +198,7 @@ pub struct RuntimeListener {
 #[derive(Debug, Clone)]
 pub struct ListenerRuntimeConfig {
     pub listen: RuntimeListener,
+    pub policies: RuntimeListenerPolicySet,
     pub performance: Performance,
     pub observability: Observability,
 }
@@ -230,6 +234,7 @@ pub struct RuntimeUpstream {
     pub load_balancing: LoadBalancing,
     pub route: RouteMatch,
     pub policy: RuntimeUpstreamPolicy,
+    pub policy_set: RuntimeUpstreamPolicySet,
     pub effective_tls: UpstreamTls,
     pub backends: Vec<RuntimeBackend>,
 }
@@ -318,12 +323,8 @@ pub struct RuntimeUpstreamPolicy {
 }
 
 impl RuntimeUpstream {
-    pub fn policy_set(
-        &self,
-        performance: &Performance,
-        resilience: &Resilience,
-    ) -> RuntimeUpstreamPolicySet {
-        RuntimeUpstreamPolicySet::from_runtime_parts(self, performance, resilience)
+    pub fn policy_set(&self) -> RuntimeUpstreamPolicySet {
+        self.policy_set.clone()
     }
 }
 

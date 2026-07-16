@@ -199,9 +199,7 @@ pub(crate) fn response_body_limit_reason(kind: BodyLimitKind) -> &'static str {
     match kind {
         BodyLimitKind::BodySize => "upstream response body too large",
         BodyLimitKind::BufferedBody => "upstream response buffered body limit exceeded",
-        BodyLimitKind::UnknownLengthPrebuffer => {
-            "unknown-length response prebuffer limit exceeded"
-        }
+        BodyLimitKind::UnknownLengthPrebuffer => "unknown-length response prebuffer limit exceeded",
     }
 }
 

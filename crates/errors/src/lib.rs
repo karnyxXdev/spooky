@@ -17,8 +17,7 @@ pub use spooky_lb::alternate_backend::{
 pub use retry::{
     HedgeOutcomeTelemetryReason, HedgePolicyDecision, HedgePolicyDenialReason,
     HedgePolicyFacts, HedgePrimaryState, HedgeTriggerTelemetryReason, RetryAttemptTelemetryReason,
-    RetryPolicyDecision, RetryPolicyDenial, RetryPolicyDenialReason, RetryPolicyFacts,
-    RetryPolicyInput,
+    RetryPolicyDecision, RetryPolicyDenialReason, RetryPolicyFacts,
     UpstreamRetryReason, UpstreamRetryability, UpstreamTerminalErrorKind,
     is_idempotent_method,
     classify_retryability, evaluate_hedge_policy, evaluate_retry_policy, is_retryable,

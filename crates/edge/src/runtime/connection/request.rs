@@ -86,13 +86,13 @@ pub struct RequestEnvelope {
     /// True once the client has sent FIN on the request stream.
     pub request_fin_received: bool,
     /// Receives the upstream H2 response (status, headers, body stream).
-    pub upstream_result_rx: Option<oneshot::Receiver<UpstreamResult>>,
+    pub(crate) upstream_result_rx: Option<oneshot::Receiver<UpstreamResult>>,
     /// Receives response body chunks to write back over QUIC.
-    pub response_chunk_rx: Option<mpsc::Receiver<ResponseChunk>>,
+    pub(crate) response_chunk_rx: Option<mpsc::Receiver<ResponseChunk>>,
     /// True once downstream response headers are emitted on this stream.
     pub response_headers_sent: bool,
     /// A chunk that could not be written due to QUIC send backpressure; retried next poll.
-    pub pending_chunk: Option<ResponseChunk>,
+    pub(crate) pending_chunk: Option<ResponseChunk>,
 }
 
 impl RequestEnvelope {

@@ -117,9 +117,6 @@ pub enum HedgeOutcomeTelemetryReason {
     HedgeWon,
 }
 
-pub type RetryPolicyInput = RetryPolicyFacts;
-pub type RetryPolicyDenial = RetryPolicyDenialReason;
-
 pub fn is_idempotent_method(method: &str) -> bool {
     matches!(
         method.to_ascii_uppercase().as_str(),

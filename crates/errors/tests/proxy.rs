@@ -1,8 +1,9 @@
 use spooky_errors::{
-    PoolError, ProxyError, RetryPolicyDecision, RetryPolicyDenial, RetryPolicyInput,
-    UpstreamErrorClassification, UpstreamHealthFailureMapping, UpstreamProxyErrorKind,
-    UpstreamRetryReason, UpstreamRetryability, UpstreamTerminalErrorKind, UpstreamTlsReason,
-    classify_retryability, classify_upstream_proxy_error, evaluate_retry_policy, is_retryable,
+    AlternateBackendFailureReason, PoolError, ProxyError, RetryPolicyDecision,
+    RetryPolicyDenialReason, RetryPolicyFacts, UpstreamErrorClassification,
+    UpstreamHealthFailureMapping, UpstreamProxyErrorKind, UpstreamRetryReason,
+    UpstreamRetryability, UpstreamTerminalErrorKind, UpstreamTlsReason, classify_retryability,
+    classify_upstream_proxy_error, evaluate_retry_policy, is_retryable,
 };
 
 #[test]
@@ -50,45 +51,83 @@ fn retryability_classification_distinguishes_retryable_and_terminal_errors() {
 #[test]
 fn retry_policy_evaluation_preserves_existing_denial_behavior() {
     assert_eq!(
-        evaluate_retry_policy(RetryPolicyInput {
+        evaluate_retry_policy(RetryPolicyFacts {
             retryability: UpstreamRetryability::Terminal(UpstreamTerminalErrorKind::Protocol),
-            bodyless_mode: true,
+            method_idempotent: true,
+            request_body_replayable: true,
+            attempt_count: 0,
+            max_attempts: 1,
             budget_available: true,
             alternate_backend_available: true,
-        }),
-        RetryPolicyDecision::DoNotRetry { denial: None }
-    );
-    assert_eq!(
-        evaluate_retry_policy(RetryPolicyInput {
-            retryability: UpstreamRetryability::Retryable(UpstreamRetryReason::Transport),
-            bodyless_mode: false,
-            budget_available: true,
-            alternate_backend_available: true,
+            alternate_backend_failure: None,
         }),
         RetryPolicyDecision::DoNotRetry {
-            denial: Some(RetryPolicyDenial::NotBodylessMode),
+            denial: Some(RetryPolicyDenialReason::TerminalError(
+                UpstreamTerminalErrorKind::Protocol,
+            )),
         }
     );
     assert_eq!(
-        evaluate_retry_policy(RetryPolicyInput {
+        evaluate_retry_policy(RetryPolicyFacts {
+            retryability: UpstreamRetryability::Retryable(UpstreamRetryReason::Transport),
+            method_idempotent: true,
+            request_body_replayable: false,
+            attempt_count: 0,
+            max_attempts: 1,
+            budget_available: true,
+            alternate_backend_available: true,
+            alternate_backend_failure: None,
+        }),
+        RetryPolicyDecision::DoNotRetry {
+            denial: Some(RetryPolicyDenialReason::RequestBodyNotReplayable),
+        }
+    );
+    assert_eq!(
+        evaluate_retry_policy(RetryPolicyFacts {
             retryability: UpstreamRetryability::Retryable(UpstreamRetryReason::Pool),
-            bodyless_mode: true,
+            method_idempotent: true,
+            request_body_replayable: true,
+            attempt_count: 0,
+            max_attempts: 1,
             budget_available: false,
             alternate_backend_available: true,
+            alternate_backend_failure: None,
         }),
         RetryPolicyDecision::DoNotRetry {
-            denial: Some(RetryPolicyDenial::BudgetDenied),
+            denial: Some(RetryPolicyDenialReason::BudgetDenied),
         }
     );
     assert_eq!(
-        evaluate_retry_policy(RetryPolicyInput {
+        evaluate_retry_policy(RetryPolicyFacts {
             retryability: UpstreamRetryability::Retryable(UpstreamRetryReason::Timeout),
-            bodyless_mode: true,
+            method_idempotent: true,
+            request_body_replayable: true,
+            attempt_count: 0,
+            max_attempts: 1,
             budget_available: true,
             alternate_backend_available: true,
+            alternate_backend_failure: None,
         }),
         RetryPolicyDecision::Retry {
             reason: UpstreamRetryReason::Timeout,
+        }
+    );
+
+    assert_eq!(
+        evaluate_retry_policy(RetryPolicyFacts {
+            retryability: UpstreamRetryability::Retryable(UpstreamRetryReason::Timeout),
+            method_idempotent: true,
+            request_body_replayable: true,
+            attempt_count: 0,
+            max_attempts: 1,
+            budget_available: true,
+            alternate_backend_available: false,
+            alternate_backend_failure: Some(AlternateBackendFailureReason::NoHealthyBackends),
+        }),
+        RetryPolicyDecision::DoNotRetry {
+            denial: Some(RetryPolicyDenialReason::AlternateBackendUnavailable(
+                AlternateBackendFailureReason::NoHealthyBackends,
+            )),
         }
     );
 }

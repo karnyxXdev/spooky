@@ -9,6 +9,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use spooky_errors::{
+    HedgeOutcomeTelemetryReason, HedgeTriggerTelemetryReason, RetryAttemptTelemetryReason,
+    RetryPolicyDenialReason,
+};
 pub use spooky_lb::health::HealthFailureReason;
 
 pub struct Metrics {
@@ -348,16 +352,6 @@ pub enum OverloadShedReason {
     ConnectionCap,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum RetryReason {
-    BackendTimeout,
-    BackendTransport,
-    BackendPool,
-    BudgetDenied,
-    NotBodylessMode,
-    NoAlternateBackend,
-}
-
 impl Default for Metrics {
     fn default() -> Self {
         Self::new(1, [String::from("unrouted")])
@@ -654,21 +648,21 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn inc_hedge_triggered(&self) {
+    pub fn inc_hedge_trigger(&self, _reason: HedgeTriggerTelemetryReason) {
         self.hedge_triggered.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn inc_hedge_won(&self) {
-        self.hedge_won.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn inc_hedge_wasted(&self) {
-        self.hedge_wasted.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn inc_hedge_primary_won_after_trigger(&self) {
-        self.hedge_primary_won_after_trigger
-            .fetch_add(1, Ordering::Relaxed);
+    pub fn inc_hedge_outcome(&self, reason: HedgeOutcomeTelemetryReason) {
+        match reason {
+            HedgeOutcomeTelemetryReason::PrimaryWonAfterTrigger => {
+                self.hedge_primary_won_after_trigger
+                    .fetch_add(1, Ordering::Relaxed);
+                self.hedge_wasted.fetch_add(1, Ordering::Relaxed);
+            }
+            HedgeOutcomeTelemetryReason::HedgeWon => {
+                self.hedge_won.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     pub fn observe_hedge_primary_late_ms(&self, late_ms: u64) {
@@ -1176,40 +1170,37 @@ impl Metrics {
         self.runtime_panics.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn inc_retry_attempt(&self, reason: RetryReason) {
+    pub fn inc_retry_attempt(&self, reason: RetryAttemptTelemetryReason) {
         self.retries_total.fetch_add(1, Ordering::Relaxed);
         match reason {
-            RetryReason::BackendTimeout => {
+            RetryAttemptTelemetryReason::Timeout => {
                 self.retry_reason_timeout.fetch_add(1, Ordering::Relaxed);
             }
-            RetryReason::BackendTransport => {
+            RetryAttemptTelemetryReason::Transport => {
                 self.retry_reason_transport.fetch_add(1, Ordering::Relaxed);
             }
-            RetryReason::BackendPool => {
+            RetryAttemptTelemetryReason::Pool => {
                 self.retry_reason_pool.fetch_add(1, Ordering::Relaxed);
             }
-            RetryReason::BudgetDenied
-            | RetryReason::NotBodylessMode
-            | RetryReason::NoAlternateBackend => {}
         }
     }
 
-    pub fn inc_retry_denied(&self, reason: RetryReason) {
+    pub fn inc_retry_denied(&self, reason: RetryPolicyDenialReason) {
         match reason {
-            RetryReason::BudgetDenied => {
+            RetryPolicyDenialReason::BudgetDenied => {
                 self.retry_denied_budget.fetch_add(1, Ordering::Relaxed);
             }
-            RetryReason::NotBodylessMode => {
+            RetryPolicyDenialReason::MethodNotIdempotent
+            | RetryPolicyDenialReason::RequestBodyNotReplayable => {
                 self.retry_denied_no_bodyless
                     .fetch_add(1, Ordering::Relaxed);
             }
-            RetryReason::NoAlternateBackend => {
+            RetryPolicyDenialReason::AlternateBackendUnavailable(_) => {
                 self.retry_denied_no_alternate
                     .fetch_add(1, Ordering::Relaxed);
             }
-            RetryReason::BackendTimeout
-            | RetryReason::BackendTransport
-            | RetryReason::BackendPool => {}
+            RetryPolicyDenialReason::TerminalError(_)
+            | RetryPolicyDenialReason::AttemptLimitReached => {}
         }
     }
 

@@ -72,7 +72,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{Instrument, info_span};
 
 use crate::{
-    ChannelBody, Metrics, OverloadShedReason, REQUEST_ID_COUNTER, RetryReason, RouteOutcome,
+    ChannelBody, Metrics, OverloadShedReason, REQUEST_ID_COUNTER, RouteOutcome,
     cid_radix::CidRadix,
     constants::{
         DEFAULT_SCID_LEN_BYTES, MAX_DATAGRAM_SIZE_BYTES, MAX_UDP_PAYLOAD_BYTES, MIN_SCID_LEN_BYTES,

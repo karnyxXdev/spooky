@@ -349,26 +349,6 @@ impl QUICListener {
         ProxyError::Transport("no healthy servers".into())
     }
 
-    fn select_backend_readonly(
-        pool: &UpstreamPool,
-        plan: &BackendSelectionPlan,
-        begin_request: bool,
-    ) -> Option<SelectedBackend> {
-        if pool.pool.readmit_due() {
-            return None;
-        }
-
-        pool.pick_readonly(plan.lb_key.as_str())
-            .and_then(|idx| pool.pool.address(idx).map(|addr| (idx, addr.to_string())))
-            .and_then(|(idx, addr)| {
-                (!begin_request || pool.begin_request_if_healthy(idx)).then_some(SelectedBackend {
-                    backend_addr: addr,
-                    backend_index: idx,
-                    backend_lb: plan.lb_type.clone(),
-                })
-            })
-    }
-
     fn select_backend_with_write_lock(
         pool: &mut UpstreamPool,
         plan: &BackendSelectionPlan,
@@ -397,19 +377,6 @@ impl QUICListener {
         upstream_pool: &Arc<RwLock<UpstreamPool>>,
         begin_request: bool,
     ) -> Result<SelectedBackend, ProxyError> {
-        {
-            let pool = upstream_pool
-                .read()
-                .map_err(|_| ProxyError::Transport("upstream pool lock poisoned".into()))?;
-            if pool.pool.is_empty() {
-                return Err(Self::no_servers_in_upstream_error());
-            }
-            let plan = Self::build_backend_selection_plan(request, &pool);
-            if let Some(selected) = Self::select_backend_readonly(&pool, &plan, begin_request) {
-                return Ok(selected);
-            }
-        }
-
         let mut pool = upstream_pool
             .write()
             .map_err(|_| ProxyError::Transport("upstream pool lock poisoned".into()))?;

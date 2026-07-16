@@ -8,7 +8,26 @@ use crate::runtime::connection::{
         checked_response_body_guardrails, evaluate_request_body_timeouts,
         response_body_limit_reason, response_chunk_ranges,
     },
+    response::ForwardingPolicyTelemetry,
 };
+
+fn record_forwarding_policy_metrics(metrics: &Metrics, policy: &ForwardingPolicyTelemetry) {
+    if let Some(reason) = policy.hedge.trigger_reason {
+        metrics.inc_hedge_trigger(reason);
+    }
+    if let Some(reason) = policy.hedge.outcome_reason {
+        metrics.inc_hedge_outcome(reason);
+    }
+    if policy.hedge.primary_late_ms > 0 {
+        metrics.observe_hedge_primary_late_ms(policy.hedge.primary_late_ms);
+    }
+    if let Some(reason) = policy.retry.attempt_reason {
+        metrics.inc_retry_attempt(reason);
+    }
+    if let Some(reason) = policy.retry.denial_reason {
+        metrics.inc_retry_denied(reason);
+    }
+}
 
 fn response_body_guardrail_error(decision: ResponseBodyGuardrailDecision) -> Option<ProxyError> {
     match decision {
@@ -245,10 +264,7 @@ impl QUICListener {
                             forward: Err(ProxyError::Transport(
                                 "upstream task dropped sender".into(),
                             )),
-                            hedge: crate::runtime::connection::response::HedgeTelemetry::default(),
-                            retry_count: 0,
-                            retry_attempt_reason: None,
-                            retry_denial_reason: None,
+                            policy: ForwardingPolicyTelemetry::default(),
                         }),
                     })
             } else {
@@ -256,31 +272,11 @@ impl QUICListener {
             };
 
             if let Some(forward_result) = upstream_ready {
-                if forward_result.hedge.launched {
-                    metrics.inc_hedge_triggered();
-                }
-                if forward_result.hedge.hedge_won {
-                    metrics.inc_hedge_won();
-                }
-                if forward_result.hedge.hedge_wasted {
-                    metrics.inc_hedge_wasted();
-                }
-                if forward_result.hedge.primary_won_after_trigger {
-                    metrics.inc_hedge_primary_won_after_trigger();
-                }
-                if forward_result.hedge.primary_late_ms > 0 {
-                    metrics.observe_hedge_primary_late_ms(forward_result.hedge.primary_late_ms);
-                }
-                if let Some(reason) = forward_result.retry_attempt_reason {
-                    metrics.inc_retry_attempt(reason);
-                }
-                if let Some(reason) = forward_result.retry_denial_reason {
-                    metrics.inc_retry_denied(reason);
-                }
+                record_forwarding_policy_metrics(metrics, &forward_result.policy);
 
                 if let Some(req) = streams.get_mut(&stream_id) {
                     req.upstream_result_rx = None;
-                    req.retry_count = forward_result.retry_count;
+                    req.retry_count = forward_result.policy.retry.count;
                     req.error_kind = match &forward_result.forward {
                         Err(ProxyError::Timeout) => Some("timeout"),
                         Err(ProxyError::Tls(_)) => Some("tls"),

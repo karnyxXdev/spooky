@@ -13,13 +13,18 @@ pub mod watchdog;
 pub use body::ChannelBody;
 pub(crate) use hash::REQUEST_ID_COUNTER;
 pub use hash::{stable_hash_socket_addr, stable_hash64};
-pub use metrics::{HealthFailureReason, Metrics, OverloadShedReason, RetryReason, RouteOutcome};
+pub use metrics::{HealthFailureReason, Metrics, OverloadShedReason, RouteOutcome};
 pub use quic_listener::configure_async_runtime;
 
 #[cfg(test)]
 mod tests {
     use core::net::SocketAddr;
     use std::{sync::atomic::Ordering, time::Duration};
+
+    use spooky_errors::{
+        HedgeOutcomeTelemetryReason, HedgeTriggerTelemetryReason, RetryAttemptTelemetryReason,
+        RetryPolicyDenialReason,
+    };
 
     use super::*;
 
@@ -126,10 +131,9 @@ mod tests {
         metrics.inc_overload_shed_reason(OverloadShedReason::CircuitOpen);
         metrics.set_active_connections(7);
         metrics.inc_connection_cap_reject();
-        metrics.inc_hedge_triggered();
-        metrics.inc_hedge_won();
-        metrics.inc_hedge_wasted();
-        metrics.inc_hedge_primary_won_after_trigger();
+        metrics.inc_hedge_trigger(HedgeTriggerTelemetryReason::DelayElapsed);
+        metrics.inc_hedge_outcome(HedgeOutcomeTelemetryReason::HedgeWon);
+        metrics.inc_hedge_outcome(HedgeOutcomeTelemetryReason::PrimaryWonAfterTrigger);
         metrics.observe_hedge_primary_late_ms(42);
         metrics.inc_control_api_connection_limit_drop();
 
@@ -164,8 +168,8 @@ mod tests {
     #[test]
     fn resilience_metrics_increment_correctly() {
         let metrics = Metrics::default();
-        metrics.inc_retry_attempt(RetryReason::BackendTimeout);
-        metrics.inc_retry_denied(RetryReason::BudgetDenied);
+        metrics.inc_retry_attempt(RetryAttemptTelemetryReason::Timeout);
+        metrics.inc_retry_denied(RetryPolicyDenialReason::BudgetDenied);
         metrics.inc_circuit_breaker_rejected();
         metrics.inc_circuit_breaker_rejected();
         metrics.set_brownout_active(true);

@@ -1,10 +1,11 @@
 use bytes::Bytes;
-use spooky_errors::ProxyError;
+use spooky_errors::{
+    HedgeOutcomeTelemetryReason, HedgeTriggerTelemetryReason, ProxyError,
+    RetryAttemptTelemetryReason, RetryPolicyDenialReason,
+};
 use tokio::sync::mpsc;
 
-use crate::RetryReason;
-
-pub enum ForwardSuccess {
+pub(crate) enum ForwardSuccess {
     Response {
         status: http::StatusCode,
         headers: http::HeaderMap,
@@ -17,21 +18,42 @@ pub enum ForwardSuccess {
     },
 }
 
-pub type ForwardResult = Result<ForwardSuccess, ProxyError>;
+pub(crate) type ForwardResult = Result<ForwardSuccess, ProxyError>;
 
-pub struct UpstreamResult {
-    pub forward: ForwardResult,
-    pub hedge: HedgeTelemetry,
-    pub retry_count: u8,
-    /// Set when a retry was attempted; the error reason that triggered it.
-    pub retry_attempt_reason: Option<RetryReason>,
-    /// Set when a retry was denied; the first denial reason encountered.
-    pub retry_denial_reason: Option<RetryReason>,
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RetryTelemetry {
+    pub(crate) count: u8,
+    pub(crate) attempt_reason: Option<RetryAttemptTelemetryReason>,
+    pub(crate) denial_reason: Option<RetryPolicyDenialReason>,
+}
+
+impl RetryTelemetry {
+    pub(crate) fn record_attempt(&mut self, reason: RetryAttemptTelemetryReason) {
+        self.count = self.count.saturating_add(1);
+        self.attempt_reason = Some(reason);
+    }
+
+    pub(crate) fn record_denial(&mut self, denial_reason: Option<RetryPolicyDenialReason>) {
+        if self.denial_reason.is_none() {
+            self.denial_reason = denial_reason;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ForwardingPolicyTelemetry {
+    pub(crate) hedge: HedgeTelemetry,
+    pub(crate) retry: RetryTelemetry,
+}
+
+pub(crate) struct UpstreamResult {
+    pub(crate) forward: ForwardResult,
+    pub(crate) policy: ForwardingPolicyTelemetry,
 }
 
 /// A chunk of the upstream response being streamed back to the client.
 #[derive(Debug)]
-pub enum ResponseChunk {
+pub(crate) enum ResponseChunk {
     /// Emit downstream response headers (used when headers are deferred until
     /// body-size validation completes).
     Start {
@@ -47,10 +69,78 @@ pub enum ResponseChunk {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct HedgeTelemetry {
-    pub launched: bool,
-    pub hedge_won: bool,
-    pub hedge_wasted: bool,
-    pub primary_won_after_trigger: bool,
-    pub primary_late_ms: u64,
+pub(crate) struct HedgeTelemetry {
+    pub(crate) trigger_reason: Option<HedgeTriggerTelemetryReason>,
+    pub(crate) outcome_reason: Option<HedgeOutcomeTelemetryReason>,
+    pub(crate) primary_late_ms: u64,
+}
+
+impl HedgeTelemetry {
+    pub(crate) fn record_trigger(&mut self, reason: HedgeTriggerTelemetryReason) {
+        self.trigger_reason = Some(reason);
+    }
+
+    pub(crate) fn record_outcome(&mut self, reason: HedgeOutcomeTelemetryReason) {
+        self.outcome_reason = Some(reason);
+    }
+
+    pub(crate) fn observe_primary_late_ms(&mut self, late_ms: u64) {
+        self.primary_late_ms = late_ms;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use spooky_errors::{
+        HedgeOutcomeTelemetryReason, HedgeTriggerTelemetryReason, RetryAttemptTelemetryReason,
+        RetryPolicyDenialReason,
+    };
+
+    use super::{HedgeTelemetry, RetryTelemetry};
+
+    #[test]
+    fn retry_telemetry_tracks_attempt_count_and_reason() {
+        let mut telemetry = RetryTelemetry::default();
+
+        telemetry.record_attempt(RetryAttemptTelemetryReason::Timeout);
+        telemetry.record_attempt(RetryAttemptTelemetryReason::Transport);
+
+        assert_eq!(telemetry.count, 2);
+        assert_eq!(
+            telemetry.attempt_reason,
+            Some(RetryAttemptTelemetryReason::Transport)
+        );
+    }
+
+    #[test]
+    fn retry_telemetry_preserves_first_denial_reason() {
+        let mut telemetry = RetryTelemetry::default();
+
+        telemetry.record_denial(Some(RetryPolicyDenialReason::BudgetDenied));
+        telemetry.record_denial(Some(RetryPolicyDenialReason::AttemptLimitReached));
+
+        assert_eq!(
+            telemetry.denial_reason,
+            Some(RetryPolicyDenialReason::BudgetDenied)
+        );
+    }
+
+    #[test]
+    fn hedge_telemetry_records_typed_trigger_and_outcome() {
+        let mut telemetry = HedgeTelemetry::default();
+
+        telemetry.record_trigger(HedgeTriggerTelemetryReason::DelayElapsed);
+        telemetry.record_outcome(HedgeOutcomeTelemetryReason::HedgeWon);
+        telemetry.observe_primary_late_ms(42);
+
+        assert_eq!(
+            telemetry.trigger_reason,
+            Some(HedgeTriggerTelemetryReason::DelayElapsed)
+        );
+        assert_eq!(
+            telemetry.outcome_reason,
+            Some(HedgeOutcomeTelemetryReason::HedgeWon)
+        );
+        assert_eq!(telemetry.primary_late_ms, 42);
+    }
 }

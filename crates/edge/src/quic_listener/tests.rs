@@ -2027,10 +2027,7 @@ fn abort_stream_awaiting_upstream_cancels_oneshot() {
     // Sending on the now-orphaned sender should return Err (closed).
     let send_result = result_tx.send(crate::runtime::connection::response::UpstreamResult {
         forward: Err(spooky_errors::ProxyError::Transport("test".into())),
-        hedge: crate::runtime::connection::response::HedgeTelemetry::default(),
-        retry_count: 0,
-        retry_attempt_reason: None,
-        retry_denial_reason: None,
+        policy: crate::runtime::connection::response::ForwardingPolicyTelemetry::default(),
     });
     assert!(
         send_result.is_err(),

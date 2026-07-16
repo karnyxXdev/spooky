@@ -1,3 +1,4 @@
+pub mod alternate_backend;
 pub mod algorithms;
 pub mod backend;
 pub mod backend_pool;

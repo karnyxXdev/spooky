@@ -3,6 +3,9 @@ use spooky_errors::{
     RetryPolicyFacts, RetryPolicyDenialReason, RetryTelemetryReason, evaluate_hedge_policy,
     evaluate_retry_policy, is_idempotent_method,
 };
+use spooky_lb::alternate_backend::{
+    AlternateBackendDecision, choose_alternate_backend,
+};
 
 use super::*;
 
@@ -116,20 +119,18 @@ impl QUICListener {
         })
     }
 
-    fn pick_alternate_backend(
+    fn resolve_alternate_backend(
         upstream_pool: &Arc<RwLock<UpstreamPool>>,
         primary_index: usize,
     ) -> Option<(String, usize)> {
         let pool = upstream_pool.read().ok()?;
-        for index in pool.pool.healthy_indices_iter() {
-            if index == primary_index {
-                continue;
-            }
-            if let Some(address) = pool.pool.address(index) {
-                return Some((address.to_string(), index));
-            }
+        match choose_alternate_backend(&pool, &[primary_index], None) {
+            AlternateBackendDecision::Select(choice) => pool
+                .pool
+                .address(choice.index)
+                .map(|address| (address.to_string(), choice.index)),
+            AlternateBackendDecision::DoNotSelect { .. } => None,
         }
-        None
     }
 
     pub(super) fn spawn_upstream_forward_task(
@@ -153,7 +154,7 @@ impl QUICListener {
         let transport = Arc::clone(&exec_ctx.transport_pool);
         let hedge_delay = resilience.hedging_delay;
         let alternate_backend = req.upstream_pool.as_ref().and_then(|upstream_pool| {
-            Self::pick_alternate_backend(upstream_pool, pending_forward.backend_index)
+            Self::resolve_alternate_backend(upstream_pool, pending_forward.backend_index)
         });
         let trace_span_for_upstream = req.trace_span.clone();
         let pending_forward_for_upstream = Arc::clone(&pending_forward);

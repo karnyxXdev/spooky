@@ -878,38 +878,86 @@ impl QUICListener {
                                     ));
                                 }
                                 if reject_body_for_bodyless.is_none() {
-                                    // Enforce cap on total bytes received for the stream,
-                                    // including chunks already forwarded to the H2 body channel.
-                                    let next_total = req.body_bytes_received.saturating_add(read);
-                                    let request_is_connect = is_connect_method(&req.method);
-                                    if !request_is_connect && next_total > max_request_body_bytes {
-                                        payload_too_large = Some((
-                                            req.upstream_name
-                                                .clone()
-                                                .unwrap_or_else(|| "unrouted".to_string()),
-                                            req.start.elapsed(),
-                                        ));
-                                    } else {
-                                        req.body_bytes_received = next_total;
+                                    let next_state = checked_request_body_ingress(
+                                        RequestBodyGuardrailConfig {
+                                            idle_timeout: Duration::ZERO,
+                                            total_timeout: Duration::ZERO,
+                                            max_body_bytes: max_request_body_bytes,
+                                            max_buffered_bytes: usize::MAX,
+                                        },
+                                        RequestBodyGuardrailInput {
+                                            elapsed: req.start.elapsed(),
+                                            idle_for: Instant::now()
+                                                .saturating_duration_since(req.last_body_activity),
+                                            bytes_received: req.body_bytes_received,
+                                            buffered_bytes: 0,
+                                            next_chunk_bytes: read,
+                                            declared_content_length: None,
+                                            exempt_from_body_size_cap: is_connect_method(
+                                                &req.method,
+                                            ),
+                                        },
+                                    );
+                                    match next_state {
+                                        Err(RequestBodyGuardrailDecision::Reject {
+                                            kind: BodyLimitKind::BodySize,
+                                        }) => {
+                                            payload_too_large = Some((
+                                                req.upstream_name
+                                                    .clone()
+                                                    .unwrap_or_else(|| "unrouted".to_string()),
+                                                req.start.elapsed(),
+                                            ));
+                                        }
+                                        Ok(next_state) => {
+                                            req.body_bytes_received = next_state.bytes_received;
 
-                                        for chunk_slice in
-                                            body_buf[..read].chunks(REQUEST_CHUNK_BYTES_LIMIT)
-                                        {
-                                            let chunk = Bytes::copy_from_slice(chunk_slice);
-                                            if let Err(err) = Self::enqueue_request_chunk(
-                                                req,
-                                                chunk,
-                                                &metrics,
-                                                max_request_body_bytes,
-                                                request_buffer_global_cap_bytes,
-                                            ) {
-                                                shed_due_to_buffer_pressure = true;
-                                                metrics.inc_request_buffer_limit_reject();
-                                                if err == RequestBufferError::GlobalCap {
-                                                    debug!("global request buffer cap reached");
+                                            for chunk_slice in
+                                                body_buf[..read].chunks(REQUEST_CHUNK_BYTES_LIMIT)
+                                            {
+                                                let chunk = Bytes::copy_from_slice(chunk_slice);
+                                                if let Err(err) = Self::enqueue_request_chunk(
+                                                    req,
+                                                    chunk,
+                                                    &metrics,
+                                                    max_request_body_bytes,
+                                                    request_buffer_global_cap_bytes,
+                                                ) {
+                                                    if err == RequestBufferError::BodySize {
+                                                        payload_too_large = Some((
+                                                            req.upstream_name
+                                                                .clone()
+                                                                .unwrap_or_else(|| {
+                                                                    "unrouted".to_string()
+                                                                }),
+                                                            req.start.elapsed(),
+                                                        ));
+                                                    } else {
+                                                        shed_due_to_buffer_pressure = true;
+                                                        metrics.inc_request_buffer_limit_reject();
+                                                        if err == RequestBufferError::Global {
+                                                            debug!(
+                                                                "global request buffer cap reached"
+                                                            );
+                                                        }
+                                                    }
+                                                    break;
                                                 }
-                                                break;
                                             }
+                                        }
+                                        Err(RequestBodyGuardrailDecision::Reject {
+                                            kind:
+                                                BodyLimitKind::UnknownLengthPrebuffer
+                                                | BodyLimitKind::BufferedBody,
+                                        }) => {
+                                            shed_due_to_buffer_pressure = true;
+                                            metrics.inc_request_buffer_limit_reject();
+                                        }
+                                        Err(other) => {
+                                            unreachable!(
+                                                "request ingress should not timeout in data path: {:?}",
+                                                other
+                                            );
                                         }
                                     }
                                 }
@@ -939,7 +987,7 @@ impl QUICListener {
                                     &mut connection.quic,
                                     stream_id,
                                     http::StatusCode::PAYLOAD_TOO_LARGE,
-                                    b"request body too large\n",
+                                    REQUEST_BODY_TOO_LARGE_BODY,
                                 )?;
                                 if let Some(req) = connection.streams.get_mut(&stream_id) {
                                     abort_stream(req, &metrics);

@@ -26,12 +26,20 @@ use super::{
     ConnectionRoutes, TokenBucket, abort_stream, can_poll_upstream_result,
     classify_active_health_check_response, collect_h3_trailers, connection_header_tokens,
     is_bodyless_request_mode, is_connect_tunnel_response, purge_connection_routes,
-    resolve_primary_from_radix_prefix, response_size_exceeded_after_chunk,
-    should_strip_bootstrap_request_header, should_strip_bootstrap_response_header,
-    should_strip_h3_response_header, sweep_closed_connections,
+    resolve_primary_from_radix_prefix, should_strip_bootstrap_request_header,
+    should_strip_bootstrap_response_header, should_strip_h3_response_header,
+    sweep_closed_connections,
 };
 use crate::{
-    REQUEST_ID_COUNTER, cid_radix::CidRadix, runtime::connection::stream::StreamAdmissionState,
+    REQUEST_ID_COUNTER,
+    cid_radix::CidRadix,
+    runtime::connection::{
+        guardrails::{
+            BodyLimitKind, ResponseBodyGuardrailConfig, ResponseBodyGuardrailDecision,
+            ResponseBodyGuardrailInput, checked_response_body_guardrails,
+        },
+        stream::StreamAdmissionState,
+    },
 };
 type RoutingMaps = (
     HashMap<Arc<[u8]>, Arc<[u8]>>,
@@ -1159,13 +1167,69 @@ fn bootstrap_response_filter_keeps_end_to_end_headers() {
 
 #[test]
 fn response_size_cap_enforced_as_running_total() {
-    let mut received = 0usize;
-    assert!(!response_size_exceeded_after_chunk(&mut received, 4, 10));
-    assert_eq!(received, 4);
-    assert!(!response_size_exceeded_after_chunk(&mut received, 6, 10));
-    assert_eq!(received, 10);
-    assert!(response_size_exceeded_after_chunk(&mut received, 1, 10));
-    assert_eq!(received, 11);
+    let config = ResponseBodyGuardrailConfig {
+        idle_timeout: Duration::from_secs(5),
+        total_timeout: Duration::from_secs(30),
+        max_body_bytes: 10,
+        unknown_length_prebuffer_bytes: 10,
+        chunk_bytes: 4,
+    };
+    assert!(
+        checked_response_body_guardrails(
+            config,
+            ResponseBodyGuardrailInput {
+                elapsed: Duration::ZERO,
+                idle_for: Duration::ZERO,
+                bytes_received: 0,
+                prebuffered_bytes: 0,
+                next_chunk_bytes: 4,
+                declared_content_length: None,
+                headers_emitted: true,
+                progressive_emission_allowed: true,
+                body_forwarding_enabled: true,
+                exempt_from_body_size_cap: false,
+            },
+        )
+        .is_ok()
+    );
+    assert!(
+        checked_response_body_guardrails(
+            config,
+            ResponseBodyGuardrailInput {
+                elapsed: Duration::ZERO,
+                idle_for: Duration::ZERO,
+                bytes_received: 4,
+                prebuffered_bytes: 0,
+                next_chunk_bytes: 6,
+                declared_content_length: None,
+                headers_emitted: true,
+                progressive_emission_allowed: true,
+                body_forwarding_enabled: true,
+                exempt_from_body_size_cap: false,
+            },
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        checked_response_body_guardrails(
+            config,
+            ResponseBodyGuardrailInput {
+                elapsed: Duration::ZERO,
+                idle_for: Duration::ZERO,
+                bytes_received: 10,
+                prebuffered_bytes: 0,
+                next_chunk_bytes: 1,
+                declared_content_length: None,
+                headers_emitted: true,
+                progressive_emission_allowed: true,
+                body_forwarding_enabled: true,
+                exempt_from_body_size_cap: false,
+            },
+        ),
+        Err(ResponseBodyGuardrailDecision::Reject {
+            kind: BodyLimitKind::BodySize,
+        })
+    );
 }
 
 #[test]

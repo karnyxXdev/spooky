@@ -2,7 +2,9 @@ use spooky_errors::{UpstreamProxyErrorKind, classify_upstream_proxy_error};
 use tokio::sync::mpsc::error::TryRecvError;
 
 use super::*;
-use crate::runtime::connection::auth::ExternalAuthDecision;
+use crate::runtime::connection::{
+    auth::ExternalAuthDecision, guardrails::is_unknown_length_response_prebuffer_reason,
+};
 
 impl QUICListener {
     /// Handle an already-resolved `ForwardResult`, applying health transitions
@@ -99,7 +101,7 @@ impl QUICListener {
             }
             Err(ProxyError::Pool(PoolError::BackendOverloaded(reason))) => {
                 metrics.inc_failure();
-                if reason.contains("unknown-length response prebuffer limit exceeded") {
+                if is_unknown_length_response_prebuffer_reason(&reason) {
                     metrics.inc_response_prebuffer_limit_reject();
                     metrics.inc_overload_shed_reason(OverloadShedReason::ResponsePrebufferCap);
                 } else {
@@ -720,7 +722,7 @@ impl QUICListener {
                         }
                         ProxyError::Pool(PoolError::BackendOverloaded(reason)) => {
                             metrics.inc_failure();
-                            if reason.contains("unknown-length response prebuffer limit exceeded") {
+                            if is_unknown_length_response_prebuffer_reason(&reason) {
                                 metrics.inc_response_prebuffer_limit_reject();
                                 metrics.inc_overload_shed_reason(
                                     OverloadShedReason::ResponsePrebufferCap,

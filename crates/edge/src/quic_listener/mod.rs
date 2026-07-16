@@ -86,6 +86,12 @@ use crate::{
         backend::{resolution::RuntimeBackendResolution, store::RuntimeBackendResolutionStore},
         bundle::{RuntimeBundle, RuntimeBundleHandle},
         connection::{
+            guardrails::{
+                BodyLimitKind, REQUEST_BODY_TOO_LARGE_BODY, RequestBodyGuardrailConfig,
+                RequestBodyGuardrailDecision, RequestBodyGuardrailInput,
+                ResponseBodyGuardrailConfig, ResponseBodyGuardrailInput,
+                checked_request_body_ingress, checked_response_body_guardrails,
+            },
             quic::{QuicConnection, QuicConnectionErrorSnapshot},
             request::RequestEnvelope,
             response::{ForwardResult, ForwardSuccess, ResponseChunk, UpstreamResult},
@@ -238,15 +244,6 @@ fn should_strip_bootstrap_response_header(
     )
 }
 
-fn response_size_exceeded_after_chunk(
-    response_bytes_received: &mut usize,
-    chunk_len: usize,
-    max_response_body_bytes: usize,
-) -> bool {
-    *response_bytes_received = response_bytes_received.saturating_add(chunk_len);
-    *response_bytes_received > max_response_body_bytes
-}
-
 fn is_connect_method(method: &str) -> bool {
     method.eq_ignore_ascii_case("CONNECT")
 }
@@ -339,8 +336,10 @@ type LbHeaderLookup<'a> = dyn Fn(&str) -> Option<String> + 'a;
 
 struct BootstrapStreamingBody {
     inner: Incoming,
-    max_bytes: Option<usize>,
+    guardrails: Option<ResponseBodyGuardrailConfig>,
+    declared_content_length: Option<usize>,
     bytes_seen: usize,
+    prebuffered_bytes: usize,
     capped: bool,
 }
 
@@ -348,17 +347,31 @@ impl BootstrapStreamingBody {
     fn new(inner: Incoming) -> Self {
         Self {
             inner,
-            max_bytes: None,
+            guardrails: None,
+            declared_content_length: None,
             bytes_seen: 0,
+            prebuffered_bytes: 0,
             capped: false,
         }
     }
 
-    fn with_max_bytes(inner: Incoming, max_bytes: usize) -> Self {
+    fn with_response_guardrails(
+        inner: Incoming,
+        max_body_bytes: usize,
+        declared_content_length: Option<usize>,
+    ) -> Self {
         Self {
             inner,
-            max_bytes: Some(max_bytes),
+            guardrails: Some(ResponseBodyGuardrailConfig {
+                idle_timeout: Duration::MAX,
+                total_timeout: Duration::MAX,
+                max_body_bytes,
+                unknown_length_prebuffer_bytes: max_body_bytes,
+                chunk_bytes: usize::MAX,
+            }),
+            declared_content_length,
             bytes_seen: 0,
+            prebuffered_bytes: 0,
             capped: false,
         }
     }
@@ -378,11 +391,27 @@ impl Body for BootstrapStreamingBody {
 
         match Pin::new(&mut self.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                if let Some(limit) = self.max_bytes
+                if let Some(guardrails) = self.guardrails
                     && let Some(data) = frame.data_ref()
                 {
-                    self.bytes_seen = self.bytes_seen.saturating_add(data.len());
-                    if self.bytes_seen > limit {
+                    if let Ok(next_state) = checked_response_body_guardrails(
+                        guardrails,
+                        ResponseBodyGuardrailInput {
+                            elapsed: Duration::ZERO,
+                            idle_for: Duration::ZERO,
+                            bytes_received: self.bytes_seen,
+                            prebuffered_bytes: self.prebuffered_bytes,
+                            next_chunk_bytes: data.len(),
+                            declared_content_length: self.declared_content_length,
+                            headers_emitted: true,
+                            progressive_emission_allowed: true,
+                            body_forwarding_enabled: true,
+                            exempt_from_body_size_cap: false,
+                        },
+                    ) {
+                        self.bytes_seen = next_state.next_state.bytes_received;
+                        self.prebuffered_bytes = next_state.next_state.prebuffered_bytes;
+                    } else {
                         self.capped = true;
                         return Poll::Ready(None);
                     }
@@ -1811,15 +1840,41 @@ impl QUICListener {
     ) -> Result<(), RequestBufferError> {
         let chunk_len = chunk.len();
         if !metrics.try_reserve_request_buffer(chunk_len, request_buffer_global_cap_bytes) {
-            return Err(RequestBufferError::GlobalCap);
+            return Err(RequestBufferError::Global);
         }
 
-        let next = req.body_buf_bytes.saturating_add(chunk.len());
-        if next > max_request_body_bytes {
+        let next_state = checked_request_body_ingress(
+            RequestBodyGuardrailConfig {
+                idle_timeout: Duration::ZERO,
+                total_timeout: Duration::ZERO,
+                max_body_bytes: max_request_body_bytes,
+                max_buffered_bytes: max_request_body_bytes,
+            },
+            RequestBodyGuardrailInput {
+                elapsed: Duration::ZERO,
+                idle_for: Duration::ZERO,
+                bytes_received: req.body_bytes_received,
+                buffered_bytes: req.body_buf_bytes,
+                next_chunk_bytes: chunk_len,
+                declared_content_length: None,
+                exempt_from_body_size_cap: false,
+            },
+        );
+        let Ok(next_state) = next_state else {
             metrics.release_request_buffer(chunk_len);
-            return Err(RequestBufferError::StreamCap);
-        }
-        req.body_buf_bytes = next;
+            return Err(match next_state {
+                Err(RequestBodyGuardrailDecision::Reject {
+                    kind: BodyLimitKind::BodySize,
+                }) => RequestBufferError::BodySize,
+                Err(RequestBodyGuardrailDecision::Reject { .. }) => RequestBufferError::Stream,
+                Err(other) => unreachable!(
+                    "request ingress should not timeout in enqueue path: {:?}",
+                    other
+                ),
+                Ok(_) => unreachable!("handled Ok state before request buffer error mapping"),
+            });
+        };
+        req.body_buf_bytes = next_state.buffered_bytes;
         req.body_buf.push_back(chunk);
         Ok(())
     }

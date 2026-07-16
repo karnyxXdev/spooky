@@ -17,18 +17,17 @@ mod policies;
 mod upstreams;
 
 pub use policies::{
-    RuntimeAdmissionPolicy, RuntimeApiKeyAuth, RuntimeAuthPolicy, RuntimeBrownoutPolicy,
+    RuntimeAdmissionPolicy, RuntimeAlternateBackendPolicy, RuntimeApiKeyAuth, RuntimeAuthPolicy,
     RuntimeBackendAddressKind, RuntimeBackendConnectionPolicy, RuntimeBackendDnsPolicy,
     RuntimeBackendEndpoint, RuntimeBackendHealthCheck, RuntimeBackendTlsPolicy,
-    RuntimeBackendTransportKind, RuntimeCircuitBreakerPolicy, RuntimeConnectionLimits,
-    RuntimeExternalAuth, RuntimeExternalAuthFailureMode, RuntimeExternalAuthRequestHeader,
-    RuntimeHedgingPolicy, RuntimeJwtAuth, RuntimeAlternateBackendPolicy, RuntimeRequestKeySpec,
+    RuntimeBackendTransportKind, RuntimeBrownoutPolicy, RuntimeCircuitBreakerPolicy,
+    RuntimeConnectionLimits, RuntimeExternalAuth, RuntimeExternalAuthFailureMode,
+    RuntimeExternalAuthRequestHeader, RuntimeHedgingPolicy, RuntimeJwtAuth,
     RuntimeListenerPolicySet, RuntimeLoadBalancingPolicy, RuntimeLoadBalancingStrategy,
-    RuntimePolicySet, RuntimeRateLimitPolicy, RuntimeRetryBudgetPolicy,
+    RuntimePolicySet, RuntimeRateLimitPolicy, RuntimeRequestKeySpec, RuntimeRetryBudgetPolicy,
     RuntimeRouteHostPattern, RuntimeRouteMatchPolicy, RuntimeRouteQueuePolicy,
-    RuntimeScopedRateLimitPolicy, RuntimeTimeoutPolicy,
-    RuntimeTransportPolicy, RuntimeUpstreamPolicySet, RuntimeUpstreamTransportPolicy,
-    RuntimeWatchdogPolicy,
+    RuntimeScopedRateLimitPolicy, RuntimeTimeoutPolicy, RuntimeTransportPolicy,
+    RuntimeUpstreamPolicySet, RuntimeUpstreamTransportPolicy, RuntimeWatchdogPolicy,
 };
 
 #[derive(Debug, Clone)]
@@ -461,9 +460,18 @@ mod tests {
         let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
         let policies = runtime.policies();
 
-        assert_eq!(policies.timeouts.backend_request, Duration::from_millis(2_500));
-        assert_eq!(policies.timeouts.backend_connect, Duration::from_millis(400));
-        assert_eq!(policies.timeouts.h2_pool_idle, Duration::from_millis(91_000));
+        assert_eq!(
+            policies.timeouts.backend_request,
+            Duration::from_millis(2_500)
+        );
+        assert_eq!(
+            policies.timeouts.backend_connect,
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            policies.timeouts.h2_pool_idle,
+            Duration::from_millis(91_000)
+        );
         assert_eq!(policies.transport.max_active_connections, 1234);
         assert_eq!(policies.transport.request_buffer_global_cap_bytes, 9_999);
         assert_eq!(policies.admission.route_queue.shed_retry_after_seconds, 17);
@@ -531,18 +539,20 @@ mod tests {
 
         let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
         let upstream_policies = runtime.upstream_policy_sets();
-        let api = upstream_policies.get("api").expect("api runtime policy set");
+        let api = upstream_policies
+            .get("api")
+            .expect("api runtime policy set");
 
         assert_eq!(
             api.load_balancing.strategy,
             RuntimeLoadBalancingStrategy::StickyCid
         );
+        assert_eq!(api.load_balancing.key.as_deref(), Some("header:x-user-id"));
         assert_eq!(
-            api.load_balancing.key.as_deref(),
-            Some("header:x-user-id")
-        );
-        assert_eq!(
-            api.auth.api_key.as_ref().map(|auth| auth.header_name.as_str()),
+            api.auth
+                .api_key
+                .as_ref()
+                .map(|auth| auth.header_name.as_str()),
             Some("x-api-key")
         );
         assert_eq!(
@@ -551,7 +561,11 @@ mod tests {
         );
         assert_eq!(
             api.transport.connection.max_inflight,
-            runtime.policies.transport.connection_limits.backend_pool_max_inflight
+            runtime
+                .policies
+                .transport
+                .connection_limits
+                .backend_pool_max_inflight
         );
         assert_eq!(api.rate_limits.scoped_limits.len(), 1);
         assert_eq!(
@@ -584,12 +598,7 @@ mod tests {
 
         let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
         let api = runtime.upstreams.get("api").expect("api runtime upstream");
-        let jwt = api
-            .policy
-            .upstream_auth
-            .jwt
-            .as_ref()
-            .expect("jwt policy");
+        let jwt = api.policy.upstream_auth.jwt.as_ref().expect("jwt policy");
         let scoped_limit = runtime
             .policies
             .rate_limits
@@ -609,10 +618,7 @@ mod tests {
             vec!["admin".to_string()]
         );
         assert_eq!(scoped_limit.name, " tenant-default ");
-        assert_eq!(
-            scoped_limit.route_allowlist,
-            vec!["api".to_string()]
-        );
+        assert_eq!(scoped_limit.route_allowlist, vec!["api".to_string()]);
         assert_eq!(scoped_limit.key.as_deref(), Some("header:x-tenant-id"));
         assert_eq!(scoped_limit.idle_ttl, Duration::from_secs(9));
     }
@@ -646,9 +652,22 @@ mod tests {
             runtime_upstream.load_balancing.key_spec,
             Some(RuntimeRequestKeySpec::Header("x-user-id".to_string()))
         );
-        assert!(!runtime_upstream.load_balancing.alternate_backend.readonly_lb_pick);
-        assert!(runtime_upstream.load_balancing.alternate_backend.healthy_fallback);
-        assert_eq!(runtime_upstream.route.host.as_deref(), Some("api.example.com:443"));
+        assert!(
+            !runtime_upstream
+                .load_balancing
+                .alternate_backend
+                .readonly_lb_pick
+        );
+        assert!(
+            runtime_upstream
+                .load_balancing
+                .alternate_backend
+                .healthy_fallback
+        );
+        assert_eq!(
+            runtime_upstream.route.host.as_deref(),
+            Some("api.example.com:443")
+        );
         assert_eq!(runtime_upstream.route.method.as_deref(), Some("GET"));
         assert_eq!(runtime_upstream.route.path_prefix.as_deref(), Some("/v1"));
         assert_eq!(exported.load_balancing.lb_type, "sticky-cid");
@@ -974,8 +993,12 @@ mod tests {
     #[test]
     fn runtime_config_rejects_invalid_lb_key_spec() {
         let mut config = sample_config();
-        config.upstream.get_mut("api").expect("api").load_balancing.key =
-            Some("header:   ".to_string());
+        config
+            .upstream
+            .get_mut("api")
+            .expect("api")
+            .load_balancing
+            .key = Some("header:   ".to_string());
 
         let err = RuntimeConfig::from_config(&config).expect_err("invalid key spec must fail");
         assert_eq!(err.category(), "config_invalid");

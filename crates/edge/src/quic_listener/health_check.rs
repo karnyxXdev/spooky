@@ -7,7 +7,9 @@ impl QUICListener {
         upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
         transport_pool: Arc<UpstreamTransportPool>,
         backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
-        backend_health_checks: Arc<HashMap<String, spooky_config::runtime::RuntimeBackendHealthCheck>>,
+        backend_health_checks: Arc<
+            HashMap<String, spooky_config::runtime::RuntimeBackendHealthCheck>,
+        >,
         _backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
         metrics: Arc<Metrics>,
         task_registry: Arc<RuntimeTaskRegistry>,
@@ -49,8 +51,12 @@ impl QUICListener {
                         continue;
                     }
                 };
-                let base_interval_ms: u64 =
-                    health.interval.as_millis().try_into().unwrap_or(u64::MAX).max(1);
+                let base_interval_ms: u64 = health
+                    .interval
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX)
+                    .max(1);
                 let initial_jitter_ms = if base_interval_ms > 1 {
                     crate::stable_hash64(address.as_bytes()) % base_interval_ms
                 } else {

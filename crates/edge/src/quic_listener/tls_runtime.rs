@@ -83,12 +83,10 @@ impl QUICListener {
         quic_config.set_max_recv_udp_payload_size(MAX_UDP_PAYLOAD_BYTES);
         quic_config.set_max_send_udp_payload_size(MAX_UDP_PAYLOAD_BYTES);
         quic_config.set_initial_max_data(transport_policy.quic_initial_max_data);
-        quic_config.set_initial_max_stream_data_bidi_local(
-            transport_policy.quic_initial_max_stream_data,
-        );
-        quic_config.set_initial_max_stream_data_bidi_remote(
-            transport_policy.quic_initial_max_stream_data,
-        );
+        quic_config
+            .set_initial_max_stream_data_bidi_local(transport_policy.quic_initial_max_stream_data);
+        quic_config
+            .set_initial_max_stream_data_bidi_remote(transport_policy.quic_initial_max_stream_data);
         quic_config.set_initial_max_stream_data_uni(transport_policy.quic_initial_max_stream_data);
         quic_config.set_initial_max_streams_bidi(transport_policy.quic_initial_max_streams_bidi);
         quic_config.set_initial_max_streams_uni(transport_policy.quic_initial_max_streams_uni);

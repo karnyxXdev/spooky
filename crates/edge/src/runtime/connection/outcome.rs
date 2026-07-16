@@ -457,14 +457,15 @@ pub(crate) fn log_backend_health_transition(addr: &str, transition: HealthTransi
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::time::Duration;
+    use std::{collections::HashMap, time::Duration};
 
-    use spooky_config::config::{
-        Backend, Config, ForwardedHeaderPolicy, HealthCheck, Listen, LoadBalancing, RouteAuth,
-        RouteMatch, Tls, Upstream, UpstreamHostPolicy,
+    use spooky_config::{
+        config::{
+            Backend, Config, ForwardedHeaderPolicy, HealthCheck, Listen, LoadBalancing, RouteAuth,
+            RouteMatch, Tls, Upstream, UpstreamHostPolicy,
+        },
+        runtime::RuntimeConfig,
     };
-    use spooky_config::runtime::RuntimeConfig;
 
     use super::*;
 

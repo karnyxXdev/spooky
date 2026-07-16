@@ -1,5 +1,6 @@
-use super::*;
 use spooky_config::runtime::{RuntimeLoadBalancingStrategy, RuntimeRequestKeySpec};
+
+use super::*;
 
 struct LbKeyRequestParts<'a> {
     method: &'a str,

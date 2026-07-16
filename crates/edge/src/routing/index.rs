@@ -26,31 +26,33 @@ impl RouteIndex {
         let mut ordered: Vec<(&String, &Upstream)> = upstreams.iter().collect();
         ordered.sort_by_key(|(left, _)| *left);
         Self::from_ordered_routes(ordered.into_iter().enumerate().map(
-            |(order, (name, upstream))| IndexedRouteSource {
-                name: name.clone(),
-                method: upstream
-                    .route
-                    .method
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(|value| value.to_ascii_uppercase()),
-                path_prefix: upstream.route.path_prefix.clone(),
-                path_len: upstream
-                    .route
-                    .path_prefix
-                    .as_ref()
-                    .map(|prefix| prefix.len())
-                    .unwrap_or(0),
-                host_specific: upstream.route.host.is_some(),
-                method_specific: upstream.route.method.is_some(),
-                host_pattern: upstream
-                    .route
-                    .host
-                    .as_deref()
-                    .and_then(parse_configured_host_pattern)
-                    .map(RuntimeRouteHostPattern::from),
-                order,
+            |(order, (name, upstream))| {
+                IndexedRouteSource {
+                    name: name.clone(),
+                    method: upstream
+                        .route
+                        .method
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(|value| value.to_ascii_uppercase()),
+                    path_prefix: upstream.route.path_prefix.clone(),
+                    path_len: upstream
+                        .route
+                        .path_prefix
+                        .as_ref()
+                        .map(|prefix| prefix.len())
+                        .unwrap_or(0),
+                    host_specific: upstream.route.host.is_some(),
+                    method_specific: upstream.route.method.is_some(),
+                    host_pattern: upstream
+                        .route
+                        .host
+                        .as_deref()
+                        .and_then(parse_configured_host_pattern)
+                        .map(RuntimeRouteHostPattern::from),
+                    order,
+                }
             },
         ))
     }

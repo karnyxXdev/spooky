@@ -1,5 +1,4 @@
-use spooky_config::config::Watchdog as WatchdogConfig;
-use spooky_config::runtime::RuntimeWatchdogPolicy;
+use spooky_config::{config::Watchdog as WatchdogConfig, runtime::RuntimeWatchdogPolicy};
 
 #[derive(Debug, Clone)]
 pub struct WatchdogRuntimeConfig {
@@ -38,7 +37,11 @@ impl From<&RuntimeWatchdogPolicy> for WatchdogRuntimeConfig {
     fn from(value: &RuntimeWatchdogPolicy) -> Self {
         Self {
             enabled: value.enabled,
-            check_interval_ms: value.check_interval.as_millis().try_into().unwrap_or(u64::MAX),
+            check_interval_ms: value
+                .check_interval
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
             poll_stall_timeout_ms: value
                 .poll_stall_timeout
                 .as_millis()

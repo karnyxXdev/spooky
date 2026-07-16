@@ -5,10 +5,10 @@ use hyper::{
     Request,
     body::{Bytes, Incoming},
 };
-pub use spooky_errors::PoolError;
 use spooky_config::runtime::{
     RuntimeBackendConnectionPolicy, RuntimeBackendTransportKind, RuntimeUpstream,
 };
+pub use spooky_errors::PoolError;
 
 use crate::{
     h1_pool::H1Pool,

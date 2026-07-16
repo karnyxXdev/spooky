@@ -76,7 +76,8 @@ fn upstream_pool_from_config() {
     })
     .unwrap();
 
-    let upstream_pool = UpstreamPool::from_runtime_upstream(runtime.upstreams.get("api").unwrap()).unwrap();
+    let upstream_pool =
+        UpstreamPool::from_runtime_upstream(runtime.upstreams.get("api").unwrap()).unwrap();
     assert!(matches!(
         upstream_pool.load_balancer,
         LoadBalancing::RoundRobin(_)

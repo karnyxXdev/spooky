@@ -71,21 +71,23 @@ fn is_valid_connect_authority(authority: &str) -> bool {
     let Some((host, port)) = authority.rsplit_once(':') else {
         return false;
     };
-    !host.trim().is_empty()
-        && port
-            .parse::<u16>()
-            .ok()
-            .is_some_and(|parsed| parsed > 0)
+    !host.trim().is_empty() && port.parse::<u16>().ok().is_some_and(|parsed| parsed > 0)
 }
 
 fn is_valid_request_key_spec(key_spec: &str) -> bool {
     let key_spec = key_spec.trim().to_ascii_lowercase();
     matches!(
         key_spec.as_str(),
-        "path" | "authority" | "method" | "cid" | "sticky-cid" | "peer_ip" | "client_ip" | "bearer_token"
+        "path"
+            | "authority"
+            | "method"
+            | "cid"
+            | "sticky-cid"
+            | "peer_ip"
+            | "client_ip"
+            | "bearer_token"
     ) || key_spec.split_once(':').is_some_and(|(source, key_name)| {
-        !key_name.trim().is_empty()
-            && matches!(source.trim(), "header" | "cookie" | "query")
+        !key_name.trim().is_empty() && matches!(source.trim(), "header" | "cookie" | "query")
     })
 }
 
@@ -200,7 +202,8 @@ impl RuntimeRouteMatchPolicy {
             )));
         }
 
-        let host = normalize_optional_string(route.host.as_deref()).map(|host| normalize_route_host(&host));
+        let host = normalize_optional_string(route.host.as_deref())
+            .map(|host| normalize_route_host(&host));
         let host_pattern = host.as_deref().map(parse_runtime_route_host_pattern);
         let method = normalized_route_method(route.method.as_deref());
 
@@ -277,7 +280,6 @@ impl RuntimeRequestKeySpec {
             }
         }
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,10 +400,14 @@ impl RuntimeExternalAuthRequestHeader {
     ) -> Result<Self, RuntimeConfigError> {
         let name = header.name.trim();
         if name.is_empty() {
-            return Err(config_invalid(format!("{field_name}.name must be non-empty")));
+            return Err(config_invalid(format!(
+                "{field_name}.name must be non-empty"
+            )));
         }
         http::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-            config_invalid(format!("{field_name}.name must be a valid HTTP header name"))
+            config_invalid(format!(
+                "{field_name}.name must be a valid HTTP header name"
+            ))
         })?;
 
         Ok(Self {
@@ -475,7 +481,9 @@ impl RuntimeExternalAuth {
                     endpoint: endpoint.clone(),
                     request_headers: RuntimeExternalAuthRequestHeader::normalize_many(
                         request_headers,
-                        &format!("upstream '{upstream_name}' auth.external_auth.http.request_headers"),
+                        &format!(
+                            "upstream '{upstream_name}' auth.external_auth.http.request_headers"
+                        ),
                     )?,
                     response_header_allowlist: normalize_nonempty_string_vec(
                         &format!(
@@ -522,7 +530,9 @@ impl RuntimeExternalAuth {
                     )?,
                     request_headers: RuntimeExternalAuthRequestHeader::normalize_many(
                         request_headers,
-                        &format!("upstream '{upstream_name}' auth.external_auth.oidc.request_headers"),
+                        &format!(
+                            "upstream '{upstream_name}' auth.external_auth.oidc.request_headers"
+                        ),
                     )?,
                     response_header_allowlist: normalize_nonempty_string_vec(
                         &format!(
@@ -633,7 +643,10 @@ impl RuntimeAuthPolicy {
         crate::config::RouteAuth {
             api_key: self.api_key.as_ref().map(RuntimeApiKeyAuth::as_config),
             jwt: self.jwt.as_ref().map(RuntimeJwtAuth::as_config),
-            external_auth: self.external_auth.as_ref().map(RuntimeExternalAuth::as_config),
+            external_auth: self
+                .external_auth
+                .as_ref()
+                .map(RuntimeExternalAuth::as_config),
             required_scopes: self.required_scopes.clone(),
             required_roles: self.required_roles.clone(),
         }
@@ -657,7 +670,10 @@ pub struct RuntimeTimeoutPolicy {
 
 impl RuntimeTimeoutPolicy {
     pub(crate) fn normalize(performance: &Performance) -> Result<Self, RuntimeConfigError> {
-        require_nonzero_u64("performance.backend_timeout_ms", performance.backend_timeout_ms)?;
+        require_nonzero_u64(
+            "performance.backend_timeout_ms",
+            performance.backend_timeout_ms,
+        )?;
         require_nonzero_u64(
             "performance.backend_connect_timeout_ms",
             performance.backend_connect_timeout_ms,
@@ -710,8 +726,7 @@ impl RuntimeTimeoutPolicy {
                 "performance.backend_body_idle_timeout_ms must be <= backend_body_total_timeout_ms",
             ));
         }
-        if performance.backend_body_total_timeout_ms
-            > performance.backend_total_request_timeout_ms
+        if performance.backend_body_total_timeout_ms > performance.backend_total_request_timeout_ms
         {
             return Err(config_invalid(
                 "performance.backend_body_total_timeout_ms must be <= backend_total_request_timeout_ms",
@@ -882,8 +897,7 @@ impl RuntimeTransportPolicy {
         if performance.quic_initial_max_stream_data > performance.quic_initial_max_data {
             return Err(config_invalid(format!(
                 "performance.quic_initial_max_stream_data ({}) must be <= quic_initial_max_data ({})",
-                performance.quic_initial_max_stream_data,
-                performance.quic_initial_max_data
+                performance.quic_initial_max_stream_data, performance.quic_initial_max_data
             )));
         }
         require_nonzero_u64(
@@ -913,19 +927,16 @@ impl RuntimeTransportPolicy {
         if performance.max_request_body_bytes > performance.quic_initial_max_stream_data as usize {
             return Err(config_invalid(format!(
                 "performance.max_request_body_bytes ({}) must be <= quic_initial_max_stream_data ({})",
-                performance.max_request_body_bytes,
-                performance.quic_initial_max_stream_data
+                performance.max_request_body_bytes, performance.quic_initial_max_stream_data
             )));
         }
         if performance.request_buffer_global_cap_bytes < performance.max_request_body_bytes {
             return Err(config_invalid(format!(
                 "performance.request_buffer_global_cap_bytes ({}) must be >= max_request_body_bytes ({})",
-                performance.request_buffer_global_cap_bytes,
-                performance.max_request_body_bytes
+                performance.request_buffer_global_cap_bytes, performance.max_request_body_bytes
             )));
         }
-        if performance.unknown_length_response_prebuffer_bytes
-            > performance.max_response_body_bytes
+        if performance.unknown_length_response_prebuffer_bytes > performance.max_response_body_bytes
         {
             return Err(config_invalid(format!(
                 "performance.unknown_length_response_prebuffer_bytes ({}) must be <= max_response_body_bytes ({})",
@@ -959,8 +970,8 @@ impl RuntimeTransportPolicy {
             max_response_body_bytes: performance.max_response_body_bytes,
             max_request_body_bytes: performance.max_request_body_bytes,
             request_buffer_global_cap_bytes: performance.request_buffer_global_cap_bytes,
-            unknown_length_response_prebuffer_bytes:
-                performance.unknown_length_response_prebuffer_bytes,
+            unknown_length_response_prebuffer_bytes: performance
+                .unknown_length_response_prebuffer_bytes,
             connection_limits: RuntimeConnectionLimits {
                 global_inflight: performance.global_inflight_limit,
                 per_upstream_inflight: performance.per_upstream_inflight_limit,
@@ -976,9 +987,7 @@ impl RuntimeTransportPolicy {
                     .saturating_mul(performance.worker_threads.max(1)),
                 max_idle_per_backend: performance.h2_pool_max_idle_per_backend,
                 pool_idle_timeout: Duration::from_millis(performance.h2_pool_idle_timeout_ms),
-                connect_timeout: Duration::from_millis(
-                    performance.backend_connect_timeout_ms,
-                ),
+                connect_timeout: Duration::from_millis(performance.backend_connect_timeout_ms),
             },
             backend_dns: RuntimeBackendDnsPolicy {
                 refresh_enabled: performance.backend_dns_refresh_enabled,
@@ -1019,13 +1028,14 @@ impl RuntimeBackendEndpoint {
         backend_id: &str,
         address: &str,
     ) -> Result<Self, RuntimeConfigError> {
-        let canonical =
-            BackendEndpoint::parse(address).map_err(|reason| RuntimeConfigError::BackendAddressInvalid {
+        let canonical = BackendEndpoint::parse(address).map_err(|reason| {
+            RuntimeConfigError::BackendAddressInvalid {
                 upstream: upstream_name.to_string(),
                 backend: backend_id.to_string(),
                 address: address.to_string(),
                 reason,
-            })?;
+            }
+        })?;
         let authority_host = canonical.authority_host().to_string();
         let authority_port = canonical.authority_port();
         let address_kind = if canonical.authority_is_ip_literal() {
@@ -1258,7 +1268,9 @@ impl RuntimeScopedRateLimitPolicy {
             }
             crate::config::ScopedRateLimitScope::Client
             | crate::config::ScopedRateLimitScope::Token => {
-                if let Some(key_spec) = key.as_deref() && !is_valid_request_key_spec(key_spec) {
+                if let Some(key_spec) = key.as_deref()
+                    && !is_valid_request_key_spec(key_spec)
+                {
                     return Err(config_invalid(format!(
                         "resilience.scoped_rate_limits['{}'].key must be a supported request key spec",
                         rule_name
@@ -1455,7 +1467,10 @@ impl RuntimeAdmissionPolicy {
             "resilience.protocol.allowed_methods",
             &resilience.protocol.allowed_methods,
         )?;
-        if allowed_methods.iter().any(|method| !is_valid_http_token(method)) {
+        if allowed_methods
+            .iter()
+            .any(|method| !is_valid_http_token(method))
+        {
             return Err(config_invalid(
                 "resilience.protocol.allowed_methods must contain valid HTTP method tokens",
             ));
@@ -1464,7 +1479,10 @@ impl RuntimeAdmissionPolicy {
             "resilience.protocol.denied_path_prefixes",
             &resilience.protocol.denied_path_prefixes,
         )?;
-        if denied_path_prefixes.iter().any(|prefix| !prefix.starts_with('/')) {
+        if denied_path_prefixes
+            .iter()
+            .any(|prefix| !prefix.starts_with('/'))
+        {
             return Err(config_invalid(
                 "resilience.protocol.denied_path_prefixes must contain '/'-prefixed paths",
             ));
@@ -1663,13 +1681,9 @@ impl RuntimeAdmissionPolicy {
                 timeout_error_rate_percent: resilience.watchdog.timeout_error_rate_percent,
                 min_requests_per_window: resilience.watchdog.min_requests_per_window,
                 overload_inflight_percent: resilience.watchdog.overload_inflight_percent,
-                unhealthy_consecutive_windows: resilience
-                    .watchdog
-                    .unhealthy_consecutive_windows,
+                unhealthy_consecutive_windows: resilience.watchdog.unhealthy_consecutive_windows,
                 drain_grace: Duration::from_millis(resilience.watchdog.drain_grace_ms),
-                restart_cooldown: Duration::from_millis(
-                    resilience.watchdog.restart_cooldown_ms,
-                ),
+                restart_cooldown: Duration::from_millis(resilience.watchdog.restart_cooldown_ms),
                 restart_command: resilience.watchdog.restart_command.clone(),
             },
             protocol: RuntimeProtocolPolicy(protocol),

@@ -13,8 +13,10 @@ impl RuntimeUpstream {
             .tls
             .clone()
             .unwrap_or_else(|| config.upstream_tls.clone());
-        let upstream_transport =
-            RuntimeUpstreamTransportPolicy::from_effective_tls(&effective_tls, &base_policies.transport);
+        let upstream_transport = RuntimeUpstreamTransportPolicy::from_effective_tls(
+            &effective_tls,
+            &base_policies.transport,
+        );
         let load_balancing = RuntimeLoadBalancingPolicy::normalize(&upstream.load_balancing)?;
         let route = RuntimeRouteMatchPolicy::normalize(name, &upstream.route)?;
         let policy = RuntimeUpstreamPolicy {
@@ -112,7 +114,10 @@ pub(super) fn normalize_upstreams(
         let mut upstream_uses_https_backends = false;
 
         for backend in &runtime_upstream.backends {
-            if matches!(backend.endpoint.transport_kind, RuntimeBackendTransportKind::H2) {
+            if matches!(
+                backend.endpoint.transport_kind,
+                RuntimeBackendTransportKind::H2
+            ) {
                 upstream_uses_https_backends = true;
             }
 

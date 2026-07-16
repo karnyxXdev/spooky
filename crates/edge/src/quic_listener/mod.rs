@@ -50,16 +50,13 @@ use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
     config::ClientAuth,
     runtime::{
-        ListenerRuntimeConfig, RuntimeConfig, RuntimeListenerTls, RuntimeTlsIdentity,
-        RuntimeBackendAddressKind, RuntimeUpstreamPolicy,
+        ListenerRuntimeConfig, RuntimeBackendAddressKind, RuntimeConfig, RuntimeListenerTls,
+        RuntimeTlsIdentity, RuntimeUpstreamPolicy,
     },
 };
 use spooky_errors::{PoolError, ProxyError};
 use spooky_lb::{health::HealthFailureReason, upstream_pool::UpstreamPool};
-use spooky_transport::{
-    h2_client::SharedDnsResolver,
-    transport_pool::UpstreamTransportPool,
-};
+use spooky_transport::{h2_client::SharedDnsResolver, transport_pool::UpstreamTransportPool};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     runtime::Handle,
@@ -508,7 +505,10 @@ impl QUICListener {
             backend_total_request_timeout: timeout_policy.backend_total_request,
             inflight_acquire_wait: timeout_policy.inflight_acquire_wait,
             drain_timeout: timeout_policy.shutdown_drain,
-            max_active_connections: transport_policy.connection_limits.max_active_connections.max(1),
+            max_active_connections: transport_policy
+                .connection_limits
+                .max_active_connections
+                .max(1),
             max_streams_per_connection: usize::try_from(
                 transport_policy.quic_initial_max_streams_bidi,
             )
@@ -560,7 +560,10 @@ impl QUICListener {
             worker_threads
         };
         let worker_slots = active_worker_threads.saturating_mul(shard_count).max(1);
-        let per_upstream_limit = transport_policy.connection_limits.per_upstream_inflight.max(1);
+        let per_upstream_limit = transport_policy
+            .connection_limits
+            .per_upstream_inflight
+            .max(1);
         let global_inflight_limit = transport_policy.connection_limits.global_inflight.max(1);
         info!(
             "Runtime performance concurrency worker_threads={} control_plane_threads={} packet_shards_per_worker={} reuseport={} pin_workers={}",
@@ -598,7 +601,10 @@ impl QUICListener {
             transport_policy.udp_recv_buffer_bytes,
             transport_policy.udp_send_buffer_bytes,
             transport_policy.backend_connections.max_idle_per_backend,
-            transport_policy.backend_connections.pool_idle_timeout.as_millis(),
+            transport_policy
+                .backend_connections
+                .pool_idle_timeout
+                .as_millis(),
         );
 
         let listener_runtime_configs = config
@@ -631,7 +637,10 @@ impl QUICListener {
                 }
                 let authority_host = backend.endpoint.authority_host.clone();
                 let authority_port = backend.endpoint.authority_port;
-                let resolution = if matches!(backend.endpoint.address_kind, RuntimeBackendAddressKind::IpLiteral) {
+                let resolution = if matches!(
+                    backend.endpoint.address_kind,
+                    RuntimeBackendAddressKind::IpLiteral
+                ) {
                     let ip_addr = authority_host.parse::<IpAddr>().map_err(|err| {
                         ProxyError::Transport(format!(
                             "failed to parse IP literal backend '{}' in upstream '{}' (backend '{}'): {}",
@@ -737,7 +746,10 @@ impl QUICListener {
         {
             warn!(
                 "resilience.adaptive_admission.high_latency_ms={} is above tuned limit {}; clamping for faster overload reaction",
-                effective_admission.adaptive_admission.high_latency.as_millis(),
+                effective_admission
+                    .adaptive_admission
+                    .high_latency
+                    .as_millis(),
                 tuned_high_latency
             );
         }

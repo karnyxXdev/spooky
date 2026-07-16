@@ -45,7 +45,10 @@ impl RuntimeResilience {
         let admission = Arc::new(AdaptiveAdmission::new(
             adaptive.enabled,
             adaptive.min_limit,
-            adaptive.max_limit.unwrap_or(global_limit).max(adaptive.min_limit),
+            adaptive
+                .max_limit
+                .unwrap_or(global_limit)
+                .max(adaptive.min_limit),
             adaptive.increase_step,
             adaptive.decrease_step,
             adaptive.high_latency_ms,
@@ -147,7 +150,11 @@ impl RuntimeResilience {
             adaptive.max_limit.max(adaptive.min_limit),
             adaptive.increase_step,
             adaptive.decrease_step,
-            adaptive.high_latency.as_millis().try_into().unwrap_or(u64::MAX),
+            adaptive
+                .high_latency
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
         ));
         let route_queue = Arc::new(RouteQueueLimiter::new(
             admission_policy.route_queue.default_cap,
@@ -178,7 +185,10 @@ impl RuntimeResilience {
         let retry_budget = Arc::new(RetryBudget::new(
             admission_policy.retry_budget.enabled,
             admission_policy.retry_budget.ratio_percent,
-            admission_policy.retry_budget.per_route_ratio_percent.clone(),
+            admission_policy
+                .retry_budget
+                .per_route_ratio_percent
+                .clone(),
         ));
         let brownout = Arc::new(BrownoutController::new(
             admission_policy.brownout.enabled,
@@ -238,10 +248,7 @@ impl RuntimeResilience {
             allow_0rtt: admission_policy.protocol.0.allow_0rtt,
             max_headers_count: admission_policy.protocol.0.max_headers_count.max(1),
             max_headers_bytes: admission_policy.protocol.0.max_headers_bytes.max(1),
-            enforce_authority_host_match: admission_policy
-                .protocol
-                .0
-                .enforce_authority_host_match,
+            enforce_authority_host_match: admission_policy.protocol.0.enforce_authority_host_match,
             allow_connect: admission_policy.protocol.0.allow_connect,
             hedging_enabled: admission_policy.hedging.enabled,
             hedging_delay: admission_policy.hedging.delay,

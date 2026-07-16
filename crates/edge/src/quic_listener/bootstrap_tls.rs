@@ -188,7 +188,10 @@ impl QUICListener {
             config.listen.listen.address, config.listen.listen.port
         );
         let alt_svc_value = format!("h3=\":{}\"; ma=86400", config.listen.listen.port);
-        let max_connections = transport_policy.connection_limits.max_active_connections.max(1);
+        let max_connections = transport_policy
+            .connection_limits
+            .max_active_connections
+            .max(1);
         let connection_timeout = timeout_policy.client_body_idle;
         let listener_label = Self::listener_label(config);
         shared_state

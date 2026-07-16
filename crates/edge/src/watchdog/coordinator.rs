@@ -9,8 +9,7 @@ use std::{
 use log::warn;
 use spooky_config::config::Watchdog as WatchdogConfig;
 
-use crate::watchdog::config::WatchdogRuntimeConfig;
-use crate::watchdog::time::now_millis;
+use crate::watchdog::{config::WatchdogRuntimeConfig, time::now_millis};
 
 pub struct WatchdogCoordinator {
     enabled: bool,

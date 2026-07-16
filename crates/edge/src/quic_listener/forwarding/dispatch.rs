@@ -41,6 +41,20 @@ struct AlternateBodylessCandidate {
     request: UpstreamRequest,
 }
 
+struct RetryExecutionCtx<'a> {
+    request_id: u64,
+    route_name: &'a str,
+    policy: ForwardingRetryHedgePolicy,
+    policy_telemetry: &'a mut ForwardingPolicyTelemetry,
+    retry_budget: &'a crate::resilience::retry_budget::RetryBudget,
+    alternate_backend: Option<&'a ResolvedAlternateBackend>,
+    backend_endpoints: &'a HashMap<String, BackendEndpoint>,
+    pending_forward: &'a PendingForward,
+    circuit_breakers: Arc<crate::resilience::circuit_breaker::CircuitBreakers>,
+    transport: Arc<UpstreamTransportPool>,
+    backend_timeout: Duration,
+}
+
 #[derive(Clone, Copy)]
 struct ForwardingRetryHedgePolicy {
     method_idempotent: bool,
@@ -315,18 +329,21 @@ impl QUICListener {
 
     async fn retry_primary_error(
         primary_err: ProxyError,
-        request_id: u64,
-        route_name: &str,
-        policy: ForwardingRetryHedgePolicy,
-        policy_telemetry: &mut ForwardingPolicyTelemetry,
-        retry_budget: &crate::resilience::retry_budget::RetryBudget,
-        alternate_backend: Option<&ResolvedAlternateBackend>,
-        backend_endpoints: &HashMap<String, BackendEndpoint>,
-        pending_forward: &PendingForward,
-        circuit_breakers: Arc<crate::resilience::circuit_breaker::CircuitBreakers>,
-        transport: Arc<UpstreamTransportPool>,
-        backend_timeout: Duration,
+        retry_ctx: RetryExecutionCtx<'_>,
     ) -> Result<Response<Incoming>, ProxyError> {
+        let RetryExecutionCtx {
+            request_id,
+            route_name,
+            policy,
+            policy_telemetry,
+            retry_budget,
+            alternate_backend,
+            backend_endpoints,
+            pending_forward,
+            circuit_breakers,
+            transport,
+            backend_timeout,
+        } = retry_ctx;
         let retry_decision = policy.retry_after_error(
             &primary_err,
             policy_telemetry.retry.count,
@@ -573,17 +590,19 @@ impl QUICListener {
                                 Ok(response) => response,
                                 Err(primary_err) => Self::retry_primary_error(
                                         primary_err,
-                                        request_id,
-                                        &route_name,
-                                        policy,
-                                        &mut policy_telemetry,
-                                        retry_budget.as_ref(),
-                                        alternate_backend.as_ref(),
-                                        backend_endpoints.as_ref(),
-                                        pending_forward_for_upstream.as_ref(),
-                                        Arc::clone(&cb),
-                                        Arc::clone(&transport),
-                                        backend_timeout,
+                                        RetryExecutionCtx {
+                                            request_id,
+                                            route_name: &route_name,
+                                            policy,
+                                            policy_telemetry: &mut policy_telemetry,
+                                            retry_budget: retry_budget.as_ref(),
+                                            alternate_backend: alternate_backend.as_ref(),
+                                            backend_endpoints: backend_endpoints.as_ref(),
+                                            pending_forward: pending_forward_for_upstream.as_ref(),
+                                            circuit_breakers: Arc::clone(&cb),
+                                            transport: Arc::clone(&transport),
+                                            backend_timeout,
+                                        },
                                     )
                                     .await?,
                             }
@@ -605,17 +624,19 @@ impl QUICListener {
                                 Ok(response) => response,
                                 Err(primary_err) => Self::retry_primary_error(
                                         primary_err,
-                                        request_id,
-                                        &route_name,
-                                        policy,
-                                        &mut policy_telemetry,
-                                        retry_budget.as_ref(),
-                                        alternate_backend.as_ref(),
-                                        backend_endpoints.as_ref(),
-                                        pending_forward_for_upstream.as_ref(),
-                                        Arc::clone(&cb),
-                                        Arc::clone(&transport),
-                                        backend_timeout,
+                                        RetryExecutionCtx {
+                                            request_id,
+                                            route_name: &route_name,
+                                            policy,
+                                            policy_telemetry: &mut policy_telemetry,
+                                            retry_budget: retry_budget.as_ref(),
+                                            alternate_backend: alternate_backend.as_ref(),
+                                            backend_endpoints: backend_endpoints.as_ref(),
+                                            pending_forward: pending_forward_for_upstream.as_ref(),
+                                            circuit_breakers: Arc::clone(&cb),
+                                            transport: Arc::clone(&transport),
+                                            backend_timeout,
+                                        },
                                     )
                                     .await?,
                             }

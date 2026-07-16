@@ -1,15 +1,34 @@
 use spooky_errors::{
-    HedgePolicyDecision, HedgePolicyFacts, HedgePrimaryState, RetryPolicyDecision,
-    RetryPolicyFacts, RetryPolicyDenialReason, RetryTelemetryReason, evaluate_hedge_policy,
-    evaluate_retry_policy, is_idempotent_method,
+    HedgeOutcomeTelemetryReason, HedgePolicyDecision, HedgePolicyFacts, HedgePrimaryState,
+    RetryAttemptTelemetryReason, RetryPolicyDecision, RetryPolicyDenialReason,
+    RetryPolicyFacts, evaluate_hedge_policy, evaluate_retry_policy, is_idempotent_method,
 };
 use spooky_lb::alternate_backend::{
-    AlternateBackendDecision, choose_alternate_backend,
+    AlternateBackendDecision, AlternateBackendFailureReason, choose_alternate_backend,
 };
 
 use super::*;
 
 const MAX_UPSTREAM_RETRY_ATTEMPTS: u8 = 1;
+
+#[derive(Clone, Debug)]
+enum ResolvedAlternateBackend {
+    Selected { address: String },
+    Unavailable { reason: AlternateBackendFailureReason },
+}
+
+impl ResolvedAlternateBackend {
+    fn is_available(&self) -> bool {
+        matches!(self, Self::Selected { .. })
+    }
+
+    fn failure_reason(&self) -> Option<AlternateBackendFailureReason> {
+        match self {
+            Self::Selected { .. } => None,
+            Self::Unavailable { reason } => Some(*reason),
+        }
+    }
+}
 
 impl QUICListener {
     #[allow(clippy::too_many_arguments)]
@@ -122,14 +141,27 @@ impl QUICListener {
     fn resolve_alternate_backend(
         upstream_pool: &Arc<RwLock<UpstreamPool>>,
         primary_index: usize,
-    ) -> Option<(String, usize)> {
-        let pool = upstream_pool.read().ok()?;
+    ) -> ResolvedAlternateBackend {
+        let Ok(pool) = upstream_pool.read() else {
+            return ResolvedAlternateBackend::Unavailable {
+                reason: AlternateBackendFailureReason::PoolUnavailable,
+            };
+        };
         match choose_alternate_backend(&pool, &[primary_index], None) {
-            AlternateBackendDecision::Select(choice) => pool
-                .pool
-                .address(choice.index)
-                .map(|address| (address.to_string(), choice.index)),
-            AlternateBackendDecision::DoNotSelect { .. } => None,
+            AlternateBackendDecision::Select(choice) => {
+                if let Some(address) = pool.pool.address(choice.index) {
+                    ResolvedAlternateBackend::Selected {
+                        address: address.to_string(),
+                    }
+                } else {
+                    ResolvedAlternateBackend::Unavailable {
+                        reason: AlternateBackendFailureReason::BackendAddressMissing,
+                    }
+                }
+            }
+            AlternateBackendDecision::DoNotSelect { denial } => {
+                ResolvedAlternateBackend::Unavailable { reason: denial }
+            }
         }
     }
 
@@ -153,9 +185,12 @@ impl QUICListener {
         let _backend_resolutions = Arc::clone(&exec_ctx.backend_resolution_store);
         let transport = Arc::clone(&exec_ctx.transport_pool);
         let hedge_delay = resilience.hedging_delay;
-        let alternate_backend = req.upstream_pool.as_ref().and_then(|upstream_pool| {
-            Self::resolve_alternate_backend(upstream_pool, pending_forward.backend_index)
-        });
+        let alternate_backend = req
+            .upstream_pool
+            .as_ref()
+            .map(|upstream_pool| {
+                Self::resolve_alternate_backend(upstream_pool, pending_forward.backend_index)
+            });
         let trace_span_for_upstream = req.trace_span.clone();
         let pending_forward_for_upstream = Arc::clone(&pending_forward);
         let (result_tx, result_rx) = oneshot::channel::<UpstreamResult>();
@@ -170,7 +205,7 @@ impl QUICListener {
             let mut hedge_telemetry =
                 crate::runtime::connection::response::HedgeTelemetry::default();
             let mut retry_count: u8 = 0;
-            let mut retry_attempt_reason: Option<RetryTelemetryReason> = None;
+            let mut retry_attempt_reason: Option<RetryAttemptTelemetryReason> = None;
             let mut retry_denial_reason: Option<RetryPolicyDenialReason> = None;
             let result: ForwardResult = async {
                 retry_budget.mark_primary(&route_name);
@@ -222,20 +257,30 @@ impl QUICListener {
                             method_allowed: hedge_method_allowed,
                             request_body_replayable: bodyless_mode,
                             tunnel_request: hedge_tunnel_request,
-                            alternate_backend_available: alternate_backend.is_some(),
-                            alternate_backend_healthy: alternate_backend.is_some(),
+                            alternate_backend_available: alternate_backend
+                                .as_ref()
+                                .is_some_and(ResolvedAlternateBackend::is_available),
+                            alternate_backend_failure: alternate_backend
+                                .as_ref()
+                                .and_then(ResolvedAlternateBackend::failure_reason),
                             budget_available: false,
                             primary_state: HedgePrimaryState::InFlightBeforeDelay,
                         }),
                         HedgePolicyDecision::WaitForPrimary
                     ) {
-                        let hedge_candidate = alternate_backend.clone().and_then(|(backend, _idx)| {
-                            let endpoint = backend_endpoints.get(&backend)?;
-                            pending_forward_for_upstream
-                                .build_bodyless_request(endpoint)
-                                .ok()
-                                .map(|req| (backend, req))
-                        });
+                        let hedge_candidate =
+                            alternate_backend
+                                .clone()
+                                .and_then(|alternate| match alternate {
+                                    ResolvedAlternateBackend::Selected { address, .. } => {
+                                        let endpoint = backend_endpoints.get(&address)?;
+                                        pending_forward_for_upstream
+                                            .build_bodyless_request(endpoint)
+                                            .ok()
+                                            .map(|req| (address, req))
+                                    }
+                                    ResolvedAlternateBackend::Unavailable { .. } => None,
+                                });
 
                         if let Some((hedge_backend, hedge_request)) = hedge_candidate {
                             let primary_started = Instant::now();
@@ -262,12 +307,12 @@ impl QUICListener {
                                     request_body_replayable: bodyless_mode,
                                     tunnel_request: hedge_tunnel_request,
                                     alternate_backend_available: true,
-                                    alternate_backend_healthy: true,
+                                    alternate_backend_failure: None,
                                     budget_available: retry_budget.allow_retry(&route_name).is_ok(),
                                     primary_state: HedgePrimaryState::InFlightAfterDelay,
                                 }) {
-                                    HedgePolicyDecision::Hedge { .. } => {
-                                        hedge_telemetry.launched = true;
+                                    HedgePolicyDecision::Hedge { reason } => {
+                                        hedge_telemetry.trigger_reason = Some(reason);
                                         let hedge_fut = send_once(
                                             hedge_backend,
                                             hedge_request,
@@ -277,12 +322,13 @@ impl QUICListener {
                                         tokio::pin!(hedge_fut);
                                         tokio::select! {
                                             result = &mut primary_fut => {
-                                                hedge_telemetry.primary_won_after_trigger = true;
-                                                hedge_telemetry.hedge_wasted = true;
+                                                hedge_telemetry.outcome_reason =
+                                                    Some(HedgeOutcomeTelemetryReason::PrimaryWonAfterTrigger);
                                                 result?
                                             },
                                             result = &mut hedge_fut => {
-                                                hedge_telemetry.hedge_won = true;
+                                                hedge_telemetry.outcome_reason =
+                                                    Some(HedgeOutcomeTelemetryReason::HedgeWon);
                                                 let elapsed_ms = primary_started.elapsed().as_millis() as u64;
                                                 let delay_ms = hedge_delay.as_millis() as u64;
                                                 hedge_telemetry.primary_late_ms = elapsed_ms.saturating_sub(delay_ms);
@@ -321,8 +367,12 @@ impl QUICListener {
                                     attempt_count: retry_count,
                                     max_attempts: MAX_UPSTREAM_RETRY_ATTEMPTS,
                                     budget_available: retry_budget.allow_retry(&route_name).is_ok(),
-                                    alternate_backend_available: alternate_backend.is_some(),
-                                    alternate_backend_healthy: alternate_backend.is_some(),
+                                    alternate_backend_available: alternate_backend
+                                        .as_ref()
+                                        .is_some_and(ResolvedAlternateBackend::is_available),
+                                    alternate_backend_failure: alternate_backend
+                                        .as_ref()
+                                        .and_then(ResolvedAlternateBackend::failure_reason),
                                 });
                                 let retry_reason = match retry_decision {
                                     RetryPolicyDecision::Retry { reason } => reason.into(),
@@ -331,24 +381,31 @@ impl QUICListener {
                                         return Err(primary_err);
                                     }
                                 };
-                                if let Some((retry_backend, _)) = alternate_backend.clone()
-                                    && let Some(endpoint) = backend_endpoints.get(&retry_backend)
-                                    && let Ok(retry_request) =
-                                        pending_forward_for_upstream.build_bodyless_request(endpoint)
-                                {
-                                    retry_count = retry_count.saturating_add(1);
-                                    retry_attempt_reason = Some(retry_reason);
-                                    info!(
-                                        "request_id={} retrying request on alternate backend: route={} reason={:?}",
-                                        request_id, route_name, retry_reason
-                                    );
-                                    send_once(
-                                        retry_backend,
-                                        retry_request,
-                                        Arc::clone(&cb),
-                                        Arc::clone(&transport),
-                                    )
-                                    .await?
+                                if let Some(alternate_backend) = alternate_backend.clone() {
+                                    if let ResolvedAlternateBackend::Selected {
+                                        address: retry_backend,
+                                        ..
+                                    } = alternate_backend
+                                        && let Some(endpoint) = backend_endpoints.get(&retry_backend)
+                                        && let Ok(retry_request) = pending_forward_for_upstream
+                                            .build_bodyless_request(endpoint)
+                                    {
+                                        retry_count = retry_count.saturating_add(1);
+                                        retry_attempt_reason = Some(retry_reason);
+                                        info!(
+                                            "request_id={} retrying request on alternate backend: route={} reason={:?}",
+                                            request_id, route_name, retry_reason
+                                        );
+                                        send_once(
+                                            retry_backend,
+                                            retry_request,
+                                            Arc::clone(&cb),
+                                            Arc::clone(&transport),
+                                        )
+                                        .await?
+                                    } else {
+                                        return Err(primary_err);
+                                    }
                                 } else {
                                     return Err(primary_err);
                                 }

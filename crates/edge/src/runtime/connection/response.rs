@@ -1,5 +1,8 @@
 use bytes::Bytes;
-use spooky_errors::{ProxyError, RetryPolicyDenialReason, RetryTelemetryReason};
+use spooky_errors::{
+    HedgeOutcomeTelemetryReason, HedgeTriggerTelemetryReason, ProxyError,
+    RetryAttemptTelemetryReason, RetryPolicyDenialReason,
+};
 use tokio::sync::mpsc;
 
 pub enum ForwardSuccess {
@@ -22,7 +25,7 @@ pub struct UpstreamResult {
     pub hedge: HedgeTelemetry,
     pub retry_count: u8,
     /// Set when a retry was attempted; the shared policy reason that triggered it.
-    pub retry_attempt_reason: Option<RetryTelemetryReason>,
+    pub retry_attempt_reason: Option<RetryAttemptTelemetryReason>,
     /// Set when a retry was denied; the first shared policy denial encountered.
     pub retry_denial_reason: Option<RetryPolicyDenialReason>,
 }
@@ -46,9 +49,7 @@ pub enum ResponseChunk {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HedgeTelemetry {
-    pub launched: bool,
-    pub hedge_won: bool,
-    pub hedge_wasted: bool,
-    pub primary_won_after_trigger: bool,
+    pub trigger_reason: Option<HedgeTriggerTelemetryReason>,
+    pub outcome_reason: Option<HedgeOutcomeTelemetryReason>,
     pub primary_late_ms: u64,
 }

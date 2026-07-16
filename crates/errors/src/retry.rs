@@ -1,4 +1,5 @@
 use crate::{PoolError, ProxyError};
+use spooky_lb::alternate_backend::AlternateBackendFailureReason;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UpstreamRetryReason {
@@ -28,8 +29,7 @@ pub enum RetryPolicyDenialReason {
     RequestBodyNotReplayable,
     AttemptLimitReached,
     BudgetDenied,
-    NoAlternateBackend,
-    AlternateBackendUnhealthy,
+    AlternateBackendUnavailable(AlternateBackendFailureReason),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,7 +41,7 @@ pub struct RetryPolicyFacts {
     pub max_attempts: u8,
     pub budget_available: bool,
     pub alternate_backend_available: bool,
-    pub alternate_backend_healthy: bool,
+    pub alternate_backend_failure: Option<AlternateBackendFailureReason>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,13 +53,13 @@ pub enum RetryPolicyDecision {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RetryTelemetryReason {
+pub enum RetryAttemptTelemetryReason {
     Timeout,
     Transport,
     Pool,
 }
 
-impl From<UpstreamRetryReason> for RetryTelemetryReason {
+impl From<UpstreamRetryReason> for RetryAttemptTelemetryReason {
     fn from(value: UpstreamRetryReason) -> Self {
         match value {
             UpstreamRetryReason::Timeout => Self::Timeout,
@@ -76,7 +76,7 @@ pub struct HedgePolicyFacts {
     pub request_body_replayable: bool,
     pub tunnel_request: bool,
     pub alternate_backend_available: bool,
-    pub alternate_backend_healthy: bool,
+    pub alternate_backend_failure: Option<AlternateBackendFailureReason>,
     pub budget_available: bool,
     pub primary_state: HedgePrimaryState,
 }
@@ -92,52 +92,29 @@ pub enum HedgePrimaryState {
 pub enum HedgePolicyDenialReason {
     HedgingDisabled,
     PrimaryRequestCompleted,
-    DelayNotElapsed,
     RequestBodyNotReplayable,
     TunnelRequest,
     MethodNotAllowed,
-    NoAlternateBackend,
-    AlternateBackendUnhealthy,
+    AlternateBackendUnavailable(AlternateBackendFailureReason),
     BudgetDenied,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HedgePolicyDecision {
     WaitForPrimary,
-    Hedge { reason: HedgeTelemetryReason },
+    Hedge { reason: HedgeTriggerTelemetryReason },
     DoNotHedge { denial: HedgePolicyDenialReason },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HedgeTelemetryReason {
+pub enum HedgeTriggerTelemetryReason {
     DelayElapsed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HedgeOutcomeTelemetryReason {
     PrimaryWonAfterTrigger,
     HedgeWon,
-    HedgeWasted,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AlternateBackendChoice<Backend> {
-    pub backend: Backend,
-    pub index: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AlternateBackendPolicyFacts {
-    pub candidate_available: bool,
-    pub excluded_primary_backend: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AlternateBackendDenialReason {
-    NoCandidateAvailable,
-    PrimaryBackendNotExcluded,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AlternateBackendDecision<Backend> {
-    Select(AlternateBackendChoice<Backend>),
-    DoNotSelect { denial: AlternateBackendDenialReason },
 }
 
 pub type RetryPolicyInput = RetryPolicyFacts;
@@ -190,11 +167,11 @@ pub fn evaluate_retry_policy(input: RetryPolicyFacts) -> RetryPolicyDecision {
                 }
             } else if !input.alternate_backend_available {
                 RetryPolicyDecision::DoNotRetry {
-                    denial: Some(RetryPolicyDenialReason::NoAlternateBackend),
-                }
-            } else if !input.alternate_backend_healthy {
-                RetryPolicyDecision::DoNotRetry {
-                    denial: Some(RetryPolicyDenialReason::AlternateBackendUnhealthy),
+                    denial: Some(RetryPolicyDenialReason::AlternateBackendUnavailable(
+                        input.alternate_backend_failure.unwrap_or(
+                            AlternateBackendFailureReason::OnlyExcludedBackendsHealthy,
+                        ),
+                    )),
                 }
             } else {
                 RetryPolicyDecision::Retry { reason }
@@ -230,13 +207,11 @@ pub fn evaluate_hedge_policy(input: HedgePolicyFacts) -> HedgePolicyDecision {
 
     if !input.alternate_backend_available {
         return HedgePolicyDecision::DoNotHedge {
-            denial: HedgePolicyDenialReason::NoAlternateBackend,
-        };
-    }
-
-    if !input.alternate_backend_healthy {
-        return HedgePolicyDecision::DoNotHedge {
-            denial: HedgePolicyDenialReason::AlternateBackendUnhealthy,
+            denial: HedgePolicyDenialReason::AlternateBackendUnavailable(
+                input.alternate_backend_failure.unwrap_or(
+                    AlternateBackendFailureReason::OnlyExcludedBackendsHealthy,
+                ),
+            ),
         };
     }
 
@@ -252,7 +227,7 @@ pub fn evaluate_hedge_policy(input: HedgePolicyFacts) -> HedgePolicyDecision {
                 }
             } else {
                 HedgePolicyDecision::Hedge {
-                    reason: HedgeTelemetryReason::DelayElapsed,
+                    reason: HedgeTriggerTelemetryReason::DelayElapsed,
                 }
             }
         }
@@ -279,7 +254,7 @@ mod tests {
             max_attempts: 1,
             budget_available: true,
             alternate_backend_available: true,
-            alternate_backend_healthy: true,
+            alternate_backend_failure: None,
         }
     }
 
@@ -348,12 +323,15 @@ mod tests {
     #[test]
     fn unhealthy_alternate_backend_blocks_retry() {
         let mut facts = retry_facts();
-        facts.alternate_backend_healthy = false;
+        facts.alternate_backend_available = false;
+        facts.alternate_backend_failure = Some(AlternateBackendFailureReason::NoHealthyBackends);
 
         assert_eq!(
             evaluate_retry_policy(facts),
             RetryPolicyDecision::DoNotRetry {
-                denial: Some(RetryPolicyDenialReason::AlternateBackendUnhealthy),
+                denial: Some(RetryPolicyDenialReason::AlternateBackendUnavailable(
+                    AlternateBackendFailureReason::NoHealthyBackends,
+                )),
             }
         );
     }
@@ -375,7 +353,7 @@ mod tests {
             request_body_replayable: true,
             tunnel_request: false,
             alternate_backend_available: true,
-            alternate_backend_healthy: true,
+            alternate_backend_failure: None,
             budget_available: true,
             primary_state: HedgePrimaryState::InFlightAfterDelay,
         }
@@ -394,7 +372,7 @@ mod tests {
         assert_eq!(
             evaluate_hedge_policy(hedge_facts()),
             HedgePolicyDecision::Hedge {
-                reason: HedgeTelemetryReason::DelayElapsed,
+                reason: HedgeTriggerTelemetryReason::DelayElapsed,
             }
         );
     }

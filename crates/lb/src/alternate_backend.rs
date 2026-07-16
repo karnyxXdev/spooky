@@ -13,15 +13,17 @@ pub struct AlternateBackendChoice {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AlternateBackendDenialReason {
+pub enum AlternateBackendFailureReason {
     NoHealthyBackends,
     OnlyExcludedBackendsHealthy,
+    PoolUnavailable,
+    BackendAddressMissing,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AlternateBackendDecision {
     Select(AlternateBackendChoice),
-    DoNotSelect { denial: AlternateBackendDenialReason },
+    DoNotSelect { denial: AlternateBackendFailureReason },
 }
 
 fn is_excluded(index: usize, excluded_indices: &[usize]) -> bool {
@@ -56,11 +58,11 @@ pub fn choose_alternate_backend(
 
     if pool.pool.healthy_len() == 0 {
         AlternateBackendDecision::DoNotSelect {
-            denial: AlternateBackendDenialReason::NoHealthyBackends,
+            denial: AlternateBackendFailureReason::NoHealthyBackends,
         }
     } else {
         AlternateBackendDecision::DoNotSelect {
-            denial: AlternateBackendDenialReason::OnlyExcludedBackendsHealthy,
+            denial: AlternateBackendFailureReason::OnlyExcludedBackendsHealthy,
         }
     }
 }
@@ -165,7 +167,7 @@ mod tests {
         assert_eq!(
             decision,
             AlternateBackendDecision::DoNotSelect {
-                denial: AlternateBackendDenialReason::OnlyExcludedBackendsHealthy,
+                denial: AlternateBackendFailureReason::OnlyExcludedBackendsHealthy,
             }
         );
     }

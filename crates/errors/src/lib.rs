@@ -10,11 +10,15 @@ pub use proxy::{
     ClassifiedUpstreamProxyError, ProxyError, UpstreamProxyErrorKind,
     classify_upstream_proxy_error, classify_upstream_send_error,
 };
+pub use spooky_lb::alternate_backend::{
+    AlternateBackendChoice, AlternateBackendDecision, AlternateBackendFailureReason,
+    AlternateBackendSelectionMode,
+};
 pub use retry::{
-    AlternateBackendChoice, AlternateBackendDecision, AlternateBackendDenialReason,
-    AlternateBackendPolicyFacts, HedgePolicyDecision, HedgePolicyDenialReason,
-    HedgePolicyFacts, HedgePrimaryState, HedgeTelemetryReason, RetryPolicyDecision, RetryPolicyDenial,
-    RetryPolicyDenialReason, RetryPolicyFacts, RetryPolicyInput, RetryTelemetryReason,
+    HedgeOutcomeTelemetryReason, HedgePolicyDecision, HedgePolicyDenialReason,
+    HedgePolicyFacts, HedgePrimaryState, HedgeTriggerTelemetryReason, RetryAttemptTelemetryReason,
+    RetryPolicyDecision, RetryPolicyDenial, RetryPolicyDenialReason, RetryPolicyFacts,
+    RetryPolicyInput,
     UpstreamRetryReason, UpstreamRetryability, UpstreamTerminalErrorKind,
     is_idempotent_method,
     classify_retryability, evaluate_hedge_policy, evaluate_retry_policy, is_retryable,

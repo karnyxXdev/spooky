@@ -1,4 +1,5 @@
 use spooky_errors::{
+    AlternateBackendFailureReason,
     PoolError, ProxyError, RetryPolicyDecision, RetryPolicyDenial, RetryPolicyInput,
     UpstreamErrorClassification, UpstreamHealthFailureMapping, UpstreamProxyErrorKind,
     UpstreamRetryReason, UpstreamRetryability, UpstreamTerminalErrorKind, UpstreamTlsReason,
@@ -58,7 +59,7 @@ fn retry_policy_evaluation_preserves_existing_denial_behavior() {
             max_attempts: 1,
             budget_available: true,
             alternate_backend_available: true,
-            alternate_backend_healthy: true,
+            alternate_backend_failure: None,
         }),
         RetryPolicyDecision::DoNotRetry {
             denial: Some(RetryPolicyDenial::TerminalError(
@@ -75,7 +76,7 @@ fn retry_policy_evaluation_preserves_existing_denial_behavior() {
             max_attempts: 1,
             budget_available: true,
             alternate_backend_available: true,
-            alternate_backend_healthy: true,
+            alternate_backend_failure: None,
         }),
         RetryPolicyDecision::DoNotRetry {
             denial: Some(RetryPolicyDenial::RequestBodyNotReplayable),
@@ -90,7 +91,7 @@ fn retry_policy_evaluation_preserves_existing_denial_behavior() {
             max_attempts: 1,
             budget_available: false,
             alternate_backend_available: true,
-            alternate_backend_healthy: true,
+            alternate_backend_failure: None,
         }),
         RetryPolicyDecision::DoNotRetry {
             denial: Some(RetryPolicyDenial::BudgetDenied),
@@ -105,10 +106,28 @@ fn retry_policy_evaluation_preserves_existing_denial_behavior() {
             max_attempts: 1,
             budget_available: true,
             alternate_backend_available: true,
-            alternate_backend_healthy: true,
+            alternate_backend_failure: None,
         }),
         RetryPolicyDecision::Retry {
             reason: UpstreamRetryReason::Timeout,
+        }
+    );
+
+    assert_eq!(
+        evaluate_retry_policy(RetryPolicyInput {
+            retryability: UpstreamRetryability::Retryable(UpstreamRetryReason::Timeout),
+            method_idempotent: true,
+            request_body_replayable: true,
+            attempt_count: 0,
+            max_attempts: 1,
+            budget_available: true,
+            alternate_backend_available: false,
+            alternate_backend_failure: Some(AlternateBackendFailureReason::NoHealthyBackends),
+        }),
+        RetryPolicyDecision::DoNotRetry {
+            denial: Some(RetryPolicyDenial::AlternateBackendUnavailable(
+                AlternateBackendFailureReason::NoHealthyBackends,
+            )),
         }
     );
 }

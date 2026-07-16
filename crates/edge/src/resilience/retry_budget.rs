@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use crate::RetryReason;
+use spooky_errors::RetryPolicyDenialReason;
 
 pub struct RetryBudget {
     enabled: bool,
@@ -41,7 +41,7 @@ impl RetryBudget {
         }
     }
 
-    pub fn allow_retry(&self, route: &str) -> Result<(), RetryReason> {
+    pub fn allow_retry(&self, route: &str) -> Result<(), RetryPolicyDenialReason> {
         if !self.enabled {
             return Ok(());
         }
@@ -56,7 +56,7 @@ impl RetryBudget {
         let retries = self.global_retries.load(Ordering::Relaxed);
         let global_limit = ((primary * ratio as u64) / 100).saturating_add(1);
         if retries >= global_limit {
-            return Err(RetryReason::BudgetDenied);
+            return Err(RetryPolicyDenialReason::BudgetDenied);
         }
 
         let mut route_allowed = true;
@@ -70,7 +70,7 @@ impl RetryBudget {
             }
         }
         if !route_allowed {
-            return Err(RetryReason::BudgetDenied);
+            return Err(RetryPolicyDenialReason::BudgetDenied);
         }
 
         self.global_retries.fetch_add(1, Ordering::Relaxed);

@@ -4,7 +4,7 @@ use crate::{
     backend_endpoint::BackendEndpoint,
     config::{
         Backend, ClientAuth, Config, ForwardedHeaderPolicy, Listen, LoadBalancing, Observability,
-        Performance, ProtocolPolicy, Resilience, RouteMatch, Security, TlsCertificate, Upstream,
+        Performance, ProtocolPolicy, Resilience, Security, TlsCertificate, Upstream,
         UpstreamHostPolicy, UpstreamHostPolicyMode, UpstreamTls,
     },
 };
@@ -22,10 +22,11 @@ pub use policies::{
     RuntimeBackendEndpoint, RuntimeBackendHealthCheck, RuntimeBackendTlsPolicy,
     RuntimeBackendTransportKind, RuntimeCircuitBreakerPolicy, RuntimeConnectionLimits,
     RuntimeExternalAuth, RuntimeExternalAuthFailureMode, RuntimeExternalAuthRequestHeader,
-    RuntimeHedgingPolicy, RuntimeJwtAuth,
+    RuntimeHedgingPolicy, RuntimeJwtAuth, RuntimeAlternateBackendPolicy, RuntimeRequestKeySpec,
     RuntimeListenerPolicySet, RuntimeLoadBalancingPolicy, RuntimeLoadBalancingStrategy,
     RuntimePolicySet, RuntimeRateLimitPolicy, RuntimeRetryBudgetPolicy,
-    RuntimeRouteQueuePolicy, RuntimeScopedRateLimitPolicy, RuntimeTimeoutPolicy,
+    RuntimeRouteHostPattern, RuntimeRouteMatchPolicy, RuntimeRouteQueuePolicy,
+    RuntimeScopedRateLimitPolicy, RuntimeTimeoutPolicy,
     RuntimeTransportPolicy, RuntimeUpstreamPolicySet, RuntimeUpstreamTransportPolicy,
     RuntimeWatchdogPolicy,
 };
@@ -238,8 +239,8 @@ pub struct RuntimeTlsIdentity {
 #[derive(Debug, Clone)]
 pub struct RuntimeUpstream {
     pub name: String,
-    pub load_balancing: LoadBalancing,
-    pub route: RouteMatch,
+    pub load_balancing: RuntimeLoadBalancingPolicy,
+    pub route: RuntimeRouteMatchPolicy,
     pub policy: RuntimeUpstreamPolicy,
     pub policy_set: RuntimeUpstreamPolicySet,
     pub effective_tls: UpstreamTls,

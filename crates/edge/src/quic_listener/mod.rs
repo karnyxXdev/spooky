@@ -658,7 +658,7 @@ impl QUICListener {
 
         let mut route_labels = config.upstreams.keys().cloned().collect::<Vec<_>>();
         route_labels.push("unrouted".to_string());
-        let routing_index = Arc::new(RouteIndex::from_upstreams(&config.upstreams_as_config()));
+        let routing_index = Arc::new(RouteIndex::from_runtime_upstreams(&config.upstreams));
         let metrics = Arc::new(Metrics::new(worker_slots, route_labels));
         let backend_dns_resolver = SharedDnsResolver::new();
         let backend_resolution_store =
@@ -690,8 +690,8 @@ impl QUICListener {
         let mut upstream_pools = HashMap::new();
         let mut upstream_inflight = HashMap::new();
         for (name, runtime_upstream) in &config.upstreams {
-            let upstream_pool = UpstreamPool::from_upstream(&runtime_upstream.as_config_upstream())
-                .map_err(|err| {
+            let upstream_pool =
+                UpstreamPool::from_runtime_upstream(runtime_upstream).map_err(|err| {
                     ProxyError::Transport(format!(
                         "failed to create upstream pool '{}': {}",
                         name, err

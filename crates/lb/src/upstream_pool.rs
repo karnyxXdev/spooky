@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use spooky_config::runtime::RuntimeUpstream;
+
 use crate::{backend::BackendState, backend_pool::BackendPool, load_balancing::LoadBalancing};
 
 pub struct UpstreamPool {
@@ -20,6 +22,23 @@ impl UpstreamPool {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+
+        Ok(Self {
+            pool: BackendPool::new_from_states(backends),
+            load_balancer,
+            lb_key,
+        })
+    }
+
+    pub fn from_runtime_upstream(upstream: &RuntimeUpstream) -> Result<Self, String> {
+        let backends = upstream
+            .backends
+            .iter()
+            .map(|backend| BackendState::new(&backend.backend))
+            .collect();
+
+        let load_balancer = LoadBalancing::from_runtime_strategy(upstream.load_balancing.strategy)?;
+        let lb_key = upstream.load_balancing.key.clone();
 
         Ok(Self {
             pool: BackendPool::new_from_states(backends),

@@ -1,6 +1,6 @@
 use super::*;
 
-type RouteMatcherKey = (Option<String>, Option<String>, Option<String>);
+type RouteMatcherKey = RuntimeRouteMatchPolicy;
 
 impl RuntimeUpstream {
     pub(super) fn from_config(
@@ -15,6 +15,8 @@ impl RuntimeUpstream {
             .unwrap_or_else(|| config.upstream_tls.clone());
         let upstream_transport =
             RuntimeUpstreamTransportPolicy::from_effective_tls(&effective_tls, &base_policies.transport);
+        let load_balancing = RuntimeLoadBalancingPolicy::normalize(&upstream.load_balancing)?;
+        let route = RuntimeRouteMatchPolicy::normalize(name, &upstream.route)?;
         let policy = RuntimeUpstreamPolicy {
             upstream_auth: RuntimeAuthPolicy::normalize(&upstream.auth, name)?,
             host: RuntimeHostPolicy(upstream.host_policy.clone()),
@@ -23,14 +25,14 @@ impl RuntimeUpstream {
         };
         let mut runtime_upstream = Self {
             name: name.to_string(),
-            load_balancing: upstream.load_balancing.clone(),
-            route: upstream.route.clone(),
+            load_balancing: load_balancing.clone(),
+            route: route.clone(),
             policy,
             policy_set: RuntimeUpstreamPolicySet {
                 timeouts: base_policies.timeouts.clone(),
                 auth: RuntimeAuthPolicy::default(),
                 rate_limits: base_policies.rate_limits.clone(),
-                load_balancing: RuntimeLoadBalancingPolicy::normalize(&upstream.load_balancing)?,
+                load_balancing,
                 admission: base_policies.admission.clone(),
                 transport: upstream_transport,
                 host: RuntimeHostPolicy(upstream.host_policy.clone()),
@@ -51,12 +53,12 @@ impl RuntimeUpstream {
 
     pub fn as_config_upstream(&self) -> Upstream {
         Upstream {
-            load_balancing: self.load_balancing.clone(),
+            load_balancing: self.load_balancing.as_config(),
             auth: self.policy.upstream_auth.as_config(),
             host_policy: self.policy.host.0.clone(),
             forwarded_headers: self.policy.forwarded_headers.0.clone(),
             tls: Some(self.effective_tls.clone()),
-            route: self.route.clone(),
+            route: self.route.as_config(),
             backends: self
                 .backends
                 .iter()
@@ -92,19 +94,15 @@ pub(super) fn normalize_upstreams(
     for (upstream_name, upstream) in &config.upstream {
         validate_upstream_policy(config, upstream_name, upstream)?;
 
-        let route_key = (
-            upstream.route.host.as_deref().map(normalize_route_host),
-            upstream.route.path_prefix.clone(),
-            normalized_route_method(upstream.route.method.as_deref()),
-        );
+        let route_key = RuntimeRouteMatchPolicy::normalize(upstream_name, &upstream.route)?;
         if let Some(existing) = seen_route_matchers.insert(route_key.clone(), upstream_name.clone())
         {
             return Err(RuntimeConfigError::DuplicateRouteAmbiguity {
                 upstream: upstream_name.clone(),
                 existing_upstream: existing,
-                host: route_key.0.clone(),
-                path_prefix: route_key.1.clone(),
-                method: route_key.2.clone(),
+                host: route_key.host.clone(),
+                path_prefix: route_key.path_prefix.clone(),
+                method: route_key.method.clone(),
             });
         }
 
@@ -587,26 +585,6 @@ fn validate_runtime_upstream_tls(
         )));
     }
     Ok(())
-}
-
-fn normalize_route_host(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let host = if let Some(rest) = trimmed.strip_prefix('[') {
-        if let Some(end) = rest.find(']') {
-            &rest[..end]
-        } else {
-            trimmed
-        }
-    } else if let Some((candidate_host, candidate_port)) = trimmed.rsplit_once(':') {
-        if !candidate_host.contains(':') && candidate_port.chars().all(|c| c.is_ascii_digit()) {
-            candidate_host
-        } else {
-            trimmed
-        }
-    } else {
-        trimmed
-    };
-    host.trim_end_matches('.').to_ascii_lowercase()
 }
 
 fn normalized_route_method(method: Option<&str>) -> Option<String> {

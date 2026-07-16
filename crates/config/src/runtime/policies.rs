@@ -89,6 +89,44 @@ fn is_valid_request_key_spec(key_spec: &str) -> bool {
     })
 }
 
+fn normalize_route_host(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let host = if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            &rest[..end]
+        } else {
+            trimmed
+        }
+    } else if let Some((candidate_host, candidate_port)) = trimmed.rsplit_once(':') {
+        if !candidate_host.contains(':') && candidate_port.chars().all(|c| c.is_ascii_digit()) {
+            candidate_host
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn normalized_route_method(method: Option<&str>) -> Option<String> {
+    method
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_uppercase())
+}
+
+fn parse_runtime_route_host_pattern(raw: &str) -> RuntimeRouteHostPattern {
+    let normalized = normalize_route_host(raw);
+    let Some(wildcard_suffix) = normalized.strip_prefix("*.") else {
+        return RuntimeRouteHostPattern::Exact(normalized);
+    };
+    if wildcard_suffix.is_empty() || wildcard_suffix.contains('*') {
+        return RuntimeRouteHostPattern::Exact(normalized);
+    }
+    RuntimeRouteHostPattern::WildcardSuffix(wildcard_suffix.to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeLoadBalancingStrategy {
     RoundRobin,
@@ -103,15 +141,163 @@ pub enum RuntimeLoadBalancingStrategy {
 impl RuntimeLoadBalancingStrategy {
     pub fn from_lb_type(lb_type: &str) -> Self {
         match lb_type.trim().to_ascii_lowercase().as_str() {
-            "round-robin" => Self::RoundRobin,
-            "consistent-hash" => Self::ConsistentHash,
+            "round-robin" | "round_robin" | "rr" => Self::RoundRobin,
+            "consistent-hash" | "consistent_hash" | "ch" => Self::ConsistentHash,
             "random" => Self::Random,
-            "least-connections" => Self::LeastConnections,
-            "latency-aware" => Self::LatencyAware,
-            "sticky-cid" => Self::StickyCid,
+            "least-connections" | "least_connections" | "lc" => Self::LeastConnections,
+            "latency-aware" | "latency_aware" | "la" => Self::LatencyAware,
+            "sticky-cid" | "sticky_cid" | "cid-sticky" | "cid_sticky" => Self::StickyCid,
             _ => Self::Other,
         }
     }
+
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::RoundRobin => "round-robin",
+            Self::ConsistentHash => "consistent-hash",
+            Self::Random => "random",
+            Self::LeastConnections => "least-connections",
+            Self::LatencyAware => "latency-aware",
+            Self::StickyCid => "sticky-cid",
+            Self::Other => "unsupported",
+        }
+    }
+
+    pub fn supports_readonly_alternate_pick(self) -> bool {
+        !matches!(self, Self::ConsistentHash | Self::StickyCid | Self::Other)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RuntimeRouteHostPattern {
+    Exact(String),
+    WildcardSuffix(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RuntimeRouteMatchPolicy {
+    pub host: Option<String>,
+    pub host_pattern: Option<RuntimeRouteHostPattern>,
+    pub path_prefix: Option<String>,
+    pub method: Option<String>,
+    pub path_len: usize,
+    pub host_specific: bool,
+    pub method_specific: bool,
+}
+
+impl RuntimeRouteMatchPolicy {
+    pub fn normalize(
+        upstream_name: &str,
+        route: &crate::config::RouteMatch,
+    ) -> Result<Self, RuntimeConfigError> {
+        let path_prefix = normalize_optional_string(route.path_prefix.as_deref());
+        if let Some(path_prefix) = path_prefix.as_deref()
+            && !path_prefix.starts_with('/')
+        {
+            return Err(config_invalid(format!(
+                "upstream '{upstream_name}' has an invalid route.path_prefix '{}'",
+                path_prefix
+            )));
+        }
+
+        let host = normalize_optional_string(route.host.as_deref()).map(|host| normalize_route_host(&host));
+        let host_pattern = host.as_deref().map(parse_runtime_route_host_pattern);
+        let method = normalized_route_method(route.method.as_deref());
+
+        Ok(Self {
+            path_len: path_prefix.as_ref().map(|value| value.len()).unwrap_or(0),
+            host_specific: host.is_some(),
+            method_specific: method.is_some(),
+            host,
+            host_pattern,
+            path_prefix,
+            method,
+        })
+    }
+
+    pub fn as_config(&self) -> crate::config::RouteMatch {
+        crate::config::RouteMatch {
+            host: self.host.clone(),
+            path_prefix: self.path_prefix.clone(),
+            method: self.method.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeRequestKeySpec {
+    Path,
+    Authority,
+    Method,
+    Cid,
+    StickyCid,
+    PeerIp,
+    ClientIp,
+    BearerToken,
+    Header(String),
+    Cookie(String),
+    Query(String),
+}
+
+impl RuntimeRequestKeySpec {
+    pub fn normalize(raw: &str) -> Result<Self, RuntimeConfigError> {
+        let normalized = raw.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "path" => Ok(Self::Path),
+            "authority" => Ok(Self::Authority),
+            "method" => Ok(Self::Method),
+            "cid" => Ok(Self::Cid),
+            "sticky-cid" => Ok(Self::StickyCid),
+            "peer_ip" => Ok(Self::PeerIp),
+            "client_ip" => Ok(Self::ClientIp),
+            "bearer_token" => Ok(Self::BearerToken),
+            _ => {
+                let Some((source, key_name)) = normalized.split_once(':') else {
+                    return Err(config_invalid(format!(
+                        "unsupported request key spec '{}'",
+                        raw
+                    )));
+                };
+                if key_name.trim().is_empty() {
+                    return Err(config_invalid(format!(
+                        "unsupported request key spec '{}'",
+                        raw
+                    )));
+                }
+                match source {
+                    "header" => Ok(Self::Header(key_name.to_string())),
+                    "cookie" => Ok(Self::Cookie(key_name.to_string())),
+                    "query" => Ok(Self::Query(key_name.to_string())),
+                    _ => Err(config_invalid(format!(
+                        "unsupported request key spec '{}'",
+                        raw
+                    ))),
+                }
+            }
+        }
+    }
+
+    pub fn as_config(&self) -> String {
+        match self {
+            Self::Path => "path".to_string(),
+            Self::Authority => "authority".to_string(),
+            Self::Method => "method".to_string(),
+            Self::Cid => "cid".to_string(),
+            Self::StickyCid => "sticky-cid".to_string(),
+            Self::PeerIp => "peer_ip".to_string(),
+            Self::ClientIp => "client_ip".to_string(),
+            Self::BearerToken => "bearer_token".to_string(),
+            Self::Header(name) => format!("header:{name}"),
+            Self::Cookie(name) => format!("cookie:{name}"),
+            Self::Query(name) => format!("query:{name}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeAlternateBackendPolicy {
+    pub readonly_lb_pick: bool,
+    pub healthy_fallback: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -967,6 +1153,8 @@ impl RuntimeBackendTlsPolicy {
 pub struct RuntimeLoadBalancingPolicy {
     pub strategy: RuntimeLoadBalancingStrategy,
     pub key: Option<String>,
+    pub key_spec: Option<RuntimeRequestKeySpec>,
+    pub alternate_backend: RuntimeAlternateBackendPolicy,
 }
 
 impl RuntimeLoadBalancingPolicy {
@@ -982,7 +1170,23 @@ impl RuntimeLoadBalancingPolicy {
         Ok(Self {
             strategy,
             key: normalize_optional_string(load_balancing.key.as_deref()),
+            key_spec: load_balancing
+                .key
+                .as_deref()
+                .map(RuntimeRequestKeySpec::normalize)
+                .transpose()?,
+            alternate_backend: RuntimeAlternateBackendPolicy {
+                readonly_lb_pick: strategy.supports_readonly_alternate_pick(),
+                healthy_fallback: true,
+            },
         })
+    }
+
+    pub fn as_config(&self) -> LoadBalancing {
+        LoadBalancing {
+            lb_type: self.strategy.canonical_name().to_string(),
+            key: self.key.clone(),
+        }
     }
 }
 
@@ -1576,7 +1780,7 @@ impl RuntimeUpstreamPolicySet {
             timeouts: base.timeouts.clone(),
             auth: upstream.policy.upstream_auth.clone(),
             rate_limits: base.rate_limits.clone(),
-            load_balancing: RuntimeLoadBalancingPolicy::normalize(&upstream.load_balancing)?,
+            load_balancing: upstream.load_balancing.clone(),
             admission: base.admission.clone(),
             transport: RuntimeUpstreamTransportPolicy::from_effective_tls(
                 &upstream.effective_tls,

@@ -72,6 +72,7 @@ mod tests {
     use spooky_config::config::{Backend, HealthCheck, LoadBalancing, RouteMatch, Upstream};
 
     use super::*;
+    use crate::health::HealthFailureReason;
 
     fn upstream(lb_type: &str, backends: &[&str]) -> Upstream {
         Upstream {
@@ -168,6 +169,30 @@ mod tests {
             decision,
             AlternateBackendDecision::DoNotSelect {
                 denial: AlternateBackendFailureReason::OnlyExcludedBackendsHealthy,
+            }
+        );
+    }
+
+    #[test]
+    fn reports_when_no_backends_are_healthy() {
+        let mut pool = UpstreamPool::from_upstream(&upstream(
+            "round-robin",
+            &["http://a", "http://b"],
+        ))
+        .expect("pool");
+
+        let _ = pool
+            .pool
+            .mark_failure_with_reason(0, HealthFailureReason::Transport);
+        let _ = pool
+            .pool
+            .mark_failure_with_reason(1, HealthFailureReason::Transport);
+
+        let decision = choose_alternate_backend(&pool, &[], None);
+        assert_eq!(
+            decision,
+            AlternateBackendDecision::DoNotSelect {
+                denial: AlternateBackendFailureReason::NoHealthyBackends,
             }
         );
     }

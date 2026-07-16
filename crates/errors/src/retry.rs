@@ -337,6 +337,77 @@ mod tests {
     }
 
     #[test]
+    fn missing_alternate_backend_reason_defaults_to_only_excluded_backends_healthy() {
+        let mut facts = retry_facts();
+        facts.alternate_backend_available = false;
+        facts.alternate_backend_failure = None;
+
+        assert_eq!(
+            evaluate_retry_policy(facts),
+            RetryPolicyDecision::DoNotRetry {
+                denial: Some(RetryPolicyDenialReason::AlternateBackendUnavailable(
+                    AlternateBackendFailureReason::OnlyExcludedBackendsHealthy,
+                )),
+            }
+        );
+    }
+
+    #[test]
+    fn budget_denied_blocks_retry() {
+        let mut facts = retry_facts();
+        facts.budget_available = false;
+
+        assert_eq!(
+            evaluate_retry_policy(facts),
+            RetryPolicyDecision::DoNotRetry {
+                denial: Some(RetryPolicyDenialReason::BudgetDenied),
+            }
+        );
+    }
+
+    #[test]
+    fn retryable_transport_allows_retry() {
+        let mut facts = retry_facts();
+        facts.retryability = UpstreamRetryability::Retryable(UpstreamRetryReason::Transport);
+
+        assert_eq!(
+            evaluate_retry_policy(facts),
+            RetryPolicyDecision::Retry {
+                reason: UpstreamRetryReason::Transport,
+            }
+        );
+    }
+
+    #[test]
+    fn retryable_pool_allows_retry() {
+        let mut facts = retry_facts();
+        facts.retryability = UpstreamRetryability::Retryable(UpstreamRetryReason::Pool);
+
+        assert_eq!(
+            evaluate_retry_policy(facts),
+            RetryPolicyDecision::Retry {
+                reason: UpstreamRetryReason::Pool,
+            }
+        );
+    }
+
+    #[test]
+    fn retry_attempt_telemetry_reason_matches_upstream_retry_reason() {
+        assert_eq!(
+            RetryAttemptTelemetryReason::from(UpstreamRetryReason::Timeout),
+            RetryAttemptTelemetryReason::Timeout
+        );
+        assert_eq!(
+            RetryAttemptTelemetryReason::from(UpstreamRetryReason::Transport),
+            RetryAttemptTelemetryReason::Transport
+        );
+        assert_eq!(
+            RetryAttemptTelemetryReason::from(UpstreamRetryReason::Pool),
+            RetryAttemptTelemetryReason::Pool
+        );
+    }
+
+    #[test]
     fn retryable_timeout_allows_retry() {
         assert_eq!(
             evaluate_retry_policy(retry_facts()),
@@ -386,6 +457,77 @@ mod tests {
             evaluate_hedge_policy(facts),
             HedgePolicyDecision::DoNotHedge {
                 denial: HedgePolicyDenialReason::RequestBodyNotReplayable,
+            }
+        );
+    }
+
+    #[test]
+    fn hedge_policy_rejects_when_disabled() {
+        let mut facts = hedge_facts();
+        facts.hedging_configured = false;
+
+        assert_eq!(
+            evaluate_hedge_policy(facts),
+            HedgePolicyDecision::DoNotHedge {
+                denial: HedgePolicyDenialReason::HedgingDisabled,
+            }
+        );
+    }
+
+    #[test]
+    fn hedge_policy_rejects_method_not_allowed() {
+        let mut facts = hedge_facts();
+        facts.method_allowed = false;
+
+        assert_eq!(
+            evaluate_hedge_policy(facts),
+            HedgePolicyDecision::DoNotHedge {
+                denial: HedgePolicyDenialReason::MethodNotAllowed,
+            }
+        );
+    }
+
+    #[test]
+    fn hedge_policy_rejects_tunnel_requests() {
+        let mut facts = hedge_facts();
+        facts.tunnel_request = true;
+
+        assert_eq!(
+            evaluate_hedge_policy(facts),
+            HedgePolicyDecision::DoNotHedge {
+                denial: HedgePolicyDenialReason::TunnelRequest,
+            }
+        );
+    }
+
+    #[test]
+    fn hedge_policy_rejects_when_no_alternate_backend_is_available() {
+        let mut facts = hedge_facts();
+        facts.alternate_backend_available = false;
+        facts.alternate_backend_failure = Some(AlternateBackendFailureReason::NoHealthyBackends);
+
+        assert_eq!(
+            evaluate_hedge_policy(facts),
+            HedgePolicyDecision::DoNotHedge {
+                denial: HedgePolicyDenialReason::AlternateBackendUnavailable(
+                    AlternateBackendFailureReason::NoHealthyBackends,
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn hedge_policy_defaults_alternate_backend_failure_reason_when_missing() {
+        let mut facts = hedge_facts();
+        facts.alternate_backend_available = false;
+        facts.alternate_backend_failure = None;
+
+        assert_eq!(
+            evaluate_hedge_policy(facts),
+            HedgePolicyDecision::DoNotHedge {
+                denial: HedgePolicyDenialReason::AlternateBackendUnavailable(
+                    AlternateBackendFailureReason::OnlyExcludedBackendsHealthy,
+                ),
             }
         );
     }

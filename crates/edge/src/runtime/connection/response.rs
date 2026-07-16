@@ -88,3 +88,59 @@ impl HedgeTelemetry {
         self.primary_late_ms = late_ms;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use spooky_errors::{
+        HedgeOutcomeTelemetryReason, HedgeTriggerTelemetryReason, RetryAttemptTelemetryReason,
+        RetryPolicyDenialReason,
+    };
+
+    use super::{HedgeTelemetry, RetryTelemetry};
+
+    #[test]
+    fn retry_telemetry_tracks_attempt_count_and_reason() {
+        let mut telemetry = RetryTelemetry::default();
+
+        telemetry.record_attempt(RetryAttemptTelemetryReason::Timeout);
+        telemetry.record_attempt(RetryAttemptTelemetryReason::Transport);
+
+        assert_eq!(telemetry.count, 2);
+        assert_eq!(
+            telemetry.attempt_reason,
+            Some(RetryAttemptTelemetryReason::Transport)
+        );
+    }
+
+    #[test]
+    fn retry_telemetry_preserves_first_denial_reason() {
+        let mut telemetry = RetryTelemetry::default();
+
+        telemetry.record_denial(Some(RetryPolicyDenialReason::BudgetDenied));
+        telemetry.record_denial(Some(RetryPolicyDenialReason::AttemptLimitReached));
+
+        assert_eq!(
+            telemetry.denial_reason,
+            Some(RetryPolicyDenialReason::BudgetDenied)
+        );
+    }
+
+    #[test]
+    fn hedge_telemetry_records_typed_trigger_and_outcome() {
+        let mut telemetry = HedgeTelemetry::default();
+
+        telemetry.record_trigger(HedgeTriggerTelemetryReason::DelayElapsed);
+        telemetry.record_outcome(HedgeOutcomeTelemetryReason::HedgeWon);
+        telemetry.observe_primary_late_ms(42);
+
+        assert_eq!(
+            telemetry.trigger_reason,
+            Some(HedgeTriggerTelemetryReason::DelayElapsed)
+        );
+        assert_eq!(
+            telemetry.outcome_reason,
+            Some(HedgeOutcomeTelemetryReason::HedgeWon)
+        );
+        assert_eq!(telemetry.primary_late_ms, 42);
+    }
+}

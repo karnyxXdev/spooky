@@ -146,10 +146,22 @@ impl QUICListener {
                         kind: BodyTimeoutKind::Idle,
                     }
                 ) {
-                    metrics.inc_failure();
                     metrics.inc_timeout();
-                    let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
-                    metrics.record_route(route_label, req.start.elapsed(), RouteOutcome::Timeout);
+                    let _ = crate::runtime::connection::outcome::observe_proxy_error_outcome(
+                        metrics,
+                        crate::runtime::connection::outcome::OutcomeRouteTarget {
+                            route: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                        },
+                        Some(crate::runtime::connection::outcome::OutcomeBackendTarget {
+                            upstream: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                            backend_addr: req.backend_addr.as_deref(),
+                            backend_index: req.backend_index,
+                        }),
+                        req.start.elapsed(),
+                        Some(http::StatusCode::REQUEST_TIMEOUT),
+                        &ProxyError::Timeout,
+                        None,
+                    );
                     let _ = Self::send_simple_response(
                         h3,
                         quic,
@@ -370,16 +382,22 @@ impl QUICListener {
                             })
                         ) {
                             if let Some(req) = streams.get(&stream_id) {
-                                metrics.inc_failure();
-                                metrics.inc_overload_shed_reason(
-                                    OverloadShedReason::ResponsePrebufferCap,
-                                );
-                                let route_label =
-                                    req.upstream_name.as_deref().unwrap_or("unrouted");
-                                metrics.record_route(
-                                    route_label,
+                                let _ = crate::runtime::connection::outcome::observe_proxy_error_outcome(
+                                    metrics,
+                                    crate::runtime::connection::outcome::OutcomeRouteTarget {
+                                        route: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                                    },
+                                    Some(crate::runtime::connection::outcome::OutcomeBackendTarget {
+                                        upstream: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                                        backend_addr: req.backend_addr.as_deref(),
+                                        backend_index: req.backend_index,
+                                    }),
                                     req.start.elapsed(),
-                                    RouteOutcome::OverloadShed,
+                                    Some(http::StatusCode::SERVICE_UNAVAILABLE),
+                                    &ProxyError::Pool(PoolError::BackendOverloaded(
+                                        "response prebuffer cap".into(),
+                                    )),
+                                    Some(OverloadShedReason::ResponsePrebufferCap),
                                 );
                                 resilience
                                     .adaptive_admission

@@ -366,6 +366,87 @@ pub fn record_request_metrics_observation(
     );
 }
 
+pub fn observe_request_outcome(
+    metrics: &Metrics,
+    route_target: OutcomeRouteTarget<'_>,
+    backend_target: Option<OutcomeBackendTarget<'_>>,
+    elapsed: Duration,
+    status: Option<StatusCode>,
+    decision: RequestOutcomeDecision,
+) -> RequestOutcomeDecision {
+    if matches!(decision.route_outcome, CanonicalRouteOutcome::Success) {
+        metrics.inc_success();
+    }
+
+    record_request_metrics_observation(
+        metrics,
+        RequestMetricsObservation {
+            route_target,
+            backend_target,
+            elapsed,
+            status: status.map(|value| value.as_u16()),
+            metrics_outcome: decision.route_outcome.as_metrics_outcome(),
+            overload_reason: decision.overload_reason,
+        },
+    );
+
+    decision
+}
+
+pub fn observe_status_outcome(
+    metrics: &Metrics,
+    route_target: OutcomeRouteTarget<'_>,
+    backend_target: Option<OutcomeBackendTarget<'_>>,
+    elapsed: Duration,
+    status: StatusCode,
+) -> RequestOutcomeDecision {
+    observe_request_outcome(
+        metrics,
+        route_target,
+        backend_target,
+        elapsed,
+        Some(status),
+        classify_status_outcome(status),
+    )
+}
+
+pub fn observe_proxy_error_outcome(
+    metrics: &Metrics,
+    route_target: OutcomeRouteTarget<'_>,
+    backend_target: Option<OutcomeBackendTarget<'_>>,
+    elapsed: Duration,
+    status: Option<StatusCode>,
+    err: &ProxyError,
+    overload_reason: Option<OverloadShedReason>,
+) -> RequestOutcomeDecision {
+    observe_request_outcome(
+        metrics,
+        route_target,
+        backend_target,
+        elapsed,
+        status,
+        classify_proxy_error_outcome(err, overload_reason),
+    )
+}
+
+pub fn observe_admission_outcome(
+    metrics: &Metrics,
+    route_target: OutcomeRouteTarget<'_>,
+    backend_target: Option<OutcomeBackendTarget<'_>>,
+    elapsed: Duration,
+    status: StatusCode,
+    outcome: AdmissionOutcomeClass,
+) -> RequestOutcomeDecision {
+    observe_request_outcome(
+        metrics,
+        route_target,
+        backend_target,
+        elapsed,
+        Some(status),
+        classify_admission_outcome(outcome),
+    )
+}
+
 #[derive(Clone, Copy)]
 pub struct BackendRequestFinishInput<'a> {
     pub upstream_pool: Option<&'a Arc<RwLock<UpstreamPool>>>,

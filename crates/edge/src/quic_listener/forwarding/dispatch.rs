@@ -130,6 +130,15 @@ fn alternate_backend_policy_state(
     )
 }
 
+fn retry_budget_available_for_error(
+    primary_err: &ProxyError,
+    route_name: &str,
+    retry_budget: &crate::resilience::retry_budget::RetryBudget,
+) -> bool {
+    matches!(primary_err, ProxyError::Pool(PoolError::CircuitOpen(_)))
+        || retry_budget.allow_retry(route_name).is_ok()
+}
+
 impl QUICListener {
     async fn send_upstream_request(
         backend: String,
@@ -322,7 +331,7 @@ impl QUICListener {
             &primary_err,
             policy_telemetry.retry.count,
             MAX_UPSTREAM_RETRY_ATTEMPTS,
-            retry_budget.allow_retry(route_name).is_ok(),
+            retry_budget_available_for_error(&primary_err, route_name, retry_budget),
             alternate_backend,
         );
         let retry_reason = match retry_decision {
@@ -465,7 +474,11 @@ impl QUICListener {
                                 result?
                             } else {
                                 match policy.hedge_after_delay(
-                                    retry_budget.allow_retry(&route_name).is_ok(),
+                                    retry_budget_available_for_error(
+                                        &ProxyError::Timeout,
+                                        &route_name,
+                                        retry_budget.as_ref(),
+                                    ),
                                 ) {
                                     HedgePolicyDecision::Hedge { reason } => {
                                         policy_telemetry.hedge.record_trigger(reason);
@@ -479,21 +492,46 @@ impl QUICListener {
                                         tokio::pin!(hedge_fut);
                                         tokio::select! {
                                             result = &mut primary_fut => {
-                                                policy_telemetry
-                                                    .hedge
-                                                    .record_outcome(HedgeOutcomeTelemetryReason::PrimaryWonAfterTrigger);
-                                                result?
+                                                match result {
+                                                    Ok(response) => {
+                                                        policy_telemetry
+                                                            .hedge
+                                                            .record_outcome(HedgeOutcomeTelemetryReason::PrimaryWonAfterTrigger);
+                                                        response
+                                                    }
+                                                    Err(_primary_err) => {
+                                                        policy_telemetry
+                                                            .hedge
+                                                            .record_outcome(HedgeOutcomeTelemetryReason::HedgeWon);
+                                                        let elapsed_ms = primary_started.elapsed().as_millis() as u64;
+                                                        let delay_ms = hedge_delay.as_millis() as u64;
+                                                        policy_telemetry
+                                                            .hedge
+                                                            .observe_primary_late_ms(elapsed_ms.saturating_sub(delay_ms));
+                                                        hedge_fut.await?
+                                                    }
+                                                }
                                             },
                                             result = &mut hedge_fut => {
-                                                policy_telemetry
-                                                    .hedge
-                                                    .record_outcome(HedgeOutcomeTelemetryReason::HedgeWon);
-                                                let elapsed_ms = primary_started.elapsed().as_millis() as u64;
-                                                let delay_ms = hedge_delay.as_millis() as u64;
-                                                policy_telemetry
-                                                    .hedge
-                                                    .observe_primary_late_ms(elapsed_ms.saturating_sub(delay_ms));
-                                                result?
+                                                match result {
+                                                    Ok(response) => {
+                                                        policy_telemetry
+                                                            .hedge
+                                                            .record_outcome(HedgeOutcomeTelemetryReason::HedgeWon);
+                                                        let elapsed_ms = primary_started.elapsed().as_millis() as u64;
+                                                        let delay_ms = hedge_delay.as_millis() as u64;
+                                                        policy_telemetry
+                                                            .hedge
+                                                            .observe_primary_late_ms(elapsed_ms.saturating_sub(delay_ms));
+                                                        response
+                                                    }
+                                                    Err(_hedge_err) => {
+                                                        policy_telemetry
+                                                            .hedge
+                                                            .record_outcome(HedgeOutcomeTelemetryReason::PrimaryWonAfterTrigger);
+                                                        primary_fut.await?
+                                                    }
+                                                }
                                             },
                                         }
                                     }

@@ -316,7 +316,7 @@ Spooky configures QUIC transport parameters to balance memory usage and throughp
 
 ### Congestion Control
 
-Spooky uses the default NewReno congestion control provided by `quiche`. This choice balances fairness with TCP flows and predictable behavior across network conditions.
+Spooky uses `quiche`'s default congestion controller, which is **CUBIC** (Spooky does not call `set_cc_algorithm`, so quiche's default applies). CUBIC balances fairness with TCP flows and predictable behavior across network conditions.
 
 ## Performance Considerations
 

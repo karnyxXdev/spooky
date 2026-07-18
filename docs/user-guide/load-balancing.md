@@ -617,9 +617,13 @@ curl --http3-only -H "X-User-ID: test123" https://localhost:9889/
 
 **Solutions**:
 - Ensure load_balancing.type is "consistent-hash"
-- Note: Hash key is automatically derived from request (authority → path → method)
-- For session affinity, ensure requests include consistent authority or path components
-- Configurable key sources are planned for future implementation
+- Set `load_balancing.key` to choose the hash source explicitly — supported specs include `path`,
+  `authority`, `method`, `cid`/`sticky-cid`, `peer_ip`/`client_ip`, `bearer_token`,
+  `header:<name>`, `cookie:<name>`, and `query:<name>` (see the `key:` field earlier in this guide)
+- When no `key` is configured, the hash key falls back to being derived from the request
+  (authority → path → method)
+- For session affinity, either set an explicit `key` or ensure requests include consistent
+  authority or path components
 
 ### Frequent Health Check Failures
 

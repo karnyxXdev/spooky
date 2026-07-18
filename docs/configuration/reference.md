@@ -1041,7 +1041,7 @@ Request-shape rules enforced by the runtime:
 
 ### watchdog
 
-Monitors worker health and triggers a restart hook when error rates or stall conditions exceed thresholds.
+Monitors worker health and triggers a restart command when error rates or stall conditions exceed thresholds.
 
 | Property | Type | Required | Default | Description |
 |----------|------|----------|---------|-------------|
@@ -1051,10 +1051,11 @@ Monitors worker health and triggers a restart hook when error rates or stall con
 | `timeout_error_rate_percent` | integer | No | `60` | Trigger if timeout errors exceed this % of requests in a window |
 | `min_requests_per_window` | integer | No | `20` | Minimum requests in a window before error-rate check applies |
 | `overload_inflight_percent` | integer | No | `95` | Trigger if in-flight % exceeds this threshold |
-| `unhealthy_consecutive_windows` | integer | No | `3` | Consecutive unhealthy windows before invoking the restart hook |
+| `unhealthy_consecutive_windows` | integer | No | `3` | Consecutive unhealthy windows before invoking the restart command |
 | `drain_grace_ms` | integer | No | `8000` | Grace period (ms) to drain connections before restarting |
-| `restart_cooldown_ms` | integer | No | `120000` | Minimum time (ms) between restart hook invocations |
-| `restart_hook` | string | No | `null` | Shell command invoked on restart trigger |
+| `restart_cooldown_ms` | integer | No | `120000` | Minimum time (ms) between restart command invocations |
+| `restart_command` | list of strings | No | `[]` | Command invoked on restart trigger; first element is the executable, the rest are args. Avoids shell evaluation. |
+| `restart_hook` | string | No | `null` | **Deprecated and rejected at startup** — setting it is a hard config error. Use `restart_command` instead. |
 
 ### Startup Validation Errors
 

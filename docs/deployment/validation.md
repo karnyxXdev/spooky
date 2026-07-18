@@ -243,7 +243,7 @@ Use the Prometheus queries below to compare the two instances side by side. Subs
 **Request success rate (should be equal between instances):**
 
 ```promql
-rate(spooky_requests_success_total{instance="host:9090"}[5m])
+rate(spooky_requests_success{instance="host:9090"}[5m])
 /
 rate(spooky_requests_total{instance="host:9090"}[5m])
 ```
@@ -280,26 +280,26 @@ If any metric diverges unfavorably, route all traffic back to the production ins
 
 After restarting Spooky with a new config or new binary, watch the following five signals for the first 30 minutes. Set up dashboard panels or alert inhibitions before the restart so you can observe cleanly.
 
-**1. `spooky_requests_success_total` rate**
+**1. `spooky_requests_success` rate**
 
 ```promql
-rate(spooky_requests_success_total[2m])
+rate(spooky_requests_success[2m])
 ```
 
 This should match the pre-deploy baseline within 1-2 minutes of restart (after QUIC connections re-establish). A sustained drop below baseline indicates requests are failing. Compare against the same window from yesterday or the previous week to account for traffic volume changes.
 
-**2. `spooky_backend_errors_total` rate**
+**2. `spooky_backend_errors` rate**
 
 ```promql
-rate(spooky_backend_errors_total[2m])
+rate(spooky_backend_errors[2m])
 ```
 
 Any sudden increase after restart indicates Spooky is reaching backends but backends are returning errors. This points to a routing misconfiguration (requests sent to wrong backend), a backend environment mismatch, or an application-level problem triggered by the new routing.
 
-**3. `spooky_backend_timeouts_total` rate**
+**3. `spooky_backend_timeouts` rate**
 
 ```promql
-rate(spooky_backend_timeouts_total[2m])
+rate(spooky_backend_timeouts[2m])
 ```
 
 A timeout spike after restart is a strong signal that backend addresses changed to something unreachable, or that connection timeout values in the config are now too low for the backend's actual response time. Distinguish from backend errors: errors indicate a response was received (and was a failure); timeouts indicate no timely response at all.

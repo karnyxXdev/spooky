@@ -841,9 +841,13 @@ Controls resource limits, tuning knobs, and connection-flood protection. All fie
 | `control_plane_threads` | integer | No | `2` | Tokio worker threads for the control-plane runtime (startup, health checks, metrics, and other async control tasks) |
 | `reuseport` | bool | No | `true` | Enable `SO_REUSEPORT`; required when `worker_threads > 1` |
 | `pin_workers` | bool | No | `false` | Pin each worker thread to a dedicated CPU core |
+| `packet_shards_per_worker` | integer | No | `1` | Packet-processing shards per bound UDP worker socket; `1` preserves single-loop behavior, values >1 enable parallel shard workers |
+| `packet_shard_queue_capacity` | integer | No | `2048` | Capacity of the bounded ingress queue per shard |
+| `packet_shard_queue_max_bytes` | integer | No | `67108864` | Memory-aware cap (bytes) for queued datagram bytes per ingress shard dispatch queue |
 | `global_inflight_limit` | integer | No | `4096` | Maximum concurrent in-flight requests across all upstreams |
 | `per_upstream_inflight_limit` | integer | No | `1024` | Maximum concurrent in-flight requests per upstream pool |
 | `per_backend_inflight_limit` | integer | No | `64` | Maximum concurrent in-flight requests per backend |
+| `inflight_acquire_wait_ms` | integer | No | `0` | Optional micro-wait (ms) before shedding on global/upstream inflight permit acquisition; `0` sheds immediately |
 | `backend_timeout_ms` | integer | No | `2000` | Initial backend response timeout (ms) |
 | `backend_connect_timeout_ms` | integer | No | `500` | Backend TCP/TLS handshake timeout (ms); must be ≤ `backend_timeout_ms` |
 | `backend_body_idle_timeout_ms` | integer | No | `2000` | Idle timeout while streaming response body (ms); must be ≥ `backend_timeout_ms` |
@@ -865,6 +869,10 @@ Controls resource limits, tuning knobs, and connection-flood protection. All fie
 | `quic_initial_max_streams_bidi` | integer | No | `100` | Maximum concurrent bidirectional QUIC streams per connection |
 | `quic_initial_max_streams_uni` | integer | No | `100` | Maximum concurrent unidirectional QUIC streams per connection |
 | `max_response_body_bytes` | integer | No | `104857600` | Hard cap on upstream response body bytes per stream; streams exceeding this return 503 (`upstream response body too large`) |
+| `max_request_body_bytes` | integer | No | `1000000` | Hard cap on request body bytes per stream; requests exceeding this are rejected with 413. Must be ≤ `quic_initial_max_stream_data` |
+| `request_buffer_global_cap_bytes` | integer | No | `67108864` | Global cap (bytes) for data buffered in request backpressure queues across a worker |
+| `unknown_length_response_prebuffer_bytes` | integer | No | `2097152` | Max bytes buffered for unknown-length upstream responses before headers are emitted; responses exceeding this are terminated with an overload response |
+| `client_body_idle_timeout_ms` | integer | No | `10000` | Idle timeout (ms) for request-body upload progress; the stream is failed if no body bytes arrive within this period |
 
 ### Connection flood protection
 

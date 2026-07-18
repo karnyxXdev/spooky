@@ -330,8 +330,11 @@ Group=spooky
 
 # Binary and configuration
 ExecStart=/usr/local/bin/spooky --config /etc/spooky/config.yaml
-# Note: Hot reload not currently supported, use restart instead
-# ExecReload=/bin/kill -HUP $MAINPID
+# Hot reload: config is reloaded via the control API, not a signal.
+# `systemctl reload spooky` POSTs to the reload endpoint (control API is HTTPS + bearer-auth).
+# Applies routes/upstreams/backends/limits/policies live; startup-owned settings and listener
+# bind/removal changes still require a full restart.
+ExecReload=/usr/bin/curl -sf -k -X POST -H "Authorization: Bearer ${SPOOKY_ADMIN_TOKEN}" https://127.0.0.1:9902/admin/runtime/reload
 
 # Restart policy
 Restart=always

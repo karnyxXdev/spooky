@@ -40,7 +40,7 @@ cargo build --release
 spooky --config /etc/spooky/config.yaml
 ```
 
-### Validate config without starting
+### Validate config without starting (Current version of spooky does not support validate flag) (planned feature)
 
 ```bash
 spooky --config /etc/spooky/config.yaml --validate

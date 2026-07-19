@@ -34,3 +34,60 @@ pub fn stable_hash_socket_addr(addr: &SocketAddr) -> u64 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+
+    use super::{stable_hash_socket_addr, stable_hash64};
+
+    #[test]
+    fn stable_hash64_matches_known_fnv1a_vectors() {
+        let cases = [
+            (b"" as &[u8], 0xcbf2_9ce4_8422_2325u64),
+            (b"a" as &[u8], 0xaf63_dc4c_8601_ec8cu64),
+            (b"foobar" as &[u8], 0x8594_4171_f739_67e8u64),
+            (b"hello world" as &[u8], 0x779a_65e7_023c_d2e7u64),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                stable_hash64(input),
+                expected,
+                "FNV-1a mismatch for {:?}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn stable_hash_socket_addr_is_deterministic_for_ipv4_and_ipv6() {
+        let ipv4 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8443));
+        let ipv6 = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            8443,
+            7,
+            3,
+        ));
+
+        assert_eq!(
+            stable_hash_socket_addr(&ipv4),
+            stable_hash_socket_addr(&ipv4)
+        );
+        assert_eq!(
+            stable_hash_socket_addr(&ipv6),
+            stable_hash_socket_addr(&ipv6)
+        );
+    }
+
+    #[test]
+    fn stable_hash_socket_addr_distinguishes_ipv4_from_ipv6() {
+        let ipv4 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8443));
+        let ipv6 = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 8443, 0, 0));
+
+        assert_ne!(
+            stable_hash_socket_addr(&ipv4),
+            stable_hash_socket_addr(&ipv6)
+        );
+    }
+}

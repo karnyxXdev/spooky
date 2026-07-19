@@ -5,11 +5,11 @@ use http::{
     header::{CONTENT_LENGTH, HOST, TE},
 };
 use quiche::h3::Header;
+use spooky_bridge::h3_to_h1::build_h1_request;
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
     config::{ForwardedHeaderPolicy, UpstreamHostPolicy},
 };
-use spooky_bridge::h3_to_h1::build_h1_request;
 
 use crate::common::{RequestInputMeta, request_input, request_target};
 
@@ -56,7 +56,9 @@ fn plain_requests_strip_hop_headers_and_add_te_trailers() {
 
     assert_eq!(req.uri().to_string(), "https://backend.internal:443/submit");
     assert_eq!(
-        req.headers().get(HOST).and_then(|value| value.to_str().ok()),
+        req.headers()
+            .get(HOST)
+            .and_then(|value| value.to_str().ok()),
         Some("api.example.com")
     );
     assert_eq!(

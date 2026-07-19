@@ -78,8 +78,7 @@ fn runtime_config_rejects_invalid_timeout_ordering() {
     config.performance.backend_connect_timeout_ms = 2_000;
     config.performance.backend_timeout_ms = 1_000;
 
-    let err =
-        RuntimeConfig::from_config(&config).expect_err("timeout ordering must be validated");
+    let err = RuntimeConfig::from_config(&config).expect_err("timeout ordering must be validated");
     assert_eq!(err.category(), "config_invalid");
     assert!(
         err.to_string()

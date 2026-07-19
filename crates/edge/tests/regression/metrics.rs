@@ -282,9 +282,7 @@ fn metrics_render_includes_backend_dns_refresh_telemetry() {
         output
             .contains("spooky_backend_dns_resolved_addresses{backend=\"backend.internal:443\"} 2")
     );
-    assert!(
-        output.contains("spooky_backend_client_rotations{backend=\"backend.internal:443\"} 1")
-    );
+    assert!(output.contains("spooky_backend_client_rotations{backend=\"backend.internal:443\"} 1"));
     assert!(output.contains(
         "spooky_backend_connect_attempt_total{backend=\"backend.internal:443\",hostname=\"backend.internal\",resolved_addr=\"10.0.0.10:443\"} 1"
     ));

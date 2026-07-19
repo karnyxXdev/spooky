@@ -5,13 +5,13 @@ use std::{convert::Infallible, net::SocketAddr};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, combinators::BoxBody};
 use quiche::h3::Header;
-use spooky_config::{
-    backend_endpoint::BackendEndpoint,
-    config::{ForwardedHeaderPolicy, UpstreamHostPolicy},
-};
 use spooky_bridge::request::{
     RequestBuildInput, RequestBuildPolicies, RequestBuildTarget, RequestForwardedContext,
     RequestTraceContext,
+};
+use spooky_config::{
+    backend_endpoint::BackendEndpoint,
+    config::{ForwardedHeaderPolicy, UpstreamHostPolicy},
 };
 
 #[derive(Clone, Copy)]

@@ -541,14 +541,12 @@ impl QUICListener {
                                 req.response_status = Some(status.as_u16());
                             }
                             immediate_terminal = true;
-                        } else {
-                            if let Some(chunk_rx) = prebuilt_response_chunk_rx {
-                                if let Some(req) = streams.get_mut(&stream_id) {
-                                    req.response_chunk_rx = Some(chunk_rx);
-                                    req.response_headers_sent = true;
-                                    req.phase = StreamPhase::SendingResponse;
-                                    req.response_status = Some(status.as_u16());
-                                }
+                        } else if let Some(chunk_rx) = prebuilt_response_chunk_rx {
+                            if let Some(req) = streams.get_mut(&stream_id) {
+                                req.response_chunk_rx = Some(chunk_rx);
+                                req.response_headers_sent = true;
+                                req.phase = StreamPhase::SendingResponse;
+                                req.response_status = Some(status.as_u16());
                             } else {
                                 let (chunk_tx, chunk_rx) =
                                     mpsc::channel::<ResponseChunk>(RESPONSE_CHUNK_CHANNEL_CAPACITY);

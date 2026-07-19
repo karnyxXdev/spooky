@@ -90,14 +90,8 @@ mod tests {
 
     #[test]
     fn channel_body_error_type_is_infallible() {
+        // Compile-time proof that ChannelBody implements the expected Body associated types.
         fn assert_body_error_type<B: Body<Data = Bytes, Error = Infallible>>() {}
         assert_body_error_type::<ChannelBody>();
-
-        let (_tx, mut body) = ChannelBody::channel(1);
-        let _typed: fn(
-            Pin<&mut ChannelBody>,
-            &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Option<Result<Frame<Bytes>, Infallible>>> = ChannelBody::poll_frame;
-        let _ = &mut body;
     }
 }

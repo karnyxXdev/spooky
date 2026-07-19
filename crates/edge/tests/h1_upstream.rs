@@ -268,7 +268,9 @@ impl ListenerTaskGuard {
     fn spawn(rt: &tokio::runtime::Runtime, mut listener: QUICListener) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
+        let runtime_handle = rt.handle().clone();
         let handle = rt.spawn_blocking(move || {
+            let _enter = runtime_handle.enter();
             while !stop_flag.load(Ordering::Relaxed) {
                 listener.poll();
             }

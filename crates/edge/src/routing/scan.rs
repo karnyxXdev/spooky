@@ -159,3 +159,98 @@ pub fn scan_lookup_for_method<'a>(
 
     best_match.map(|(name, _, _, _, _, _)| name)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use spooky_config::config::{Backend, LoadBalancing, RouteMatch, Upstream};
+
+    use crate::routing::{
+        index::RouteIndex,
+        scan::{scan_lookup, scan_lookup_for_method},
+    };
+
+    fn upstream(path_prefix: &str, host: Option<&str>, method: Option<&str>) -> Upstream {
+        Upstream {
+            load_balancing: LoadBalancing {
+                lb_type: "round-robin".to_string(),
+                key: None,
+            },
+            auth: Default::default(),
+            host_policy: Default::default(),
+            forwarded_headers: Default::default(),
+            tls: None,
+            route: RouteMatch {
+                path_prefix: Some(path_prefix.to_string()),
+                host: host.map(str::to_string),
+                method: method.map(str::to_string),
+            },
+            backends: vec![Backend {
+                id: "b1".to_string(),
+                address: "http://127.0.0.1:7001".to_string(),
+                weight: 1,
+                health_check: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn scan_lookup_matches_route_index_lookup_for_reference_inputs() {
+        let upstreams = HashMap::from([
+            ("default".to_string(), upstream("/api", None, None)),
+            (
+                "exact".to_string(),
+                upstream("/api", Some("pay.example.com"), None),
+            ),
+            (
+                "wildcard".to_string(),
+                upstream("/api/private", Some("*.example.com"), None),
+            ),
+            (
+                "method".to_string(),
+                upstream("/transfer", None, Some("POST")),
+            ),
+        ]);
+        let index = RouteIndex::from_upstreams(&upstreams);
+
+        let cases = [
+            ("/api", Some("pay.example.com")),
+            ("/api/private", Some("team.example.com")),
+            ("/api/other", Some("unknown.example.net")),
+            ("/unmatched", Some("pay.example.com")),
+        ];
+
+        for (path, host) in cases {
+            assert_eq!(
+                scan_lookup(&upstreams, path, host),
+                index.lookup(path, host)
+            );
+        }
+    }
+
+    #[test]
+    fn scan_lookup_for_method_matches_route_index_lookup_for_method() {
+        let upstreams = HashMap::from([
+            ("generic".to_string(), upstream("/transfer", None, None)),
+            (
+                "post_only".to_string(),
+                upstream("/transfer", None, Some("POST")),
+            ),
+        ]);
+        let index = RouteIndex::from_upstreams(&upstreams);
+
+        let cases = [
+            ("/transfer", None, Some("POST")),
+            ("/transfer", None, Some("GET")),
+            ("/transfer", None, None),
+        ];
+
+        for (path, host, method) in cases {
+            assert_eq!(
+                scan_lookup_for_method(&upstreams, path, host, method),
+                index.lookup_for_method(path, host, method)
+            );
+        }
+    }
+}

@@ -73,3 +73,82 @@ pub fn parse_configured_host_pattern_ref(raw: &str) -> Option<ConfiguredHostPatt
     }
     Some(ConfiguredHostPatternRef::WildcardSuffix(wildcard_suffix))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use super::{
+        ConfiguredHostPattern, ConfiguredHostPatternRef, normalize_host_for_routing,
+        parse_configured_host_pattern, parse_configured_host_pattern_ref,
+    };
+
+    #[test]
+    fn normalize_host_for_routing_lowercases_and_strips_port_and_trailing_dot() {
+        assert_eq!(
+            normalize_host_for_routing(" Example.COM.:443 "),
+            Some(Cow::Owned("example.com".to_string()))
+        );
+    }
+
+    #[test]
+    fn normalize_host_for_routing_preserves_already_normalized_host() {
+        assert_eq!(
+            normalize_host_for_routing("api.example.com"),
+            Some(Cow::Borrowed("api.example.com"))
+        );
+    }
+
+    #[test]
+    fn normalize_host_for_routing_parses_ipv6_authority() {
+        assert_eq!(
+            normalize_host_for_routing("[2001:db8::1]:443"),
+            Some(Cow::Borrowed("2001:db8::1"))
+        );
+    }
+
+    #[test]
+    fn normalize_host_for_routing_rejects_invalid_input() {
+        assert_eq!(normalize_host_for_routing(""), None);
+        assert_eq!(normalize_host_for_routing("   "), None);
+        assert_eq!(normalize_host_for_routing("[missing-end"), None);
+    }
+
+    #[test]
+    fn parse_configured_host_pattern_distinguishes_exact_and_wildcard_hosts() {
+        assert_eq!(
+            parse_configured_host_pattern("Api.Example.com."),
+            Some(ConfiguredHostPattern::Exact("api.example.com".to_string()))
+        );
+        assert_eq!(
+            parse_configured_host_pattern("*.Example.com"),
+            Some(ConfiguredHostPattern::WildcardSuffix(
+                "example.com".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_configured_host_pattern_rejects_invalid_input() {
+        assert_eq!(parse_configured_host_pattern(""), None);
+        assert_eq!(parse_configured_host_pattern("[missing-end"), None);
+    }
+
+    #[test]
+    fn parse_configured_host_pattern_ref_distinguishes_exact_and_wildcard_hosts() {
+        assert_eq!(
+            parse_configured_host_pattern_ref("api.example.com"),
+            Some(ConfiguredHostPatternRef::Exact("api.example.com"))
+        );
+        assert_eq!(
+            parse_configured_host_pattern_ref("*.example.com"),
+            Some(ConfiguredHostPatternRef::WildcardSuffix("example.com"))
+        );
+    }
+
+    #[test]
+    fn parse_configured_host_pattern_ref_rejects_invalid_input() {
+        assert_eq!(parse_configured_host_pattern_ref(""), None);
+        assert_eq!(parse_configured_host_pattern_ref("[missing-end"), None);
+    }
+}

@@ -471,8 +471,6 @@ pub fn upstream_tls_default_strict_sni() -> bool {
     true
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,4 +504,3 @@ mod tests {
         assert_eq!(log.format, LogFormat::Plain);
     }
 }
-

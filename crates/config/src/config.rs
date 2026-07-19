@@ -1292,3 +1292,65 @@ impl Default for RoutingTransparency {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn minimal_yaml_applies_documented_defaults() {
+        let yaml = r#"
+listen:
+  tls: {}
+upstream:
+  api:
+    route: {}
+    backends:
+      - id: backend1
+        address: "http://127.0.0.1:7001"
+"#;
+
+        let config: Config = serde_yaml::from_str(yaml).expect("minimal config should parse");
+        let upstream = config.upstream.get("api").expect("missing api upstream");
+        let backend = upstream
+            .backends
+            .first()
+            .expect("missing backend in minimal config");
+
+        assert_eq!(config.version, 1);
+        assert_eq!(config.listen.protocol, "http3");
+        assert_eq!(config.listen.port, 9889);
+        assert_eq!(config.listen.address, "0.0.0.0");
+        assert_eq!(config.log.level, "info");
+        assert_eq!(backend.weight, 100);
+    }
+
+    #[test]
+    fn backend_health_check_defaults_are_filled_by_serde() {
+        let yaml = r#"
+listen:
+  tls: {}
+upstream:
+  api:
+    route: {}
+    backends:
+      - id: backend1
+        address: "http://127.0.0.1:7001"
+        health_check: {}
+"#;
+
+        let config: Config =
+            serde_yaml::from_str(yaml).expect("config with empty health_check should parse");
+        let health_check = config.upstream["api"].backends[0]
+            .health_check
+            .as_ref()
+            .expect("missing defaulted health check");
+
+        assert_eq!(health_check.path, "/health");
+        assert_eq!(health_check.interval, 5_000);
+        assert_eq!(health_check.timeout_ms, 1_000);
+        assert_eq!(health_check.failure_threshold, 3);
+        assert_eq!(health_check.success_threshold, 2);
+        assert_eq!(health_check.cooldown_ms, 5_000);
+    }
+}

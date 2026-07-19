@@ -35,6 +35,10 @@ rustls-pki-types.workspace = true
 subtle.workspace = true
 x509-parser = "0.16"
 
+[[test]]
+name = "regression"
+path = "tests/regression/main.rs"
+
 [dev-dependencies]
 rand.workspace = true
 rcgen = "0.12"

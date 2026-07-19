@@ -40,11 +40,11 @@ impl Body for ChannelBody {
 
 #[cfg(test)]
 mod tests {
-    use std::{convert::Infallible, pin::Pin};
+    use std::convert::Infallible;
 
     use bytes::Bytes;
     use http_body_util::BodyExt;
-    use hyper::body::{Body, Frame};
+    use hyper::body::Body;
 
     use super::ChannelBody;
 

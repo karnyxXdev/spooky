@@ -119,6 +119,7 @@ mod startup;
 mod tls_runtime;
 mod token_bucket;
 mod validation;
+pub mod workers;
 
 #[cfg(test)]
 use bootstrap_tls::BootstrapStartupState;

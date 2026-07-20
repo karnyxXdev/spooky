@@ -16,6 +16,7 @@ use quiche::h3::NameValue;
 use rand::RngCore;
 use rcgen::{Certificate, CertificateParams, SanType};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use serial_test::serial;
 use spooky_config::{
     config::{
         Backend, ClientAuth, Config, Listen, LoadBalancing, Log, LogFormat, RouteMatch, Security,
@@ -267,7 +268,9 @@ impl ListenerTaskGuard {
     fn spawn(rt: &tokio::runtime::Runtime, mut listener: QUICListener) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
+        let runtime_handle = rt.handle().clone();
         let handle = rt.spawn_blocking(move || {
+            let _enter = runtime_handle.enter();
             while !stop_flag.load(Ordering::Relaxed) {
                 listener.poll();
             }
@@ -451,6 +454,7 @@ fn reserve_unused_udp_port() -> u16 {
 }
 
 #[test]
+#[serial]
 fn http_only_upstream_starts_and_forwards_requests_end_to_end() {
     if !local_tcp_bind_available() {
         return;
@@ -500,6 +504,7 @@ fn http_only_upstream_starts_and_forwards_requests_end_to_end() {
 }
 
 #[test]
+#[serial]
 fn http_only_upstream_normalizes_forwarding_headers() {
     if !local_tcp_bind_available() {
         return;
@@ -572,6 +577,7 @@ fn http_only_upstream_normalizes_forwarding_headers() {
 }
 
 #[test]
+#[serial]
 fn http_only_upstream_retries_bodyless_requests_on_alternate_backend() {
     if !local_tcp_bind_available() {
         return;
@@ -616,6 +622,7 @@ fn http_only_upstream_retries_bodyless_requests_on_alternate_backend() {
 }
 
 #[test]
+#[serial]
 fn mixed_http_and_https_upstreams_route_by_scheme() {
     if !local_tcp_bind_available() {
         return;

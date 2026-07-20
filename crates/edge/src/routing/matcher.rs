@@ -35,6 +35,10 @@ pub fn compare_route_candidate(
     current: RouteCandidate,
     candidate: RouteCandidate,
 ) -> RoutePreference {
+    let wildcard_specificity_equal = candidate.host_match_kind != HostMatchKind::Wildcard
+        || current.host_match_kind != HostMatchKind::Wildcard
+        || candidate.wildcard_suffix_len == current.wildcard_suffix_len;
+
     if candidate.route.path_len > current.route.path_len {
         RoutePreference::TakeCandidatePathLen
     } else if candidate.route.path_len == current.route.path_len
@@ -54,12 +58,14 @@ pub fn compare_route_candidate(
         RoutePreference::TakeCandidateWildcardSpecificity
     } else if candidate.route.path_len == current.route.path_len
         && candidate.host_match_kind == current.host_match_kind
+        && wildcard_specificity_equal
         && candidate.route.method_specific
         && !current.route.method_specific
     {
         RoutePreference::TakeCandidateMethodSpecific
     } else if candidate.route.path_len == current.route.path_len
         && candidate.host_match_kind == current.host_match_kind
+        && wildcard_specificity_equal
         && candidate.route.method_specific == current.route.method_specific
         && candidate.route.order < current.route.order
     {
@@ -171,4 +177,148 @@ pub fn best_matching_route_with_reason(
         };
     }
     best
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::routing::{
+        decision::{RouteDecisionReason, RoutePreference},
+        matcher::{compare_route_candidate, prefer_host_lookup_result, prefer_route_candidate},
+        route::{HostLookupResult, HostMatchKind, IndexedRoute, RouteCandidate},
+    };
+
+    fn indexed_route(
+        upstream_idx: usize,
+        path_len: usize,
+        host_specific: bool,
+        method_specific: bool,
+        order: usize,
+    ) -> IndexedRoute {
+        IndexedRoute {
+            upstream_idx,
+            path_len,
+            host_specific,
+            method_specific,
+            order,
+        }
+    }
+
+    fn candidate(
+        upstream_idx: usize,
+        path_len: usize,
+        host_specific: bool,
+        host_match_kind: HostMatchKind,
+        wildcard_suffix_len: usize,
+        method_specific: bool,
+        order: usize,
+    ) -> RouteCandidate {
+        RouteCandidate {
+            route: indexed_route(
+                upstream_idx,
+                path_len,
+                host_specific,
+                method_specific,
+                order,
+            ),
+            host_match_kind,
+            wildcard_suffix_len,
+        }
+    }
+
+    #[test]
+    fn compare_route_candidate_prefers_longer_path() {
+        let current = candidate(0, 4, false, HostMatchKind::Default, 0, false, 0);
+        let candidate = candidate(1, 7, false, HostMatchKind::Default, 0, false, 1);
+
+        assert_eq!(
+            compare_route_candidate(current, candidate),
+            RoutePreference::TakeCandidatePathLen
+        );
+    }
+
+    #[test]
+    fn compare_route_candidate_prefers_host_specific_route() {
+        let current = candidate(0, 4, false, HostMatchKind::Default, 0, false, 0);
+        let candidate = candidate(1, 4, true, HostMatchKind::Wildcard, 11, false, 1);
+
+        assert_eq!(
+            compare_route_candidate(current, candidate),
+            RoutePreference::TakeCandidateHostSpecific
+        );
+    }
+
+    #[test]
+    fn compare_route_candidate_prefers_exact_host_over_wildcard() {
+        let current = candidate(0, 4, true, HostMatchKind::Wildcard, 11, false, 0);
+        let candidate = candidate(1, 4, true, HostMatchKind::Exact, 0, false, 1);
+
+        assert_eq!(
+            compare_route_candidate(current, candidate),
+            RoutePreference::TakeCandidateExactHost
+        );
+    }
+
+    #[test]
+    fn compare_route_candidate_prefers_more_specific_wildcard_suffix() {
+        let current = candidate(0, 4, true, HostMatchKind::Wildcard, 11, false, 0);
+        let candidate = candidate(1, 4, true, HostMatchKind::Wildcard, 15, false, 1);
+
+        assert_eq!(
+            compare_route_candidate(current, candidate),
+            RoutePreference::TakeCandidateWildcardSpecificity
+        );
+    }
+
+    #[test]
+    fn compare_route_candidate_prefers_method_specific_route() {
+        let current = candidate(0, 4, true, HostMatchKind::Exact, 0, false, 0);
+        let candidate = candidate(1, 4, true, HostMatchKind::Exact, 0, true, 1);
+
+        assert_eq!(
+            compare_route_candidate(current, candidate),
+            RoutePreference::TakeCandidateMethodSpecific
+        );
+    }
+
+    #[test]
+    fn compare_route_candidate_prefers_lexical_order_on_full_tie() {
+        let current = candidate(0, 4, true, HostMatchKind::Exact, 0, true, 2);
+        let candidate = candidate(1, 4, true, HostMatchKind::Exact, 0, true, 1);
+
+        assert_eq!(
+            compare_route_candidate(current, candidate),
+            RoutePreference::TakeCandidateLexicalOrder
+        );
+    }
+
+    #[test]
+    fn prefer_route_candidate_returns_preferred_candidate() {
+        let current = candidate(0, 4, false, HostMatchKind::Default, 0, false, 0);
+        let better = candidate(1, 7, false, HostMatchKind::Default, 0, false, 1);
+
+        assert_eq!(
+            prefer_route_candidate(Some(current), Some(better)),
+            Some(better)
+        );
+    }
+
+    #[test]
+    fn prefer_host_lookup_result_carries_tiebreak_reason() {
+        let current = HostLookupResult {
+            candidate: candidate(0, 4, true, HostMatchKind::Wildcard, 11, false, 0),
+            decision_reason: None,
+        };
+        let better = HostLookupResult {
+            candidate: candidate(1, 4, true, HostMatchKind::Exact, 0, false, 1),
+            decision_reason: None,
+        };
+
+        assert_eq!(
+            prefer_host_lookup_result(Some(current), Some(better)),
+            Some(HostLookupResult {
+                candidate: better.candidate,
+                decision_reason: Some(RouteDecisionReason::ExactHostTieBreak),
+            })
+        );
+    }
 }

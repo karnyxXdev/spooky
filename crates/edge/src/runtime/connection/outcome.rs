@@ -10,7 +10,32 @@ use spooky_lb::{
     backend::HealthTransition, health::HealthFailureReason, upstream_pool::UpstreamPool,
 };
 
-use crate::{Metrics, OverloadShedReason, RouteOutcome, runtime::health::outcome_from_status};
+use crate::{
+    Metrics, OverloadShedReason, RouteOutcome,
+    runtime::backend::{
+        event::{
+            BackendHealthObservation, BackendHealthObservationOutcome,
+            BackendHealthObservationSource, BackendRequestFeedback,
+        },
+        lifecycle::{
+            apply_backend_health_observation, apply_backend_request_accounting,
+            apply_backend_request_feedback,
+        },
+        state::BackendIdentity,
+    },
+};
+
+fn emit_backend_health_transition(
+    backend_addr: &str,
+    transition: Option<HealthTransition>,
+) -> Option<HealthTransition> {
+    if let Some(transition) = transition {
+        log_backend_health_transition(backend_addr, &transition);
+        Some(transition)
+    } else {
+        None
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CanonicalRouteOutcome {
@@ -387,34 +412,61 @@ pub(crate) fn finish_backend_request_accounting(input: BackendRequestFinishInput
         status,
     } = input;
 
-    if let (Some(pool), Some(index)) = (upstream_pool, backend_index)
-        && let Ok(mut guard) = pool.write()
-    {
-        guard.finish_request(index, elapsed, status);
-    }
+    apply_backend_request_accounting(upstream_pool, backend_index, elapsed, status);
 }
 
 pub(crate) fn observe_backend_response_status(
     input: BackendHealthObservationInput<'_>,
 ) -> Option<HealthTransition> {
     let BackendHealthObservationInput {
-        backend_addr: _backend_addr,
+        backend_addr,
         backend_index,
         upstream_pool,
         status,
     } = input;
 
-    let pool = upstream_pool?;
-    let mut pool = pool.write().ok()?;
-    match outcome_from_status(status) {
-        crate::runtime::health::HealthClassification::Success => {
-            pool.pool.mark_success(backend_index)
-        }
-        crate::runtime::health::HealthClassification::Failure => pool
-            .pool
-            .mark_request_failure(backend_index, HealthFailureReason::HttpStatus5xx),
-        crate::runtime::health::HealthClassification::Neutral => None,
+    let observation = BackendHealthObservation {
+        identity: BackendIdentity::new(backend_addr),
+        source: BackendHealthObservationSource::PassiveRequest,
+        outcome: if status.is_server_error() {
+            BackendHealthObservationOutcome::Failure
+        } else if status.is_client_error() {
+            BackendHealthObservationOutcome::Neutral
+        } else {
+            BackendHealthObservationOutcome::Success
+        },
+        reason: if status.is_server_error() {
+            Some(HealthFailureReason::HttpStatus5xx)
+        } else {
+            None
+        },
+    };
+
+    apply_backend_health_observation(upstream_pool, Some(backend_index), &observation)
+}
+
+pub(crate) fn observe_backend_response_status_and_log(
+    input: BackendHealthObservationInput<'_>,
+) -> Option<HealthTransition> {
+    emit_backend_health_transition(input.backend_addr, observe_backend_response_status(input))
+}
+
+pub(crate) fn record_classified_backend_failure_metrics(
+    metrics_phase: &str,
+    backend_addr: &str,
+    metrics: &Metrics,
+    classified: &ClassifiedUpstreamProxyError,
+) -> Option<HealthFailureReason> {
+    let health_mapping = classified.health_failure?;
+    metrics.inc_health_failure(health_mapping.failure_reason);
+    if health_mapping.failure_reason == HealthFailureReason::Tls {
+        metrics.record_upstream_tls_failure(
+            backend_addr,
+            metrics_phase,
+            health_mapping.metrics_reason,
+        );
     }
+    Some(health_mapping.failure_reason)
 }
 
 pub(crate) fn observe_classified_backend_failure(
@@ -429,22 +481,39 @@ pub(crate) fn observe_classified_backend_failure(
         classified,
     } = input;
 
-    let health_mapping = classified.health_failure?;
-    metrics.inc_health_failure(health_mapping.failure_reason);
-    if health_mapping.failure_reason == HealthFailureReason::Tls {
-        metrics.record_upstream_tls_failure(
-            backend_addr,
-            metrics_phase,
-            health_mapping.metrics_reason,
-        );
-    }
-    let pool = upstream_pool?;
-    let mut pool = pool.write().ok()?;
-    pool.pool
-        .mark_request_failure(backend_index, health_mapping.failure_reason)
+    let reason = record_classified_backend_failure_metrics(
+        metrics_phase,
+        backend_addr,
+        metrics,
+        classified,
+    )?;
+    let feedback = BackendRequestFeedback::failure(
+        BackendIdentity::new(backend_addr),
+        Duration::ZERO,
+        None,
+        Some(reason),
+    );
+
+    apply_backend_request_feedback(upstream_pool, Some(backend_index), &feedback)
 }
 
-pub(crate) fn log_backend_health_transition(addr: &str, transition: HealthTransition) {
+pub(crate) fn observe_classified_backend_failure_and_log(
+    input: ClassifiedBackendFailureInput<'_>,
+) -> Option<HealthTransition> {
+    emit_backend_health_transition(
+        input.backend_addr,
+        observe_classified_backend_failure(input),
+    )
+}
+
+pub(crate) fn log_backend_health_transition_result(
+    backend_addr: &str,
+    transition: Option<HealthTransition>,
+) -> Option<HealthTransition> {
+    emit_backend_health_transition(backend_addr, transition)
+}
+
+pub(crate) fn log_backend_health_transition(addr: &str, transition: &HealthTransition) {
     match transition {
         HealthTransition::BecameHealthy => {
             info!("Backend {} became healthy", addr);

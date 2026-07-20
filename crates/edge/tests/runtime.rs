@@ -4,6 +4,7 @@ use std::{
 };
 
 use spooky_edge::runtime::backend::{
+    event::{BackendLifecycleMutation, BackendRefreshOutcome},
     resolution::{RuntimeBackendAddressKind, RuntimeBackendResolution},
     store::RuntimeBackendResolutionStore,
 };
@@ -27,10 +28,13 @@ fn hostname_entries_exclude_ip_literal_backends() {
         ),
     ]);
 
-    let entries = store.hostname_entries();
+    let entries = store.hostname_backends();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].backend_addr, "api.internal:443");
-    assert_eq!(entries[0].address_kind, RuntimeBackendAddressKind::Hostname);
+    assert_eq!(entries[0].identity.backend_addr, "api.internal:443");
+    assert_eq!(
+        entries[0].resolution.address_kind,
+        RuntimeBackendAddressKind::Hostname
+    );
 }
 
 #[test]
@@ -44,9 +48,9 @@ fn store_snapshot_preserves_seeded_resolution_state() {
 
     let snapshot = store.snapshot();
     let entry = snapshot.get("127.0.0.1:8080").expect("entry");
-    assert_eq!(entry.authority_host, "127.0.0.1");
-    assert_eq!(entry.authority_port, 8080);
-    assert_eq!(entry.resolved_addrs.len(), 1);
+    assert_eq!(entry.resolution.authority_host, "127.0.0.1");
+    assert_eq!(entry.resolution.authority_port, 8080);
+    assert_eq!(entry.resolution.resolved_addrs.len(), 1);
 }
 
 #[test]
@@ -57,8 +61,8 @@ fn hostname_resolution_update_canonicalizes_and_tracks_generation() {
         443,
     )]);
 
-    let update = store
-        .update_hostname_resolution(
+    let mutation = store
+        .apply_resolution_refresh(
             "api.internal:443",
             vec![
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 443),
@@ -69,13 +73,24 @@ fn hostname_resolution_update_canonicalizes_and_tracks_generation() {
         )
         .expect("update");
 
-    assert!(update.changed());
-    assert_eq!(update.refresh_generation, 1);
-    assert_eq!(
-        update.current_addrs,
-        vec![
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 443)
-        ]
-    );
+    match mutation {
+        BackendLifecycleMutation::ResolutionUpdated { result, .. } => match result.outcome {
+            BackendRefreshOutcome::Updated {
+                current_addrs,
+                refresh_generation,
+                ..
+            } => {
+                assert_eq!(refresh_generation, 1);
+                assert_eq!(
+                    current_addrs,
+                    vec![
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443),
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 443)
+                    ]
+                );
+            }
+            other => panic!("expected updated refresh outcome, got {other:?}"),
+        },
+        other => panic!("expected resolution update mutation, got {other:?}"),
+    }
 }

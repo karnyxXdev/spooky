@@ -202,8 +202,8 @@ impl QUICListener {
                     backend_addr,
                     &classified,
                 );
-                if let Some(transition) =
-                    crate::runtime::connection::outcome::observe_classified_backend_failure(
+                let _ =
+                    crate::runtime::connection::outcome::observe_classified_backend_failure_and_log(
                         crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
                             metrics_phase: "data_plane",
                             backend_addr,
@@ -212,13 +212,7 @@ impl QUICListener {
                             metrics,
                             classified: &classified,
                         },
-                    )
-                {
-                    crate::runtime::connection::outcome::log_backend_health_transition(
-                        backend_addr,
-                        transition,
                     );
-                }
 
                 match classified.kind {
                     UpstreamProxyErrorKind::Timeout => {
@@ -653,7 +647,7 @@ impl QUICListener {
                         req.backend_index,
                         classified.as_ref(),
                     ) {
-                        if let Some(transition) = crate::runtime::connection::outcome::observe_classified_backend_failure(
+                        let _ = crate::runtime::connection::outcome::observe_classified_backend_failure_and_log(
                             crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
                                 metrics_phase: "data_plane",
                                 backend_addr: addr,
@@ -662,15 +656,10 @@ impl QUICListener {
                                 metrics,
                                 classified,
                             },
-                        ) {
-                            crate::runtime::connection::outcome::log_backend_health_transition(
-                                addr,
-                                transition,
-                            );
-                        }
+                        );
                     } else if let (Some(addr), Some(idx)) =
                         (req.backend_addr.as_deref(), req.backend_index)
-                        && let Some(t) = crate::runtime::connection::outcome::observe_backend_response_status(
+                        && crate::runtime::connection::outcome::observe_backend_response_status_and_log(
                             crate::runtime::connection::outcome::BackendHealthObservationInput {
                                 backend_addr: addr,
                                 backend_index: idx,
@@ -680,9 +669,8 @@ impl QUICListener {
                                     .and_then(|code| http::StatusCode::from_u16(code).ok())
                                     .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR),
                             },
-                        )
+                        ).is_some()
                     {
-                        crate::runtime::connection::outcome::log_backend_health_transition(addr, t);
                     }
                     match err {
                         ProxyError::Timeout => {

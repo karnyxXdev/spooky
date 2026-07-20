@@ -293,7 +293,7 @@ impl QUICListener {
         };
         match choose_alternate_backend(&pool, &[primary_index], None) {
             AlternateBackendDecision::Select(choice) => {
-                if let Some(address) = pool.pool.address(choice.index) {
+                if let Some(address) = pool.backend_address(choice.index) {
                     ResolvedAlternateBackend::Selected {
                         address: address.to_string(),
                     }
@@ -407,7 +407,6 @@ impl QUICListener {
         let route_name = pending_forward.upstream_name.to_string();
         let backend_timeout = exec_ctx.backend_timeout;
         let backend_endpoints = Arc::clone(&exec_ctx.backend_endpoints);
-        let _backend_resolutions = Arc::clone(&exec_ctx.backend_resolution_store);
         let transport = Arc::clone(&exec_ctx.transport_pool);
         let hedge_delay = resilience.hedging_delay;
         let alternate_backend = req.upstream_pool.as_ref().map(|upstream_pool| {

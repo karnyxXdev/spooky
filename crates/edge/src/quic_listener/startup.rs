@@ -19,7 +19,10 @@ use crate::{
     resilience::runtime::RuntimeResilience,
     routing::index::RouteIndex,
     runtime::{
-        backend::{resolution::RuntimeBackendResolution, store::RuntimeBackendResolutionStore},
+        backend::{
+            lifecycle::BackendLifecycleCoordinator, resolution::RuntimeBackendResolution,
+            store::RuntimeBackendResolutionStore,
+        },
         bundle::{RuntimeBundle, RuntimeBundleHandle},
         generation::{RuntimeGenerationState, RuntimeSharedServices, StartupOwnedRuntimeState},
         listener::QUICListener,
@@ -243,6 +246,9 @@ impl QUICListener {
         let backend_dns_resolver = SharedDnsResolver::new();
         let backend_resolution_store =
             Arc::new(RuntimeBackendResolutionStore::new(backend_resolutions));
+        let backend_lifecycle = Arc::new(BackendLifecycleCoordinator::new(Arc::clone(
+            &backend_resolution_store,
+        )));
         let connect_metrics = Arc::clone(&metrics);
         let connect_observer: spooky_transport::h2_client::ConnectObserver = Arc::new(
             move |observation: spooky_transport::h2_client::ConnectObservation| {
@@ -327,6 +333,7 @@ impl QUICListener {
             RuntimeSharedServices {
                 listener_tls_store,
                 transport_pool,
+                backend_lifecycle,
                 backend_resolution_store,
                 backend_dns_resolver,
                 metrics,
@@ -454,7 +461,6 @@ impl QUICListener {
             h3_config,
             transport_pool: Arc::clone(&shared_services.transport_pool),
             backend_endpoints: Arc::clone(&generation_state.backend_endpoints),
-            backend_resolution_store: Arc::clone(&shared_services.backend_resolution_store),
             backend_dns_resolver: shared_services.backend_dns_resolver.clone(),
             upstream_policies: Arc::clone(&generation_state.upstream_policies),
             upstream_pools: generation_state.upstream_pools.clone(),

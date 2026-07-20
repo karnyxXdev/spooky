@@ -1,4 +1,12 @@
+use std::{
+    sync::{Arc, RwLock},
+    time::Duration,
+};
+
+use spooky_lb::{backend::HealthTransition, upstream_pool::UpstreamPool};
+
 use super::{
+    event::{BackendRequestFeedback, BackendRequestFeedbackOutcome},
     resolution::RuntimeBackendResolution,
     state::{
         BackendHealthState, BackendIdentity, BackendLifecycleSnapshot, BackendMembershipState,
@@ -60,9 +68,108 @@ impl From<&RuntimeBackendLifecycleState> for BackendLifecycleSnapshot {
     }
 }
 
+pub fn apply_backend_request_accounting(
+    upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
+    backend_index: Option<usize>,
+    elapsed: Duration,
+    status: Option<u16>,
+) {
+    if let (Some(pool), Some(index)) = (upstream_pool, backend_index)
+        && let Ok(mut guard) = pool.write()
+    {
+        guard.finish_request(index, elapsed, status);
+    }
+}
+
+pub fn apply_backend_request_feedback(
+    upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
+    backend_index: Option<usize>,
+    feedback: &BackendRequestFeedback,
+) -> Option<HealthTransition> {
+    let (Some(pool), Some(index)) = (upstream_pool, backend_index) else {
+        return None;
+    };
+    let mut pool = pool.write().ok()?;
+    match feedback.outcome {
+        BackendRequestFeedbackOutcome::Success => pool.mark_backend_healthy(index),
+        BackendRequestFeedbackOutcome::Neutral => None,
+        BackendRequestFeedbackOutcome::Failure { reason } => {
+            reason.and_then(|reason| pool.mark_backend_request_failure(index, reason))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use spooky_config::{
+        config::{Backend, Config, HealthCheck, Listen, LoadBalancing, RouteMatch, Tls, Upstream},
+        runtime::RuntimeConfig,
+    };
+
+    use crate::runtime::backend::event::BackendRequestFeedback;
+
     use super::*;
+
+    fn test_upstream_pool() -> Arc<RwLock<UpstreamPool>> {
+        let mut upstreams = std::collections::HashMap::new();
+        upstreams.insert(
+            "api".to_string(),
+            Upstream {
+                tls: None,
+                load_balancing: LoadBalancing {
+                    lb_type: "round-robin".to_string(),
+                    key: None,
+                },
+                auth: Default::default(),
+                host_policy: Default::default(),
+                forwarded_headers: Default::default(),
+                route: RouteMatch::default(),
+                backends: vec![Backend {
+                    id: "backend-a".to_string(),
+                    address: "127.0.0.1:8080".to_string(),
+                    weight: 1,
+                    health_check: Some(HealthCheck {
+                        path: "/health".to_string(),
+                        interval: 0,
+                        timeout_ms: 1000,
+                        failure_threshold: 1,
+                        success_threshold: 1,
+                        cooldown_ms: 0,
+                    }),
+                }],
+            },
+        );
+
+        let runtime = RuntimeConfig::from_config(&Config {
+            version: 1,
+            listen: Listen {
+                protocol: "http1".to_string(),
+                tls: Tls {
+                    cert: "/tmp/test-cert.pem".to_string(),
+                    key: "/tmp/test-key.pem".to_string(),
+                    ..Tls::default()
+                },
+                ..Listen::default()
+            },
+            listeners: Vec::new(),
+            upstream: upstreams,
+            load_balancing: None,
+            upstream_tls: Default::default(),
+            log: Default::default(),
+            performance: Default::default(),
+            observability: Default::default(),
+            resilience: Default::default(),
+            security: Default::default(),
+        })
+        .expect("runtime config");
+
+        Arc::new(RwLock::new(
+            UpstreamPool::from_runtime_upstream(runtime.upstreams.get("api").expect("upstream"))
+                .expect("pool"),
+        ))
+    }
 
     #[test]
     fn lifecycle_state_seeds_from_resolution_with_unknown_health() {
@@ -78,5 +185,52 @@ mod tests {
         assert_eq!(state.membership, BackendMembershipState::Active);
         assert_eq!(state.health, BackendHealthState::Unknown);
         assert!(state.resolution.is_hostname());
+    }
+
+    #[test]
+    fn request_feedback_applier_marks_backend_unhealthy_and_healthy() {
+        let pool = test_upstream_pool();
+        let unhealthy = apply_backend_request_feedback(
+            Some(&pool),
+            Some(0),
+            &BackendRequestFeedback::failure(
+                BackendIdentity::new("127.0.0.1:8080"),
+                Duration::from_millis(10),
+                Some(503),
+                Some(spooky_lb::health::HealthFailureReason::HttpStatus5xx),
+            ),
+        );
+        assert!(matches!(unhealthy, Some(HealthTransition::BecameUnhealthy)));
+
+        let healthy = apply_backend_request_feedback(
+            Some(&pool),
+            Some(0),
+            &BackendRequestFeedback::from_status(
+                BackendIdentity::new("127.0.0.1:8080"),
+                Duration::from_millis(10),
+                http::StatusCode::OK,
+            ),
+        );
+        assert!(matches!(healthy, Some(HealthTransition::BecameHealthy)));
+    }
+
+    #[test]
+    fn request_accounting_applier_finishes_inflight_request() {
+        let pool = test_upstream_pool();
+        {
+            let guard = pool.read().expect("read");
+            assert!(guard.begin_request_if_healthy(0));
+        }
+
+        apply_backend_request_accounting(
+            Some(&pool),
+            Some(0),
+            Duration::from_millis(15),
+            Some(200),
+        );
+
+        let guard = pool.read().expect("read");
+        assert_eq!(guard.pool.backends[0].active_requests(), 0);
+        assert!(guard.pool.backends[0].ewma_latency_ms().is_some());
     }
 }

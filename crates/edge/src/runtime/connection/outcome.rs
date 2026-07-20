@@ -10,7 +10,16 @@ use spooky_lb::{
     backend::HealthTransition, health::HealthFailureReason, upstream_pool::UpstreamPool,
 };
 
-use crate::{Metrics, OverloadShedReason, RouteOutcome, runtime::health::outcome_from_status};
+use crate::{
+    Metrics, OverloadShedReason, RouteOutcome,
+    runtime::{
+        backend::{
+            event::BackendRequestFeedback,
+            lifecycle::{apply_backend_request_accounting, apply_backend_request_feedback},
+            state::BackendIdentity,
+        },
+    },
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CanonicalRouteOutcome {
@@ -387,32 +396,26 @@ pub(crate) fn finish_backend_request_accounting(input: BackendRequestFinishInput
         status,
     } = input;
 
-    if let (Some(pool), Some(index)) = (upstream_pool, backend_index)
-        && let Ok(mut guard) = pool.write()
-    {
-        guard.finish_request(index, elapsed, status);
-    }
+    apply_backend_request_accounting(upstream_pool, backend_index, elapsed, status);
 }
 
 pub(crate) fn observe_backend_response_status(
     input: BackendHealthObservationInput<'_>,
 ) -> Option<HealthTransition> {
     let BackendHealthObservationInput {
-        backend_addr: _backend_addr,
+        backend_addr,
         backend_index,
         upstream_pool,
         status,
     } = input;
 
-    let pool = upstream_pool?;
-    let mut pool = pool.write().ok()?;
-    match outcome_from_status(status) {
-        crate::runtime::health::HealthClassification::Success => pool.mark_backend_healthy(backend_index),
-        crate::runtime::health::HealthClassification::Failure => {
-            pool.mark_backend_request_failure(backend_index, HealthFailureReason::HttpStatus5xx)
-        }
-        crate::runtime::health::HealthClassification::Neutral => None,
-    }
+    let feedback = BackendRequestFeedback::from_status(
+        BackendIdentity::new(backend_addr),
+        Duration::ZERO,
+        status,
+    );
+
+    apply_backend_request_feedback(upstream_pool, Some(backend_index), &feedback)
 }
 
 pub(crate) fn observe_classified_backend_failure(
@@ -436,9 +439,14 @@ pub(crate) fn observe_classified_backend_failure(
             health_mapping.metrics_reason,
         );
     }
-    let pool = upstream_pool?;
-    let mut pool = pool.write().ok()?;
-    pool.mark_backend_request_failure(backend_index, health_mapping.failure_reason)
+    let feedback = BackendRequestFeedback::failure(
+        BackendIdentity::new(backend_addr),
+        Duration::ZERO,
+        None,
+        Some(health_mapping.failure_reason),
+    );
+
+    apply_backend_request_feedback(upstream_pool, Some(backend_index), &feedback)
 }
 
 pub(crate) fn log_backend_health_transition(addr: &str, transition: HealthTransition) {

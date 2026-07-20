@@ -202,16 +202,17 @@ impl QUICListener {
                     backend_addr,
                     &classified,
                 );
-                let _ = crate::runtime::connection::outcome::observe_classified_backend_failure_and_log(
-                    crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
-                        metrics_phase: "data_plane",
-                        backend_addr,
-                        backend_index,
-                        upstream_pool: upstream_pool.as_ref(),
-                        metrics,
-                        classified: &classified,
-                    },
-                );
+                let _ =
+                    crate::runtime::connection::outcome::observe_classified_backend_failure_and_log(
+                        crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
+                            metrics_phase: "data_plane",
+                            backend_addr,
+                            backend_index,
+                            upstream_pool: upstream_pool.as_ref(),
+                            metrics,
+                            classified: &classified,
+                        },
+                    );
 
                 match classified.kind {
                     UpstreamProxyErrorKind::Timeout => {

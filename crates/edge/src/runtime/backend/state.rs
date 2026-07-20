@@ -56,9 +56,7 @@ impl From<&RuntimeBackendResolution> for BackendResolutionState {
 pub enum BackendHealthState {
     Unknown,
     Healthy,
-    Unhealthy {
-        reason: Option<HealthFailureReason>,
-    },
+    Unhealthy { reason: Option<HealthFailureReason> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

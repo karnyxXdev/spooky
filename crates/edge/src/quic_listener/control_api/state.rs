@@ -149,7 +149,8 @@ impl ControlApiState {
                 .snapshot_inventory(&runtime.state().upstream_pools);
         }
 
-        self.backend_lifecycle.snapshot_inventory(&self.upstream_pools)
+        self.backend_lifecycle
+            .snapshot_inventory(&self.upstream_pools)
     }
 
     pub(super) fn snapshot_backend_health(&self) -> BackendLifecycleInventorySummary {

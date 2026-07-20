@@ -78,19 +78,18 @@ async fn refresh_backend_hostname(
     backend_lifecycle: &BackendLifecycleCoordinator,
     backend_dns_resolver: &SharedDnsResolver,
 ) -> BackendDnsRefreshApplication {
-    let resolved_addrs = match tokio::net::lookup_host((
-        backend.resolution.authority_host.as_str(),
-        0,
-    ))
-    .await
-    {
-        Ok(addrs) => Ok(
-            addrs
+    let resolved_addrs =
+        match tokio::net::lookup_host((backend.resolution.authority_host.as_str(), 0)).await {
+            Ok(addrs) => Ok(addrs
                 .map(|addr| SocketAddr::new(addr.ip(), backend.resolution.authority_port))
-                .collect::<Vec<_>>(),
-        ),
-        Err(err) => Err(err.to_string()),
-    };
+                .collect::<Vec<_>>()),
+            Err(err) => Err(err.to_string()),
+        };
 
-    backend_lifecycle.apply_refresh(backend, resolved_addrs, backend_dns_resolver, transport_pool)
+    backend_lifecycle.apply_refresh(
+        backend,
+        resolved_addrs,
+        backend_dns_resolver,
+        transport_pool,
+    )
 }

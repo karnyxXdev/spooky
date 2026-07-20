@@ -1,4 +1,7 @@
-use std::{net::SocketAddr, time::{Duration, SystemTime}};
+use std::{
+    net::SocketAddr,
+    time::{Duration, SystemTime},
+};
 
 use http::StatusCode;
 use spooky_lb::health::HealthFailureReason;
@@ -143,17 +146,11 @@ pub struct BackendRequestFeedback {
 pub enum BackendRequestFeedbackOutcome {
     Success,
     Neutral,
-    Failure {
-        reason: Option<HealthFailureReason>,
-    },
+    Failure { reason: Option<HealthFailureReason> },
 }
 
 impl BackendRequestFeedback {
-    pub fn from_status(
-        identity: BackendIdentity,
-        elapsed: Duration,
-        status: StatusCode,
-    ) -> Self {
+    pub fn from_status(identity: BackendIdentity, elapsed: Duration, status: StatusCode) -> Self {
         let outcome = if status.is_server_error() {
             BackendRequestFeedbackOutcome::Failure {
                 reason: Some(HealthFailureReason::HttpStatus5xx),

@@ -141,19 +141,19 @@ impl QUICListener {
 
                             let evaluation = match result {
                                 Ok(Ok(response)) => {
-                                    let outcome =
-                                        match classify_active_health_check_response(response.status())
-                                        {
-                                            HealthClassification::Success => {
-                                                BackendHealthObservationOutcome::Success
-                                            }
-                                            HealthClassification::Failure => {
-                                                BackendHealthObservationOutcome::Failure
-                                            }
-                                            HealthClassification::Neutral => {
-                                                BackendHealthObservationOutcome::Neutral
-                                            }
-                                        };
+                                    let outcome = match classify_active_health_check_response(
+                                        response.status(),
+                                    ) {
+                                        HealthClassification::Success => {
+                                            BackendHealthObservationOutcome::Success
+                                        }
+                                        HealthClassification::Failure => {
+                                            BackendHealthObservationOutcome::Failure
+                                        }
+                                        HealthClassification::Neutral => {
+                                            BackendHealthObservationOutcome::Neutral
+                                        }
+                                    };
                                     evaluate_active_health_check(
                                         BackendIdentity::new(job.backend_identity.clone()),
                                         outcome,
@@ -172,16 +172,14 @@ impl QUICListener {
                                         HealthFailureReason::Transport,
                                     )
                                 }
-                                Ok(Err(pool_err)) => {
-                                    Self::evaluate_failed_health_check(
-                                        &job.backend_identity,
-                                        task_metrics.as_ref(),
-                                        job.base_interval_ms,
-                                        job.consecutive_failures,
-                                        ProxyError::Pool(pool_err),
-                                        HealthFailureReason::Transport,
-                                    )
-                                }
+                                Ok(Err(pool_err)) => Self::evaluate_failed_health_check(
+                                    &job.backend_identity,
+                                    task_metrics.as_ref(),
+                                    job.base_interval_ms,
+                                    job.consecutive_failures,
+                                    ProxyError::Pool(pool_err),
+                                    HealthFailureReason::Transport,
+                                ),
                                 Err(_) => Self::evaluate_failed_health_check(
                                     &job.backend_identity,
                                     task_metrics.as_ref(),

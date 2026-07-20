@@ -19,9 +19,7 @@ use crate::{
     resilience::runtime::RuntimeResilience,
     routing::index::RouteIndex,
     runtime::{
-        backend::{
-            lifecycle::BackendLifecycleCoordinator, store::RuntimeBackendResolutionStore,
-        },
+        backend::{lifecycle::BackendLifecycleCoordinator, store::RuntimeBackendResolutionStore},
         tasks::RuntimeTaskRegistry,
         tls::store::ListenerTlsReloadStore,
     },

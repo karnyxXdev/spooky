@@ -16,12 +16,12 @@ use super::{
         BackendRequestFeedbackOutcome,
     },
     resolution::RuntimeBackendResolution,
-    store::RuntimeBackendResolutionStore,
     state::{
         BackendHealthState, BackendIdentity, BackendLifecycleInventorySnapshot,
         BackendLifecycleSnapshot, BackendMembershipState, BackendPoolPlacementSnapshot,
-        CanonicalBackendLifecycleSnapshot, BackendResolutionState,
+        BackendResolutionState, CanonicalBackendLifecycleSnapshot,
     },
+    store::RuntimeBackendResolutionStore,
 };
 use crate::Metrics;
 
@@ -176,8 +176,9 @@ impl BackendLifecycleCoordinator {
                 let Some(backend) = guard.pool.backend(backend_index) else {
                     continue;
                 };
-                let entry = snapshots.entry(backend_addr.to_string()).or_insert_with(|| {
-                    CanonicalBackendLifecycleSnapshot {
+                let entry = snapshots
+                    .entry(backend_addr.to_string())
+                    .or_insert_with(|| CanonicalBackendLifecycleSnapshot {
                         identity: BackendIdentity::new(backend_addr.to_string()),
                         resolution: BackendResolutionState {
                             authority_host: backend_addr.to_string(),
@@ -190,8 +191,7 @@ impl BackendLifecycleCoordinator {
                         health: BackendHealthState::Unknown,
                         membership: BackendMembershipState::Removed,
                         placements: Vec::new(),
-                    }
-                });
+                    });
                 entry.placements.push(BackendPoolPlacementSnapshot {
                     upstream_name: upstream_name.clone(),
                     backend_index,
@@ -222,7 +222,8 @@ impl BackendLifecycleCoordinator {
                     .then(left.backend_index.cmp(&right.backend_index))
             });
         }
-        backends.sort_by(|left, right| left.identity.backend_addr.cmp(&right.identity.backend_addr));
+        backends
+            .sort_by(|left, right| left.identity.backend_addr.cmp(&right.identity.backend_addr));
 
         BackendLifecycleInventorySnapshot { backends }
     }
@@ -315,18 +316,15 @@ pub(crate) fn apply_backend_health_observation(
     };
     let mut pool = pool.write().ok()?;
     match (observation.source, observation.outcome) {
-        (
-            BackendHealthObservationSource::ActiveCheck,
-            BackendHealthObservationOutcome::Success,
-        ) => pool.mark_backend_healthy(index),
-        (
-            BackendHealthObservationSource::ActiveCheck,
-            BackendHealthObservationOutcome::Failure,
-        ) => pool.mark_backend_failure_from_active_check(index),
-        (
-            BackendHealthObservationSource::ActiveCheck,
-            BackendHealthObservationOutcome::Neutral,
-        ) => None,
+        (BackendHealthObservationSource::ActiveCheck, BackendHealthObservationOutcome::Success) => {
+            pool.mark_backend_healthy(index)
+        }
+        (BackendHealthObservationSource::ActiveCheck, BackendHealthObservationOutcome::Failure) => {
+            pool.mark_backend_failure_from_active_check(index)
+        }
+        (BackendHealthObservationSource::ActiveCheck, BackendHealthObservationOutcome::Neutral) => {
+            None
+        }
         (_, BackendHealthObservationOutcome::Success) => pool.mark_backend_healthy(index),
         (_, BackendHealthObservationOutcome::Neutral) => None,
         (_, BackendHealthObservationOutcome::Failure) => observation
@@ -502,11 +500,7 @@ pub(crate) fn log_backend_dns_refresh(outcome: &BackendDnsRefreshApplication) {
             } else {
                 info!(
                     "backend DNS refresh updated '{}' (backend '{}'): {:?} -> {:?} generation={} stale_pooled_connections=possible_until_idle_timeout",
-                    authority_host,
-                    backend_addr,
-                    previous_addrs,
-                    current_addrs,
-                    generation
+                    authority_host, backend_addr, previous_addrs, current_addrs, generation
                 );
             }
         }
@@ -559,11 +553,8 @@ mod tests {
         transport_pool::{BackendTransportKind, UpstreamTransportPool},
     };
 
-    use crate::runtime::backend::event::{
-        BackendHealthObservationOutcome, BackendRequestFeedback,
-    };
-
     use super::*;
+    use crate::runtime::backend::event::{BackendHealthObservationOutcome, BackendRequestFeedback};
 
     fn test_upstream_pool_with_interval(interval: u64) -> Arc<RwLock<UpstreamPool>> {
         let mut upstreams = std::collections::HashMap::new();
@@ -675,7 +666,10 @@ mod tests {
         let snapshot = coordinator
             .snapshot_backend("https://backend.internal:8443")
             .expect("backend snapshot");
-        assert_eq!(snapshot.identity.backend_addr, "https://backend.internal:8443");
+        assert_eq!(
+            snapshot.identity.backend_addr,
+            "https://backend.internal:8443"
+        );
 
         let all = coordinator.snapshot_all();
         assert_eq!(all.len(), 1);
@@ -738,7 +732,9 @@ mod tests {
             } if current_addrs == new_addrs
         ));
 
-        let snapshot = coordinator.snapshot_backend(backend_addr).expect("snapshot");
+        let snapshot = coordinator
+            .snapshot_backend(backend_addr)
+            .expect("snapshot");
         assert_eq!(snapshot.resolution.resolved_addrs, new_addrs);
         assert_eq!(snapshot.resolution.refresh_generation, 1);
         assert_eq!(
@@ -758,7 +754,12 @@ mod tests {
                 8080,
             ),
         ]));
-        store.apply_resolution_refresh(backend_addr, initial_addrs.clone(), std::time::SystemTime::UNIX_EPOCH)
+        store
+            .apply_resolution_refresh(
+                backend_addr,
+                initial_addrs.clone(),
+                std::time::SystemTime::UNIX_EPOCH,
+            )
             .expect("seed refresh");
         let coordinator = BackendLifecycleCoordinator::new(Arc::clone(&store));
         let resolver = SharedDnsResolver::new();
@@ -793,7 +794,12 @@ mod tests {
                 8080,
             ),
         ]));
-        store.apply_resolution_refresh(backend_addr, retained_addrs.clone(), std::time::SystemTime::UNIX_EPOCH)
+        store
+            .apply_resolution_refresh(
+                backend_addr,
+                retained_addrs.clone(),
+                std::time::SystemTime::UNIX_EPOCH,
+            )
             .expect("seed refresh");
         let coordinator = BackendLifecycleCoordinator::new(store);
         let resolver = SharedDnsResolver::new();
@@ -862,7 +868,10 @@ mod tests {
         assert_eq!(failure.next_delay, Duration::from_millis(200));
         let transition =
             apply_backend_health_observation(Some(&pool), Some(0), &failure.observation);
-        assert!(matches!(transition, Some(HealthTransition::BecameUnhealthy)));
+        assert!(matches!(
+            transition,
+            Some(HealthTransition::BecameUnhealthy)
+        ));
 
         let success = evaluate_active_health_check(
             BackendIdentity::new("127.0.0.1:8080"),
@@ -899,7 +908,10 @@ mod tests {
         );
         let transition =
             coordinator.apply_health_observation(Some(&pool), Some(0), &failure.observation);
-        assert!(matches!(transition, Some(HealthTransition::BecameUnhealthy)));
+        assert!(matches!(
+            transition,
+            Some(HealthTransition::BecameUnhealthy)
+        ));
 
         let mut pools = HashMap::new();
         pools.insert("api".to_string(), Arc::clone(&pool));
@@ -970,7 +982,10 @@ mod tests {
                 Some(spooky_lb::health::HealthFailureReason::HttpStatus5xx),
             ),
         );
-        assert!(matches!(transition, Some(HealthTransition::BecameUnhealthy)));
+        assert!(matches!(
+            transition,
+            Some(HealthTransition::BecameUnhealthy)
+        ));
 
         let inventory = coordinator.snapshot_inventory(&pools);
         let backend = inventory
@@ -978,7 +993,10 @@ mod tests {
             .iter()
             .find(|backend| backend.identity.backend_addr == "127.0.0.1:8080")
             .expect("backend inventory");
-        assert!(matches!(backend.health, BackendHealthState::Unhealthy { .. }));
+        assert!(matches!(
+            backend.health,
+            BackendHealthState::Unhealthy { .. }
+        ));
         assert!(!backend.placements[0].healthy);
         assert_eq!(inventory.summary().healthy_backends, 0);
     }
@@ -1008,7 +1026,13 @@ mod tests {
             ),
         );
         assert!(transition.is_none());
-        assert_eq!(coordinator.snapshot_inventory(&pools).summary().healthy_backends, 1);
+        assert_eq!(
+            coordinator
+                .snapshot_inventory(&pools)
+                .summary()
+                .healthy_backends,
+            1
+        );
 
         let failure = evaluate_active_health_check(
             BackendIdentity::new("127.0.0.1:8080"),
@@ -1019,7 +1043,16 @@ mod tests {
         );
         let transition =
             coordinator.apply_health_observation(Some(&pool), Some(0), &failure.observation);
-        assert!(matches!(transition, Some(HealthTransition::BecameUnhealthy)));
-        assert_eq!(coordinator.snapshot_inventory(&pools).summary().healthy_backends, 0);
+        assert!(matches!(
+            transition,
+            Some(HealthTransition::BecameUnhealthy)
+        ));
+        assert_eq!(
+            coordinator
+                .snapshot_inventory(&pools)
+                .summary()
+                .healthy_backends,
+            0
+        );
     }
 }

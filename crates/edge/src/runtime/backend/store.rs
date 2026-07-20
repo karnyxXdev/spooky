@@ -83,13 +83,10 @@ impl RuntimeBackendResolutionStore {
             return None;
         }
 
-        let previous_addrs = std::mem::replace(
-            &mut entry.resolution.resolved_addrs,
-            resolved_addrs.clone(),
-        );
+        let previous_addrs =
+            std::mem::replace(&mut entry.resolution.resolved_addrs, resolved_addrs.clone());
         entry.resolution.last_refresh_success_at = Some(refreshed_at);
-        entry.resolution.refresh_generation =
-            entry.resolution.refresh_generation.saturating_add(1);
+        entry.resolution.refresh_generation = entry.resolution.refresh_generation.saturating_add(1);
 
         let result = if previous_addrs != resolved_addrs {
             BackendRefreshResult {
@@ -146,7 +143,10 @@ mod tests {
             .get("https://backend.internal:8443")
             .expect("backend snapshot");
 
-        assert_eq!(backend.identity.backend_addr, "https://backend.internal:8443");
+        assert_eq!(
+            backend.identity.backend_addr,
+            "https://backend.internal:8443"
+        );
         assert!(backend.resolution.is_hostname());
     }
 
@@ -169,11 +169,10 @@ mod tests {
         assert!(matches!(
             mutation,
             BackendLifecycleMutation::ResolutionUpdated {
-                result:
-                    BackendRefreshResult {
-                        outcome: BackendRefreshOutcome::Updated { .. },
-                        ..
-                    },
+                result: BackendRefreshResult {
+                    outcome: BackendRefreshOutcome::Updated { .. },
+                    ..
+                },
                 ..
             }
         ));

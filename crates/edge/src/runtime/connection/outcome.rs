@@ -12,18 +12,16 @@ use spooky_lb::{
 
 use crate::{
     Metrics, OverloadShedReason, RouteOutcome,
-    runtime::{
-        backend::{
-            event::{
-                BackendHealthObservation, BackendHealthObservationOutcome,
-                BackendHealthObservationSource, BackendRequestFeedback,
-            },
-            lifecycle::{
-                apply_backend_health_observation, apply_backend_request_accounting,
-                apply_backend_request_feedback,
-            },
-            state::BackendIdentity,
+    runtime::backend::{
+        event::{
+            BackendHealthObservation, BackendHealthObservationOutcome,
+            BackendHealthObservationSource, BackendRequestFeedback,
         },
+        lifecycle::{
+            apply_backend_health_observation, apply_backend_request_accounting,
+            apply_backend_request_feedback,
+        },
+        state::BackendIdentity,
     },
 };
 
@@ -483,8 +481,12 @@ pub(crate) fn observe_classified_backend_failure(
         classified,
     } = input;
 
-    let reason =
-        record_classified_backend_failure_metrics(metrics_phase, backend_addr, metrics, classified)?;
+    let reason = record_classified_backend_failure_metrics(
+        metrics_phase,
+        backend_addr,
+        metrics,
+        classified,
+    )?;
     let feedback = BackendRequestFeedback::failure(
         BackendIdentity::new(backend_addr),
         Duration::ZERO,

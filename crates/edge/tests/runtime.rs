@@ -74,25 +74,23 @@ fn hostname_resolution_update_canonicalizes_and_tracks_generation() {
         .expect("update");
 
     match mutation {
-        BackendLifecycleMutation::ResolutionUpdated { result, .. } => {
-            match result.outcome {
-                BackendRefreshOutcome::Updated {
+        BackendLifecycleMutation::ResolutionUpdated { result, .. } => match result.outcome {
+            BackendRefreshOutcome::Updated {
+                current_addrs,
+                refresh_generation,
+                ..
+            } => {
+                assert_eq!(refresh_generation, 1);
+                assert_eq!(
                     current_addrs,
-                    refresh_generation,
-                    ..
-                } => {
-                    assert_eq!(refresh_generation, 1);
-                    assert_eq!(
-                        current_addrs,
-                        vec![
-                            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443),
-                            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 443)
-                        ]
-                    );
-                }
-                other => panic!("expected updated refresh outcome, got {other:?}"),
+                    vec![
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443),
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 443)
+                    ]
+                );
             }
-        }
+            other => panic!("expected updated refresh outcome, got {other:?}"),
+        },
         other => panic!("expected resolution update mutation, got {other:?}"),
     }
 }

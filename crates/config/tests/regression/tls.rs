@@ -1,7 +1,9 @@
 //! Upstream TLS lowering: effective-TLS resolution and validation.
 
-use spooky_config::config::{ForwardedHeaderPolicyMode, UpstreamHostPolicyMode, UpstreamTls};
-use spooky_config::runtime::{RuntimeBackendTransportKind, RuntimeConfig};
+use spooky_config::{
+    config::{ForwardedHeaderPolicyMode, UpstreamHostPolicyMode, UpstreamTls},
+    runtime::{RuntimeBackendTransportKind, RuntimeConfig},
+};
 
 use crate::common::sample_config;
 

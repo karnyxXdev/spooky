@@ -3,9 +3,8 @@ use std::sync::Arc;
 use spooky_config::runtime::RuntimeConfig;
 use spooky_errors::ProxyError;
 
-use crate::runtime::{bundle::RuntimeBundleHandle, shared_state::SharedRuntimeState};
-
 use super::{QUICListener, runtime_state::ControlPlaneBootstrap};
+use crate::runtime::{bundle::RuntimeBundleHandle, shared_state::SharedRuntimeState};
 
 impl QUICListener {
     pub fn spawn_control_plane_tasks(

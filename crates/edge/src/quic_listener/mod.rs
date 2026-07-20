@@ -111,7 +111,7 @@ mod startup;
 mod tls_runtime;
 mod token_bucket;
 mod validation;
-mod workers;
+pub mod workers;
 
 pub use async_runtime::configure_async_runtime;
 pub(in crate::quic_listener) use async_runtime::{

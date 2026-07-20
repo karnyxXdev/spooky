@@ -2,10 +2,12 @@
 
 use std::time::Duration;
 
-use spooky_config::config::{
-    ExternalAuth, ExternalAuthFailureMode, JwtAuth, ScopedRateLimit, ScopedRateLimitScope,
+use spooky_config::{
+    config::{
+        ExternalAuth, ExternalAuthFailureMode, JwtAuth, ScopedRateLimit, ScopedRateLimitScope,
+    },
+    runtime::{RuntimeConfig, RuntimeExternalAuth},
 };
-use spooky_config::runtime::{RuntimeConfig, RuntimeExternalAuth};
 
 use crate::common::sample_config;
 

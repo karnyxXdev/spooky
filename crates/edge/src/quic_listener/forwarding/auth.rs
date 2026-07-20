@@ -1,5 +1,4 @@
-use std::convert::Infallible;
-use std::sync::OnceLock;
+use std::{convert::Infallible, sync::OnceLock};
 
 use http_body_util::Full;
 use hyper_rustls::HttpsConnectorBuilder;

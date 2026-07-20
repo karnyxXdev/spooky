@@ -131,7 +131,7 @@ use forwarding::{ForwardingExecutionCtx, ForwardingSharedCtx, StreamProgressConf
 use health_check::classify_active_health_check_response;
 pub(in crate::quic_listener) use protocol::{
     can_poll_upstream_result, collect_h3_trailers, is_bodyless_request_mode, is_connect_method,
-    is_head_method, is_tunnel_mode, is_tunnel_response, is_websocket_upgrade_request,
+    is_head_method, is_tunnel_mode, is_tunnel_response,
 };
 #[cfg(test)]
 pub(in crate::quic_listener) use protocol::{
@@ -142,7 +142,7 @@ pub use runtime_state::ListenerWorkerRuntimeState;
 pub(crate) use token_bucket::TokenBucket;
 use validation::{
     RequestBufferError, extract_header_value, generated_span_id, generated_trace_id,
-    parse_traceparent, validate_http_request, validate_request_headers,
+    parse_traceparent, validate_request_headers,
 };
 pub use workers::{ListenerWorkerGroupConfig, spawn_listener_worker_group};
 use x509_parser::{extensions::GeneralName, parse_x509_certificate};

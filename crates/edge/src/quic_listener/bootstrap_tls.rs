@@ -38,7 +38,7 @@ use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
     runtime::{ListenerRuntimeConfig, RuntimeUpstreamPolicy},
 };
-use spooky_errors::{BridgeError, ProxyError, classify_upstream_proxy_error};
+use spooky_errors::{ProxyError, classify_upstream_proxy_error};
 use spooky_lb::upstream_pool::UpstreamPool;
 
 pub(super) use super::bootstrap::{BootstrapConnectionState, BootstrapStartupState};
@@ -49,12 +49,13 @@ use super::{
         evaluate_forwarding_pre_admission_policy,
     },
     bootstrap::{
+        BootstrapRequestIntake, bootstrap_error_response, prepare_bootstrap_request_intake,
+    },
+    bootstrap::{
         PreparedBootstrapListenerStartup, prepare_bootstrap_listener_startup,
         spawn_bootstrap_listener_task,
     },
-    is_head_method, is_websocket_upgrade_request,
     runtime_endpoint::RuntimeConnectionSlotGuard,
-    validate_http_request,
 };
 use crate::{
     REQUEST_ID_COUNTER,
@@ -233,7 +234,9 @@ impl Drop for BootstrapStreamingBody {
     }
 }
 
-pub(super) fn boxed_full(body: Bytes) -> http_body_util::combinators::BoxBody<Bytes, Infallible> {
+pub(in crate::quic_listener) fn boxed_full(
+    body: Bytes,
+) -> http_body_util::combinators::BoxBody<Bytes, Infallible> {
     Full::new(body).map_err(|never| match never {}).boxed()
 }
 
@@ -497,55 +500,28 @@ impl QUICListener {
 
                             Box::pin(async move {
                                 let request_start = Instant::now();
-                                let is_websocket_upgrade =
-                                    is_websocket_upgrade_request(&req, use_h2);
-                                let client_upgrade = if is_websocket_upgrade {
-                                    Some(upgrade::on(&mut req))
-                                } else {
-                                    None
+                                let BootstrapRequestIntake {
+                                    method,
+                                    path,
+                                    authority,
+                                    content_length,
+                                    suppress_downstream_body,
+                                    is_websocket_upgrade,
+                                    client_upgrade,
+                                } = match prepare_bootstrap_request_intake(
+                                    &mut req,
+                                    use_h2,
+                                    resilience.as_ref(),
+                                    metrics.as_ref(),
+                                    &alt,
+                                    request_start,
+                                ) {
+                                    Ok(intake) => intake,
+                                    Err(response) => return Ok(response),
                                 };
-
-                                let request = match validate_http_request(&req, &resilience) {
-                                    Ok(request) => request,
-                                    Err((status, body, is_policy)) => {
-                                        metrics.inc_request_validation_reject();
-                                        if is_policy {
-                                            metrics.inc_policy_denied();
-                                        }
-                                        let _ = observe_proxy_error_outcome(
-                                            metrics.as_ref(),
-                                            OutcomeRouteTarget::UNROUTED,
-                                            None,
-                                            request_start.elapsed(),
-                                            Some(status),
-                                            &ProxyError::Bridge(BridgeError::InvalidHeader),
-                                            None,
-                                        );
-                                        return Ok(Response::builder()
-                                            .status(status)
-                                            .header("alt-svc", &alt)
-                                            .body(boxed_full(Bytes::copy_from_slice(body)))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(boxed_full(Bytes::new()))
-                                            }));
-                                    }
-                                };
-                                let method = request.method;
-                                let path = request.path;
-                                let authority = request.authority;
-                                let content_length = request.content_length;
-                                let suppress_downstream_body = is_head_method(&method);
 
                                 let bootstrap_error = |status: StatusCode, body: &'static [u8]| {
-                                    Ok(Response::builder()
-                                        .status(status)
-                                        .header("alt-svc", &alt)
-                                        .body(boxed_full(Bytes::from_static(body)))
-                                        .unwrap_or_else(|_| {
-                                            Response::new(boxed_full(Bytes::from_static(
-                                                b"error\n",
-                                            )))
-                                        }))
+                                    Ok(bootstrap_error_response(&alt, status, body))
                                 };
 
                                 let lb_header_lookup = |name: &str| {

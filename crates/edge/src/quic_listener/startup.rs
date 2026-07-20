@@ -414,7 +414,9 @@ impl QUICListener {
         debug!("Listening on {}", local_addr);
 
         let listener_label = Self::listener_label(&config);
-        let listener_tls_store = Arc::clone(&shared_state.listener_tls_store);
+        let shared_services = shared_state.shared_services();
+        let generation_state = shared_state.generation_state();
+        let listener_tls_store = Arc::clone(&shared_services.listener_tls_store);
         let tls_reload_generation =
             listener_tls_store
                 .generation(&listener_label)
@@ -450,18 +452,18 @@ impl QUICListener {
             tls_reload_generation,
             quic_config,
             h3_config,
-            transport_pool: Arc::clone(&shared_state.transport_pool),
-            backend_endpoints: Arc::clone(&shared_state.backend_endpoints),
-            backend_resolution_store: Arc::clone(&shared_state.backend_resolution_store),
-            backend_dns_resolver: shared_state.backend_dns_resolver.clone(),
-            upstream_policies: Arc::clone(&shared_state.upstream_policies),
-            upstream_pools: shared_state.upstream_pools.clone(),
-            upstream_inflight: shared_state.upstream_inflight.clone(),
-            global_inflight: Arc::clone(&shared_state.global_inflight),
-            routing_index: Arc::clone(&shared_state.routing_index),
-            metrics: Arc::clone(&shared_state.metrics),
-            resilience: Arc::clone(&shared_state.resilience),
-            watchdog: Arc::clone(&shared_state.watchdog),
+            transport_pool: Arc::clone(&shared_services.transport_pool),
+            backend_endpoints: Arc::clone(&generation_state.backend_endpoints),
+            backend_resolution_store: Arc::clone(&shared_services.backend_resolution_store),
+            backend_dns_resolver: shared_services.backend_dns_resolver.clone(),
+            upstream_policies: Arc::clone(&generation_state.upstream_policies),
+            upstream_pools: generation_state.upstream_pools.clone(),
+            upstream_inflight: generation_state.upstream_inflight.clone(),
+            global_inflight: Arc::clone(&generation_state.global_inflight),
+            routing_index: Arc::clone(&generation_state.routing_index),
+            metrics: Arc::clone(&shared_services.metrics),
+            resilience: Arc::clone(&generation_state.resilience),
+            watchdog: Arc::clone(&shared_services.watchdog),
             draining: false,
             drain_start: None,
             watchdog_worker_drained: false,

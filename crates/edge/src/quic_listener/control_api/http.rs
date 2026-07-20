@@ -52,8 +52,10 @@ impl QUICListener {
             ProxyError::Transport("no effective listeners configured".to_string())
         })?;
         let primary_listener_label = Self::listener_label(&listener_config);
+        let shared = shared_state.shared_services();
+        let generation = shared_state.generation_state();
         if startup_endpoint.enabled
-            && shared_state
+            && shared
                 .listener_tls_store
                 .bootstrap_server_config(&primary_listener_label)
                 .is_none()
@@ -70,12 +72,12 @@ impl QUICListener {
         }
         let state = ControlApiState {
             control_api: endpoint.clone(),
-            metrics: Arc::clone(&shared_state.metrics),
-            resilience: Arc::clone(&shared_state.resilience),
-            watchdog: Arc::clone(&shared_state.watchdog),
-            upstream_pools: shared_state.upstream_pools.clone(),
-            listener_runtime_configs: Arc::clone(&shared_state.listener_runtime_configs),
-            listener_tls_store: Arc::clone(&shared_state.listener_tls_store),
+            metrics: Arc::clone(&shared.metrics),
+            resilience: Arc::clone(&generation.resilience),
+            watchdog: Arc::clone(&shared.watchdog),
+            upstream_pools: generation.upstream_pools.clone(),
+            listener_runtime_configs: Arc::clone(&generation.listener_runtime_configs),
+            listener_tls_store: Arc::clone(&shared.listener_tls_store),
             primary_listener_label,
             expected_workers: worker_count.max(1),
             started_at: Instant::now(),
@@ -117,7 +119,7 @@ impl QUICListener {
         spawn_supervised_async_task(
             &handle,
             "control-api-endpoint",
-            Some(Arc::clone(&shared_state.metrics)),
+            Some(Arc::clone(&shared.metrics)),
             async move {
                 let mut listener_binding = initial_binding;
 
@@ -553,15 +555,17 @@ impl QUICListener {
         };
         let runtime = runtime_bundle_handle.current();
         let shared_state = &runtime.shared_state;
+        let shared = shared_state.shared_services();
+        let generation = shared_state.generation_state();
 
         if req.method() == Method::GET && path == paths.health_path.as_str() {
             let response = json!({
                 "status": "ok",
                 "uptime_ms": state.started_at.elapsed().as_millis() as u64,
                 "watchdog": {
-                    "enabled": shared_state.watchdog.enabled(),
-                    "degraded": shared_state.watchdog.is_degraded(),
-                    "restart_requested": shared_state.watchdog.restart_requested(),
+                    "enabled": shared.watchdog.enabled(),
+                    "degraded": shared.watchdog.is_degraded(),
+                    "restart_requested": shared.watchdog.restart_requested(),
                 },
             });
             return Self::json_response(StatusCode::OK, response);
@@ -569,7 +573,7 @@ impl QUICListener {
 
         if req.method() == Method::GET && path == paths.ready_path.as_str() {
             let (healthy_backends, total_backends) = state.snapshot_backend_health();
-            let restart_requested = shared_state.watchdog.restart_requested();
+            let restart_requested = shared.watchdog.restart_requested();
             let ready = !restart_requested && (total_backends == 0 || healthy_backends > 0);
             let response = json!({
                 "ready": ready,
@@ -597,7 +601,7 @@ impl QUICListener {
                 );
             }
             let (healthy_backends, total_backends) = state.snapshot_backend_health();
-            let tls_listeners = shared_state
+            let tls_listeners = shared
                 .listener_tls_store
                 .snapshot()
                 .into_iter()
@@ -611,7 +615,7 @@ impl QUICListener {
                             "sni_names": inventory.sni_identities.keys().cloned().collect::<Vec<_>>(),
                             "client_auth_enabled": inventory.listener_tls.client_auth.enabled,
                             "require_client_cert": inventory.listener_tls.client_auth.require_client_cert,
-                            "generation": shared_state.listener_tls_store.generation(&listener).unwrap_or(0),
+                            "generation": shared.listener_tls_store.generation(&listener).unwrap_or(0),
                         }),
                     )
                 })
@@ -622,28 +626,28 @@ impl QUICListener {
                     "expected": state.expected_workers,
                 },
                 "watchdog": {
-                    "enabled": shared_state.watchdog.enabled(),
-                    "degraded": shared_state.watchdog.is_degraded(),
-                    "restart_requested": shared_state.watchdog.restart_requested(),
-                    "restart_reason": shared_state.watchdog.restart_reason(),
-                    "restart_requested_at_ms": shared_state.watchdog.restart_requested_at_ms(),
+                    "enabled": shared.watchdog.enabled(),
+                    "degraded": shared.watchdog.is_degraded(),
+                    "restart_requested": shared.watchdog.restart_requested(),
+                    "restart_reason": shared.watchdog.restart_reason(),
+                    "restart_requested_at_ms": shared.watchdog.restart_requested_at_ms(),
                 },
                 "adaptive_admission": {
-                    "enabled": shared_state.resilience.adaptive_admission.enabled(),
-                    "current_limit": shared_state.resilience.adaptive_admission.current_limit(),
-                    "inflight_percent": shared_state.resilience.adaptive_admission.inflight_percent(),
+                    "enabled": generation.resilience.adaptive_admission.enabled(),
+                    "current_limit": generation.resilience.adaptive_admission.current_limit(),
+                    "inflight_percent": generation.resilience.adaptive_admission.inflight_percent(),
                 },
                 "backends": {
                     "healthy": healthy_backends,
                     "total": total_backends,
                 },
                 "metrics": {
-                    "requests_total": shared_state.metrics.requests_total.load(Ordering::Relaxed),
-                    "requests_success": shared_state.metrics.requests_success.load(Ordering::Relaxed),
-                    "requests_failure": shared_state.metrics.requests_failure.load(Ordering::Relaxed),
-                    "active_connections": shared_state.metrics.active_connections.load(Ordering::Relaxed),
-                    "backend_timeouts": shared_state.metrics.backend_timeouts.load(Ordering::Relaxed),
-                    "backend_errors": shared_state.metrics.backend_errors.load(Ordering::Relaxed),
+                    "requests_total": shared.metrics.requests_total.load(Ordering::Relaxed),
+                    "requests_success": shared.metrics.requests_success.load(Ordering::Relaxed),
+                    "requests_failure": shared.metrics.requests_failure.load(Ordering::Relaxed),
+                    "active_connections": shared.metrics.active_connections.load(Ordering::Relaxed),
+                    "backend_timeouts": shared.metrics.backend_timeouts.load(Ordering::Relaxed),
+                    "backend_errors": shared.metrics.backend_errors.load(Ordering::Relaxed),
                 },
                 "tls": {
                     "listeners": tls_listeners,
@@ -672,9 +676,9 @@ impl QUICListener {
             }
 
             return Self::reload_listener_certs(
-                shared_state.listener_runtime_configs.as_ref(),
-                shared_state.listener_tls_store.as_ref(),
-                shared_state.metrics.as_ref(),
+                generation.listener_runtime_configs.as_ref(),
+                shared.listener_tls_store.as_ref(),
+                shared.metrics.as_ref(),
             );
         }
 
@@ -837,7 +841,7 @@ impl QUICListener {
                     }),
                 );
             }
-            if !shared_state.watchdog.enabled() {
+            if !shared.watchdog.enabled() {
                 return Self::json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     json!({
@@ -847,7 +851,7 @@ impl QUICListener {
                 );
             }
 
-            let accepted = shared_state.watchdog.request_restart("admin_runtime_api");
+            let accepted = shared.watchdog.request_restart("admin_runtime_api");
             return Self::json_response(
                 if accepted {
                     StatusCode::ACCEPTED
@@ -856,7 +860,7 @@ impl QUICListener {
                 },
                 json!({
                     "accepted": accepted,
-                    "restart_requested": shared_state.watchdog.restart_requested(),
+                    "restart_requested": shared.watchdog.restart_requested(),
                     "reason": if accepted { "admin_runtime_api" } else { "restart pending or cooldown active" },
                 }),
             );

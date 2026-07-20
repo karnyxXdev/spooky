@@ -79,7 +79,13 @@ impl ControlApiState {
 
     pub(super) fn current_listener_tls_store(&self) -> Arc<ListenerTlsReloadStore> {
         self.current_runtime()
-            .map(|runtime| runtime.shared_state.listener_tls_store.clone())
+            .map(|runtime| {
+                runtime
+                    .shared_state
+                    .shared_services()
+                    .listener_tls_store
+                    .clone()
+            })
             .unwrap_or_else(|| Arc::clone(&self.listener_tls_store))
     }
 
@@ -87,13 +93,19 @@ impl ControlApiState {
         &self,
     ) -> Arc<HashMap<String, ListenerRuntimeConfig>> {
         self.current_runtime()
-            .map(|runtime| runtime.shared_state.listener_runtime_configs.clone())
+            .map(|runtime| {
+                runtime
+                    .shared_state
+                    .generation_state()
+                    .listener_runtime_configs
+                    .clone()
+            })
             .unwrap_or_else(|| Arc::clone(&self.listener_runtime_configs))
     }
 
     pub(super) fn current_metrics(&self) -> Arc<Metrics> {
         self.current_runtime()
-            .map(|runtime| runtime.shared_state.metrics.clone())
+            .map(|runtime| runtime.shared_state.shared_services().metrics.clone())
             .unwrap_or_else(|| Arc::clone(&self.metrics))
     }
 
@@ -112,7 +124,12 @@ impl ControlApiState {
         if let Some(runtime) = self.current_runtime() {
             let mut healthy = 0usize;
             let mut total = 0usize;
-            for pool in runtime.shared_state.upstream_pools.values() {
+            for pool in runtime
+                .shared_state
+                .generation_state()
+                .upstream_pools
+                .values()
+            {
                 let guard = match pool.read() {
                     Ok(guard) => guard,
                     Err(_) => continue,

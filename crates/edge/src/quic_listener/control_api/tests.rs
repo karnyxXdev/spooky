@@ -98,6 +98,8 @@ fn control_api_state_with_runtime_bundle(
 ) -> ControlApiState {
     let startup_bundle = runtime_bundle_from_config("startup.yaml", startup);
     let reloaded_bundle = runtime_bundle_from_config("reloaded.yaml", reloaded);
+    let startup_shared = startup_bundle.shared_state.shared_services();
+    let startup_generation = startup_bundle.shared_state.generation_state();
     let listener_config = startup_bundle
         .runtime_config
         .primary_listener_runtime_config()
@@ -109,12 +111,12 @@ fn control_api_state_with_runtime_bundle(
             .observability
             .control_api
             .clone(),
-        metrics: Arc::clone(&startup_bundle.shared_state.metrics),
-        resilience: Arc::clone(&startup_bundle.shared_state.resilience),
-        watchdog: Arc::clone(&startup_bundle.shared_state.watchdog),
-        upstream_pools: startup_bundle.shared_state.upstream_pools.clone(),
-        listener_runtime_configs: Arc::clone(&startup_bundle.shared_state.listener_runtime_configs),
-        listener_tls_store: Arc::clone(&startup_bundle.shared_state.listener_tls_store),
+        metrics: Arc::clone(&startup_shared.metrics),
+        resilience: Arc::clone(&startup_generation.resilience),
+        watchdog: Arc::clone(&startup_shared.watchdog),
+        upstream_pools: startup_generation.upstream_pools.clone(),
+        listener_runtime_configs: Arc::clone(&startup_generation.listener_runtime_configs),
+        listener_tls_store: Arc::clone(&startup_shared.listener_tls_store),
         primary_listener_label: QUICListener::listener_label(&listener_config),
         expected_workers: 1,
         started_at: Instant::now(),
@@ -125,6 +127,8 @@ fn control_api_state_with_runtime_bundle(
 fn runtime_bundle_control_api_state(
     bundle: RuntimeBundle,
 ) -> (ControlApiState, Arc<RuntimeBundleHandle>) {
+    let bundle_shared = bundle.shared_state.shared_services();
+    let bundle_generation = bundle.shared_state.generation_state();
     let listener_config = bundle
         .runtime_config
         .primary_listener_runtime_config()
@@ -132,12 +136,12 @@ fn runtime_bundle_control_api_state(
     let runtime_handle = Arc::new(RuntimeBundleHandle::new(bundle.clone()));
     let state = ControlApiState {
         control_api: bundle.runtime_config.observability.control_api.clone(),
-        metrics: Arc::clone(&bundle.shared_state.metrics),
-        resilience: Arc::clone(&bundle.shared_state.resilience),
-        watchdog: Arc::clone(&bundle.shared_state.watchdog),
-        upstream_pools: bundle.shared_state.upstream_pools.clone(),
-        listener_runtime_configs: Arc::clone(&bundle.shared_state.listener_runtime_configs),
-        listener_tls_store: Arc::clone(&bundle.shared_state.listener_tls_store),
+        metrics: Arc::clone(&bundle_shared.metrics),
+        resilience: Arc::clone(&bundle_generation.resilience),
+        watchdog: Arc::clone(&bundle_shared.watchdog),
+        upstream_pools: bundle_generation.upstream_pools.clone(),
+        listener_runtime_configs: Arc::clone(&bundle_generation.listener_runtime_configs),
+        listener_tls_store: Arc::clone(&bundle_shared.listener_tls_store),
         primary_listener_label: QUICListener::listener_label(&listener_config),
         expected_workers: 1,
         started_at: Instant::now(),
@@ -525,14 +529,21 @@ async fn runtime_bundle_cert_reload_ignores_unrelated_config_drift_and_bundle_sw
         runtime_handle
             .current()
             .shared_state
+            .generation_state()
             .listener_runtime_configs
             .as_ref(),
         runtime_handle
             .current()
             .shared_state
+            .shared_services()
             .listener_tls_store
             .as_ref(),
-        runtime_handle.current().shared_state.metrics.as_ref(),
+        runtime_handle
+            .current()
+            .shared_state
+            .shared_services()
+            .metrics
+            .as_ref(),
     );
     assert_eq!(response.status(), StatusCode::ACCEPTED);
 
@@ -554,6 +565,7 @@ async fn runtime_bundle_cert_reload_ignores_unrelated_config_drift_and_bundle_sw
     assert!(
         current_runtime
             .shared_state
+            .shared_services()
             .listener_tls_store
             .generation(&state.primary_listener_label)
             .unwrap_or(0)
@@ -594,14 +606,26 @@ async fn reload_listener_certs_is_atomic_when_any_listener_reload_fails() {
     ];
 
     let bundle = runtime_bundle_from_config("current.yaml", &config);
-    let generations_before = bundle.shared_state.listener_tls_store.generations();
+    let generations_before = bundle
+        .shared_state
+        .shared_services()
+        .listener_tls_store
+        .generations();
 
     std::fs::write(&cert2, "not a valid certificate").expect("corrupt cert");
 
     let response = QUICListener::reload_listener_certs(
-        bundle.shared_state.listener_runtime_configs.as_ref(),
-        bundle.shared_state.listener_tls_store.as_ref(),
-        bundle.shared_state.metrics.as_ref(),
+        bundle
+            .shared_state
+            .generation_state()
+            .listener_runtime_configs
+            .as_ref(),
+        bundle
+            .shared_state
+            .shared_services()
+            .listener_tls_store
+            .as_ref(),
+        bundle.shared_state.shared_services().metrics.as_ref(),
     );
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -615,7 +639,11 @@ async fn reload_listener_certs_is_atomic_when_any_listener_reload_fails() {
     assert_eq!(payload["reloaded"], serde_json::Value::Bool(false));
 
     assert_eq!(
-        bundle.shared_state.listener_tls_store.generations(),
+        bundle
+            .shared_state
+            .shared_services()
+            .listener_tls_store
+            .generations(),
         generations_before
     );
 }

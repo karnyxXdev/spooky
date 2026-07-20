@@ -5,9 +5,15 @@ impl QUICListener {
         current: &RuntimeBundle,
         next: &RuntimeBundle,
     ) -> Option<String> {
-        for label in current.shared_state.listener_runtime_configs.keys() {
+        for label in current
+            .shared_state
+            .generation_state()
+            .listener_runtime_configs
+            .keys()
+        {
             if !next
                 .shared_state
+                .generation_state()
                 .listener_runtime_configs
                 .contains_key(label)
             {
@@ -19,9 +25,15 @@ impl QUICListener {
         }
 
         let worker_count = next.runtime_config.performance.worker_threads.max(1);
-        for (label, listener_config) in next.shared_state.listener_runtime_configs.iter() {
+        for (label, listener_config) in next
+            .shared_state
+            .generation_state()
+            .listener_runtime_configs
+            .iter()
+        {
             if current
                 .shared_state
+                .generation_state()
                 .listener_runtime_configs
                 .contains_key(label)
             {
@@ -73,6 +85,7 @@ impl QUICListener {
         let primary_listener_label = Self::listener_label(&listener_config);
         if next
             .shared_state
+            .shared_services()
             .listener_tls_store
             .bootstrap_server_config(&primary_listener_label)
             .is_none()

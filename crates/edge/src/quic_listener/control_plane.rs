@@ -39,9 +39,10 @@ impl QUICListener {
     ) -> Result<(), ProxyError> {
         Self::configure_expected_workers(bootstrap.shared_state, bootstrap.worker_count);
         Self::spawn_generation_background_tasks(&bootstrap);
+        let shared = bootstrap.shared_state.shared_services();
         Self::spawn_metrics_endpoint(
             bootstrap.runtime_config,
-            Arc::clone(&bootstrap.shared_state.metrics),
+            Arc::clone(&shared.metrics),
             bootstrap.runtime_bundle.clone(),
         )?;
         Self::spawn_control_api_endpoint(
@@ -59,29 +60,31 @@ impl QUICListener {
             bootstrap.shared_state,
         );
         let shared_state = bootstrap.shared_state;
-        let task_registry = Arc::clone(&shared_state.generation_tasks);
+        let shared = shared_state.shared_services();
+        let generation = shared_state.generation_state();
+        let task_registry = Arc::clone(&generation.generation_tasks);
         Self::spawn_backend_dns_refresh(
             bootstrap.runtime_config,
-            Arc::clone(&shared_state.transport_pool),
-            Arc::clone(&shared_state.backend_resolution_store),
-            shared_state.backend_dns_resolver.clone(),
-            Arc::clone(&shared_state.metrics),
+            Arc::clone(&shared.transport_pool),
+            Arc::clone(&shared.backend_resolution_store),
+            shared.backend_dns_resolver.clone(),
+            Arc::clone(&shared.metrics),
             Arc::clone(&task_registry),
         );
         Self::spawn_health_checks(
-            shared_state.upstream_pools.clone(),
-            Arc::clone(&shared_state.transport_pool),
-            Arc::clone(&shared_state.backend_endpoints),
-            Arc::clone(&shared_state.backend_health_checks),
-            Arc::clone(&shared_state.backend_resolution_store),
-            Arc::clone(&shared_state.metrics),
+            generation.upstream_pools.clone(),
+            Arc::clone(&shared.transport_pool),
+            Arc::clone(&generation.backend_endpoints),
+            Arc::clone(&generation.backend_health_checks),
+            Arc::clone(&shared.backend_resolution_store),
+            Arc::clone(&shared.metrics),
             Arc::clone(&task_registry),
         );
         Self::spawn_watchdog(
             bootstrap.runtime_config,
-            Arc::clone(&shared_state.metrics),
-            Arc::clone(&shared_state.resilience),
-            Arc::clone(&shared_state.watchdog),
+            Arc::clone(&shared.metrics),
+            Arc::clone(&generation.resilience),
+            Arc::clone(&shared.watchdog),
             task_registry,
         );
     }
@@ -106,6 +109,7 @@ impl QUICListener {
 
     fn configure_expected_workers(shared_state: &SharedRuntimeState, worker_count: usize) {
         shared_state
+            .shared_services()
             .watchdog
             .set_expected_workers(worker_count.max(1));
     }

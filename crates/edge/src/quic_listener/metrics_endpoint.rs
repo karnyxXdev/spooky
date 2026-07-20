@@ -236,7 +236,7 @@ impl QUICListener {
                 metrics_path: endpoint.path.clone(),
                 max_connections: endpoint.max_connections.max(1),
                 connection_timeout: Duration::from_millis(endpoint.connection_timeout_ms.max(1)),
-                metrics: runtime.shared_state.metrics.clone(),
+                metrics: runtime.shared_state.shared_services().metrics.clone(),
             };
         }
 

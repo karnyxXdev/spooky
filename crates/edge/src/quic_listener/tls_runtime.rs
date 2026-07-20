@@ -307,6 +307,7 @@ impl QUICListener {
         let runtime = runtime_bundle.current();
         let current_tls_generation = runtime
             .shared_state
+            .shared_services()
             .listener_tls_store
             .generation(&self.listener_label)
             .ok_or_else(|| {
@@ -328,20 +329,22 @@ impl QUICListener {
             )));
         };
 
+        let shared = runtime.shared_state.shared_services();
+        let generation = runtime.shared_state.generation_state();
         self.config = listener_config;
-        self.listener_tls_store = Arc::clone(&runtime.shared_state.listener_tls_store);
-        self.transport_pool = Arc::clone(&runtime.shared_state.transport_pool);
-        self.backend_endpoints = Arc::clone(&runtime.shared_state.backend_endpoints);
-        self.backend_resolution_store = Arc::clone(&runtime.shared_state.backend_resolution_store);
-        self.backend_dns_resolver = runtime.shared_state.backend_dns_resolver.clone();
-        self.upstream_policies = Arc::clone(&runtime.shared_state.upstream_policies);
-        self.upstream_pools = runtime.shared_state.upstream_pools.clone();
-        self.upstream_inflight = runtime.shared_state.upstream_inflight.clone();
-        self.global_inflight = Arc::clone(&runtime.shared_state.global_inflight);
-        self.routing_index = Arc::clone(&runtime.shared_state.routing_index);
-        self.metrics = Arc::clone(&runtime.shared_state.metrics);
-        self.resilience = Arc::clone(&runtime.shared_state.resilience);
-        self.watchdog = Arc::clone(&runtime.shared_state.watchdog);
+        self.listener_tls_store = Arc::clone(&shared.listener_tls_store);
+        self.transport_pool = Arc::clone(&shared.transport_pool);
+        self.backend_endpoints = Arc::clone(&generation.backend_endpoints);
+        self.backend_resolution_store = Arc::clone(&shared.backend_resolution_store);
+        self.backend_dns_resolver = shared.backend_dns_resolver.clone();
+        self.upstream_policies = Arc::clone(&generation.upstream_policies);
+        self.upstream_pools = generation.upstream_pools.clone();
+        self.upstream_inflight = generation.upstream_inflight.clone();
+        self.global_inflight = Arc::clone(&generation.global_inflight);
+        self.routing_index = Arc::clone(&generation.routing_index);
+        self.metrics = Arc::clone(&shared.metrics);
+        self.resilience = Arc::clone(&generation.resilience);
+        self.watchdog = Arc::clone(&shared.watchdog);
         let settings = Self::listener_runtime_settings(&self.config);
         self.backend_timeout = settings.backend_timeout;
         self.backend_body_idle_timeout = settings.backend_body_idle_timeout;

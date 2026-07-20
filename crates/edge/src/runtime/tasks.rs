@@ -158,7 +158,10 @@ mod tests {
             let _ = task_join.await;
             completed_flag.store(true, Ordering::Release);
         });
-        registry.register(RuntimeTaskRegistration::new(task_handle.clone(), completion_rx));
+        registry.register(RuntimeTaskRegistration::new(
+            task_handle.clone(),
+            completion_rx,
+        ));
         task_handle
     }
 

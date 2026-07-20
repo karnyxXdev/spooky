@@ -770,10 +770,7 @@ fn build_shared_state_separates_backend_identity_from_resolution_state() {
     let runtime =
         RuntimeConfig::from_config(&dns_resolution_test_config(cert, key)).expect("runtime");
     let shared = super::QUICListener::build_shared_state(&runtime).expect("shared state");
-    let snapshot = shared
-        .shared_services()
-        .backend_resolution_store
-        .snapshot();
+    let snapshot = shared.shared_services().backend_resolution_store.snapshot();
 
     let dns_backend = snapshot
         .get("backend.internal:8443")

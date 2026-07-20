@@ -93,7 +93,7 @@ impl RuntimeBundleHandle {
         }
     }
 
-    pub(crate) fn current(&self) -> Arc<RuntimeBundle> {
+    pub fn current(&self) -> Arc<RuntimeBundle> {
         self.inner
             .read()
             .map(|bundle| Arc::clone(&*bundle))

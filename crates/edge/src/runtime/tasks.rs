@@ -119,3 +119,75 @@ impl RuntimeTaskRegistration {
         Self { abort, completion }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+
+    use super::*;
+
+    struct CompletionSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for CompletionSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    fn spawn_registered_task(
+        registry: &RuntimeTaskRegistry,
+        completed: Arc<AtomicBool>,
+    ) -> AbortHandle {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _completion = CompletionSignal(Some(completion_tx));
+            future::pending::<()>().await;
+        });
+        let task_handle = task.abort_handle();
+        let task_join = task;
+        let completed_flag = Arc::clone(&completed);
+        tokio::spawn(async move {
+            let _ = task_join.await;
+            completed_flag.store(true, Ordering::Release);
+        });
+        registry.register(RuntimeTaskRegistration::new(task_handle.clone(), completion_rx));
+        task_handle
+    }
+
+    #[tokio::test]
+    async fn task_retirement_is_generation_scoped() {
+        let retired_generation = RuntimeTaskRegistry::new();
+        let active_generation = RuntimeTaskRegistry::new();
+
+        let retired_completed = Arc::new(AtomicBool::new(false));
+        let active_completed = Arc::new(AtomicBool::new(false));
+
+        let _retired_task =
+            spawn_registered_task(&retired_generation, Arc::clone(&retired_completed));
+        let active_task = spawn_registered_task(&active_generation, Arc::clone(&active_completed));
+
+        retired_generation.retire_generation(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            retired_completed.load(Ordering::Acquire),
+            "retired generation tasks should be aborted during retirement"
+        );
+        assert!(
+            !active_completed.load(Ordering::Acquire),
+            "active generation tasks should remain alive"
+        );
+
+        active_task.abort();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(active_completed.load(Ordering::Acquire));
+    }
+}

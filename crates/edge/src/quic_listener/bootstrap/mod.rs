@@ -1,3 +1,4 @@
+mod context;
 mod dispatch;
 mod intake;
 mod outcome;
@@ -7,6 +8,9 @@ mod startup;
 mod state;
 mod websocket;
 
+pub(in crate::quic_listener) use self::context::{
+    BootstrapDispatchCtx, BootstrapRequestCtx, BootstrapRuntimeCtx,
+};
 pub(in crate::quic_listener) use self::dispatch::{
     BootstrapDispatchInput, dispatch_bootstrap_upstream,
 };

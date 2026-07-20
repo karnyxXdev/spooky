@@ -1,9 +1,8 @@
 use std::{
-    collections::HashMap,
     convert::Infallible,
     net::SocketAddr,
     sync::{Arc, RwLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -27,10 +26,7 @@ use spooky_config::{
 use spooky_errors::ProxyError;
 use spooky_lb::upstream_pool::UpstreamPool;
 
-use crate::{
-    Metrics, resilience::runtime::RuntimeResilience, routing::index::RouteIndex,
-    runtime::connection::outcome::AdmissionOutcomeClass,
-};
+use crate::runtime::connection::outcome::AdmissionOutcomeClass;
 
 use super::{
     super::{
@@ -41,7 +37,7 @@ use super::{
         },
         forwarding::BootstrapResolutionInput,
     },
-    BootstrapStreamingBody, bootstrap_error_response, boxed_full,
+    BootstrapRequestCtx, BootstrapStreamingBody, bootstrap_error_response, boxed_full,
     intake::BootstrapRequestIntake,
     outcome::{observe_bootstrap_admission_outcome, observe_bootstrap_request_proxy_error},
 };
@@ -57,25 +53,17 @@ pub(in crate::quic_listener) struct BootstrapPreparedRoute {
 
 pub(in crate::quic_listener) struct BootstrapPolicyEvaluationInput<'a> {
     pub(in crate::quic_listener) intake: &'a BootstrapRequestIntake,
-    pub(in crate::quic_listener) peer: SocketAddr,
     pub(in crate::quic_listener) headers: &'a HeaderMap,
-    pub(in crate::quic_listener) routing_index: &'a RouteIndex,
-    pub(in crate::quic_listener) upstream_pools: &'a HashMap<String, Arc<RwLock<UpstreamPool>>>,
-    pub(in crate::quic_listener) upstream_policies: &'a HashMap<String, RuntimeUpstreamPolicy>,
-    pub(in crate::quic_listener) backend_endpoints: &'a HashMap<String, BackendEndpoint>,
-    pub(in crate::quic_listener) metrics: &'a Metrics,
-    pub(in crate::quic_listener) resilience: &'a RuntimeResilience,
-    pub(in crate::quic_listener) request_start: Instant,
-    pub(in crate::quic_listener) alt_svc: &'a str,
+    pub(in crate::quic_listener) request_ctx: BootstrapRequestCtx<'a>,
 }
 
 pub(in crate::quic_listener) struct BootstrapBuildRequestInput<'a> {
     pub(in crate::quic_listener) request: Request<Incoming>,
     pub(in crate::quic_listener) intake: &'a BootstrapRequestIntake,
     pub(in crate::quic_listener) prepared_route: &'a BootstrapPreparedRoute,
+    pub(in crate::quic_listener) request_ctx: BootstrapRequestCtx<'a>,
     pub(in crate::quic_listener) request_id: u64,
     pub(in crate::quic_listener) traceparent: Option<&'a str>,
-    pub(in crate::quic_listener) peer: SocketAddr,
 }
 
 fn bootstrap_bridge_headers(headers: &HeaderMap) -> Vec<quiche::h3::Header> {
@@ -103,9 +91,9 @@ fn bootstrap_request_build_input<'a>(
     headers: &'a [quiche::h3::Header],
     body: BoxBody<Bytes, Infallible>,
     content_length: Option<usize>,
+    request_ctx: BootstrapRequestCtx<'a>,
     request_id: u64,
     traceparent: Option<&'a str>,
-    peer: SocketAddr,
 ) -> RequestBuildInput<'a, BoxBody<Bytes, Infallible>> {
     RequestBuildInput {
         method: &intake.method,
@@ -121,7 +109,9 @@ fn bootstrap_request_build_input<'a>(
             request_id,
             traceparent,
         },
-        forwarded: RequestForwardedContext { client_addr: peer },
+        forwarded: RequestForwardedContext {
+            client_addr: request_ctx.peer,
+        },
     }
 }
 
@@ -167,52 +157,67 @@ pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
         path: &input.intake.path,
         authority: input.intake.authority.as_deref(),
         header_lookup: Some(&lb_header_lookup),
-        routing_index: input.routing_index,
-        upstream_pools: input.upstream_pools,
-        upstream_policies: input.upstream_policies,
-        metrics: input.metrics,
+        routing_index: &input.request_ctx.runtime.routing_index,
+        upstream_pools: &input.request_ctx.runtime.upstream_pools,
+        upstream_policies: &input.request_ctx.runtime.upstream_policies,
+        metrics: input.request_ctx.runtime.metrics.as_ref(),
         elapsed: Duration::ZERO,
     }) {
         Ok(value) => value,
         Err(err) => {
             let (status, body) = QUICListener::bootstrap_route_resolution_error_response(&err);
-            return Err(bootstrap_error_response(input.alt_svc, status, body));
+            return Err(bootstrap_error_response(
+                &input.request_ctx.runtime.alt_svc,
+                status,
+                body,
+            ));
         }
     };
 
     let admission = evaluate_forwarding_pre_admission_policy(
         &resolved.upstream_policy,
         Some(&lb_header_lookup),
-        &input.resilience.brownout,
-        input.resilience.adaptive_admission.inflight_percent(),
+        &input.request_ctx.runtime.resilience.brownout,
+        input
+            .request_ctx
+            .runtime
+            .resilience
+            .adaptive_admission
+            .inflight_percent(),
         &resolved.upstream_name,
-        input.resilience.shed_retry_after_seconds,
-        &input.resilience.scoped_rate_limits,
+        input
+            .request_ctx
+            .runtime
+            .resilience
+            .shed_retry_after_seconds,
+        &input.request_ctx.runtime.resilience.scoped_rate_limits,
         |rule| {
             resolve_scoped_rate_limit_key_for_bootstrap(
                 rule,
                 &resolved.upstream_name,
                 input.intake,
-                input.peer,
+                input.request_ctx.peer,
                 &lb_header_lookup,
             )
         },
     );
     input
+        .request_ctx
+        .runtime
         .metrics
-        .set_brownout_active(input.resilience.brownout.is_active());
+        .set_brownout_active(input.request_ctx.runtime.resilience.brownout.is_active());
     let rejection_response = admission_rejection_response(&admission);
 
     match admission {
         AdmissionPolicyDecision::AdmitReady => {}
         AdmissionPolicyDecision::Unauthorized(_) => {
-            input.metrics.inc_policy_denied();
+            input.request_ctx.runtime.metrics.inc_policy_denied();
             observe_bootstrap_admission_outcome(
-                input.metrics,
+                input.request_ctx.runtime.metrics.as_ref(),
                 &resolved.upstream_name,
                 &resolved.backend_addr,
                 resolved.backend_index,
-                input.request_start,
+                input.request_ctx.request_start,
                 StatusCode::UNAUTHORIZED,
                 AdmissionOutcomeClass::AuthDenied,
             );
@@ -225,30 +230,34 @@ pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
                     "Bootstrap request route={} missing admission rejection response for unauthorized decision",
                     resolved.upstream_name
                 );
-                return Err(internal_proxy_error_response(input.alt_svc));
+                return Err(internal_proxy_error_response(
+                    &input.request_ctx.runtime.alt_svc,
+                ));
             };
             let Some(challenge) = response.www_authenticate else {
                 warn!(
                     "Bootstrap request route={} missing auth challenge in admission rejection response",
                     resolved.upstream_name
                 );
-                return Err(internal_proxy_error_response(input.alt_svc));
+                return Err(internal_proxy_error_response(
+                    &input.request_ctx.runtime.alt_svc,
+                ));
             };
             return Err(Response::builder()
                 .status(response.status)
-                .header("alt-svc", input.alt_svc)
+                .header("alt-svc", &input.request_ctx.runtime.alt_svc)
                 .header("www-authenticate", challenge)
                 .body(boxed_full(Bytes::from_static(response.body)))
                 .unwrap_or_else(|_| Response::new(boxed_full(Bytes::from_static(b"error\n")))));
         }
         AdmissionPolicyDecision::RateLimited(decision) => {
-            input.metrics.inc_request_rate_limited();
+            input.request_ctx.runtime.metrics.inc_request_rate_limited();
             observe_bootstrap_admission_outcome(
-                input.metrics,
+                input.request_ctx.runtime.metrics.as_ref(),
                 &resolved.upstream_name,
                 &resolved.backend_addr,
                 resolved.backend_index,
-                input.request_start,
+                input.request_ctx.request_start,
                 StatusCode::TOO_MANY_REQUESTS,
                 AdmissionOutcomeClass::RateLimited,
             );
@@ -261,75 +270,90 @@ pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
                     "Bootstrap request route={} missing admission rejection response for rate-limited decision",
                     resolved.upstream_name
                 );
-                return Err(internal_proxy_error_response(input.alt_svc));
+                return Err(internal_proxy_error_response(
+                    &input.request_ctx.runtime.alt_svc,
+                ));
             };
             let Some(retry_after_seconds) = response.retry_after_seconds else {
                 warn!(
                     "Bootstrap request route={} missing retry-after in rate-limited admission rejection response",
                     resolved.upstream_name
                 );
-                return Err(internal_proxy_error_response(input.alt_svc));
+                return Err(internal_proxy_error_response(
+                    &input.request_ctx.runtime.alt_svc,
+                ));
             };
             return Err(Response::builder()
                 .status(response.status)
-                .header("alt-svc", input.alt_svc)
+                .header("alt-svc", &input.request_ctx.runtime.alt_svc)
                 .header("retry-after", retry_after_seconds.to_string())
                 .body(boxed_full(Bytes::from_static(response.body)))
                 .unwrap_or_else(|_| Response::new(boxed_full(Bytes::from_static(b"error\n")))));
         }
         AdmissionPolicyDecision::Overloaded(decision) => {
             observe_bootstrap_admission_outcome(
-                input.metrics,
+                input.request_ctx.runtime.metrics.as_ref(),
                 &resolved.upstream_name,
                 &resolved.backend_addr,
                 resolved.backend_index,
-                input.request_start,
+                input.request_ctx.request_start,
                 StatusCode::SERVICE_UNAVAILABLE,
                 AdmissionOutcomeClass::OverloadShed {
                     reason: Some(decision.reason.metrics_reason()),
                 },
             );
             input
+                .request_ctx
+                .runtime
                 .resilience
                 .adaptive_admission
-                .observe(input.request_start.elapsed(), true);
+                .observe(input.request_ctx.request_start.elapsed(), true);
             let Some(response) = rejection_response.as_ref() else {
                 warn!(
                     "Bootstrap request route={} missing admission rejection response for overload decision",
                     resolved.upstream_name
                 );
-                return Err(internal_proxy_error_response(input.alt_svc));
+                return Err(internal_proxy_error_response(
+                    &input.request_ctx.runtime.alt_svc,
+                ));
             };
             let Some(retry_after_seconds) = response.retry_after_seconds else {
                 warn!(
                     "Bootstrap request route={} missing retry-after in overload admission rejection response",
                     resolved.upstream_name
                 );
-                return Err(internal_proxy_error_response(input.alt_svc));
+                return Err(internal_proxy_error_response(
+                    &input.request_ctx.runtime.alt_svc,
+                ));
             };
             return Err(Response::builder()
                 .status(response.status)
-                .header("alt-svc", input.alt_svc)
+                .header("alt-svc", &input.request_ctx.runtime.alt_svc)
                 .header("retry-after", retry_after_seconds.to_string())
                 .body(boxed_full(Bytes::from_static(response.body)))
                 .unwrap_or_else(|_| Response::new(boxed_full(Bytes::from_static(b"error\n")))));
         }
     }
 
-    let endpoint = match input.backend_endpoints.get(&resolved.backend_addr) {
+    let endpoint = match input
+        .request_ctx
+        .runtime
+        .backend_endpoints
+        .get(&resolved.backend_addr)
+    {
         Some(endpoint) => endpoint.clone(),
         None => {
             observe_bootstrap_request_proxy_error(
-                input.metrics,
+                input.request_ctx.runtime.metrics.as_ref(),
                 &resolved.upstream_name,
                 &resolved.backend_addr,
                 resolved.backend_index,
-                input.request_start,
+                input.request_ctx.request_start,
                 StatusCode::BAD_GATEWAY,
                 &ProxyError::Transport("no endpoint".into()),
             );
             return Err(bootstrap_error_response(
-                input.alt_svc,
+                &input.request_ctx.runtime.alt_svc,
                 StatusCode::BAD_GATEWAY,
                 b"no endpoint\n",
             ));
@@ -363,9 +387,9 @@ pub(in crate::quic_listener) fn build_bootstrap_upstream_request(
                 &bridge_headers,
                 boxed_full(Bytes::new()),
                 None,
+                input.request_ctx,
                 input.request_id,
                 input.traceparent,
-                input.peer,
             ),
         );
     }
@@ -381,9 +405,9 @@ pub(in crate::quic_listener) fn build_bootstrap_upstream_request(
                 &bridge_headers,
                 bridge_body,
                 None,
+                input.request_ctx,
                 input.request_id,
                 input.traceparent,
-                input.peer,
             ),
         )
     } else {
@@ -394,9 +418,9 @@ pub(in crate::quic_listener) fn build_bootstrap_upstream_request(
                 &bridge_headers,
                 bridge_body,
                 None,
+                input.request_ctx,
                 input.request_id,
                 input.traceparent,
-                input.peer,
             ),
         )
     }

@@ -17,7 +17,6 @@ use spooky_bridge::response::{
 use spooky_lb::upstream_pool::UpstreamPool;
 
 use crate::{
-    Metrics,
     quic_listener::bootstrap::{BootstrapPreparedRoute, write_bootstrap_websocket_upgrade},
     runtime::connection::guardrails::{
         BodyLimitKind, RESPONSE_BODY_TOO_LARGE_BODY, ResponseBodyGuardrailConfig,
@@ -30,6 +29,7 @@ use super::outcome::{
     finish_bootstrap_backend_request_accounting, observe_bootstrap_response_prebuffer_overflow,
     observe_bootstrap_response_status,
 };
+use crate::quic_listener::bootstrap::BootstrapDispatchCtx;
 
 pub(in crate::quic_listener) struct BootstrapStreamingBody {
     inner: Incoming,
@@ -180,13 +180,9 @@ pub(in crate::quic_listener) fn boxed_full(body: Bytes) -> BoxBody<Bytes, Infall
 pub(in crate::quic_listener) struct BootstrapWritebackInput<'a> {
     pub(in crate::quic_listener) upstream_resp: Response<Incoming>,
     pub(in crate::quic_listener) prepared_route: &'a BootstrapPreparedRoute,
-    pub(in crate::quic_listener) metrics: &'a Metrics,
-    pub(in crate::quic_listener) request_start: Instant,
-    pub(in crate::quic_listener) alt_svc: &'a str,
+    pub(in crate::quic_listener) dispatch_ctx: BootstrapDispatchCtx<'a>,
     pub(in crate::quic_listener) suppress_downstream_body: bool,
-    pub(in crate::quic_listener) is_websocket_upgrade: bool,
     pub(in crate::quic_listener) client_upgrade: Option<hyper::upgrade::OnUpgrade>,
-    pub(in crate::quic_listener) max_response_body_bytes: usize,
 }
 
 pub(in crate::quic_listener) fn write_bootstrap_response(
@@ -208,7 +204,7 @@ pub(in crate::quic_listener) fn write_bootstrap_response(
             protocol: ResponseNormalizationProtocol::Http1,
             strip_connection_headers: true,
             allow_trailers: false,
-            preserve_upgrade: input.is_websocket_upgrade
+            preserve_upgrade: input.dispatch_ctx.is_websocket_upgrade
                 && status == StatusCode::SWITCHING_PROTOCOLS,
         },
     });
@@ -222,8 +218,18 @@ pub(in crate::quic_listener) fn write_bootstrap_response(
         ResponseBodyGuardrailConfig {
             idle_timeout: Duration::ZERO,
             total_timeout: Duration::MAX,
-            max_body_bytes: input.max_response_body_bytes,
-            unknown_length_prebuffer_bytes: input.max_response_body_bytes,
+            max_body_bytes: input
+                .dispatch_ctx
+                .request
+                .runtime
+                .body_limits
+                .max_response_body_bytes,
+            unknown_length_prebuffer_bytes: input
+                .dispatch_ctx
+                .request
+                .runtime
+                .body_limits
+                .max_response_body_bytes,
             chunk_bytes: 1,
         },
         ResponseBodyGuardrailInput {
@@ -239,7 +245,7 @@ pub(in crate::quic_listener) fn write_bootstrap_response(
                 normalized_response.emission.body,
                 ResponseBodyPolicy::Forward
             ),
-            exempt_from_body_size_cap: input.is_websocket_upgrade
+            exempt_from_body_size_cap: input.dispatch_ctx.is_websocket_upgrade
                 && status == StatusCode::SWITCHING_PROTOCOLS,
         },
     );
@@ -250,20 +256,20 @@ pub(in crate::quic_listener) fn write_bootstrap_response(
         })
     ) {
         observe_bootstrap_response_prebuffer_overflow(
-            input.metrics,
+            input.dispatch_ctx.request.runtime.metrics.as_ref(),
             input.prepared_route,
-            input.request_start,
+            input.dispatch_ctx.request.request_start,
         );
         return Ok(Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header("alt-svc", input.alt_svc)
+            .header("alt-svc", &input.dispatch_ctx.request.runtime.alt_svc)
             .body(boxed_full(Bytes::from_static(RESPONSE_BODY_TOO_LARGE_BODY)))
             .unwrap_or_else(|_| Response::new(boxed_full(Bytes::from_static(b"error\n")))));
     }
     observe_bootstrap_response_status(
-        input.metrics,
+        input.dispatch_ctx.request.runtime.metrics.as_ref(),
         input.prepared_route,
-        input.request_start,
+        input.dispatch_ctx.request.request_start,
         status,
     );
 
@@ -271,16 +277,17 @@ pub(in crate::quic_listener) fn write_bootstrap_response(
     for header in &normalized_response.head.headers {
         resp_builder = resp_builder.header(&header.name, &header.value);
     }
-    resp_builder = resp_builder.header("alt-svc", input.alt_svc);
+    resp_builder = resp_builder.header("alt-svc", &input.dispatch_ctx.request.runtime.alt_svc);
 
-    if input.is_websocket_upgrade && input.upstream_resp.status() == StatusCode::SWITCHING_PROTOCOLS
+    if input.dispatch_ctx.is_websocket_upgrade
+        && input.upstream_resp.status() == StatusCode::SWITCHING_PROTOCOLS
     {
         return write_bootstrap_websocket_upgrade(
             resp_builder,
             &mut input.upstream_resp,
             input.prepared_route,
-            input.request_start,
-            input.alt_svc,
+            input.dispatch_ctx.request.request_start,
+            &input.dispatch_ctx.request.runtime.alt_svc,
             input.client_upgrade,
             status,
         );
@@ -292,18 +299,23 @@ pub(in crate::quic_listener) fn write_bootstrap_response(
     ) {
         finish_bootstrap_backend_request_accounting(
             input.prepared_route,
-            input.request_start,
+            input.dispatch_ctx.request.request_start,
             Some(status.as_u16()),
         );
         boxed_full(Bytes::new())
     } else {
         BootstrapStreamingBody::with_response_guardrails(
             input.upstream_resp.into_body(),
-            input.max_response_body_bytes,
+            input
+                .dispatch_ctx
+                .request
+                .runtime
+                .body_limits
+                .max_response_body_bytes,
             upstream_content_length,
             Arc::clone(&input.prepared_route.upstream_pool),
             input.prepared_route.backend_index,
-            input.request_start,
+            input.dispatch_ctx.request.request_start,
             Some(status.as_u16()),
         )
         .map_err(|never| match never {})

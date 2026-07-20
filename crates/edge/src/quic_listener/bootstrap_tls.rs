@@ -23,11 +23,12 @@ pub(super) use super::bootstrap::{BootstrapConnectionState, BootstrapStartupStat
 use super::{
     QUICListener,
     bootstrap::{
-        BootstrapBuildRequestInput, BootstrapDispatchInput, BootstrapPolicyEvaluationInput,
-        BootstrapPreparedRoute, BootstrapRequestIntake, BootstrapWritebackInput, boxed_full,
-        build_bootstrap_upstream_request, dispatch_bootstrap_upstream,
-        evaluate_bootstrap_request_policy, observe_bootstrap_request_proxy_error,
-        prepare_bootstrap_request_intake, write_bootstrap_response,
+        BootstrapBuildRequestInput, BootstrapDispatchCtx, BootstrapDispatchInput,
+        BootstrapPolicyEvaluationInput, BootstrapRequestCtx, BootstrapRequestIntake,
+        BootstrapRuntimeCtx, BootstrapWritebackInput, boxed_full, build_bootstrap_upstream_request,
+        dispatch_bootstrap_upstream, evaluate_bootstrap_request_policy,
+        observe_bootstrap_request_proxy_error, prepare_bootstrap_request_intake,
+        write_bootstrap_response,
     },
     bootstrap::{
         PreparedBootstrapListenerStartup, prepare_bootstrap_listener_startup,
@@ -154,18 +155,9 @@ impl QUICListener {
                     continue;
                 }
 
-                let alt_svc = runtime_state.alt_svc_value.clone();
-                let transport_pool = Arc::clone(&runtime_state.transport_pool);
-                let backend_endpoints = Arc::clone(&runtime_state.backend_endpoints);
-                let backend_resolution_store = Arc::clone(&runtime_state.backend_resolution_store);
-                let upstream_policies = Arc::clone(&runtime_state.upstream_policies);
                 let metrics = Arc::clone(&runtime_state.metrics);
-                let resilience = Arc::clone(&runtime_state.resilience);
-                let upstream_pools = runtime_state.upstream_pools.clone();
-                let routing_index = Arc::clone(&runtime_state.routing_index);
-                let max_request_body_bytes = runtime_state.max_request_body_bytes;
-                let max_response_body_bytes = runtime_state.max_response_body_bytes;
-                let backend_timeout = runtime_state.backend_timeout;
+                let runtime_ctx =
+                    Arc::new(BootstrapRuntimeCtx::from_connection_state(&runtime_state));
                 let timeout = runtime_state.connection_timeout;
                 let listener_label = listener_label.clone();
                 let listener_tls_store = Arc::clone(&runtime_state.listener_tls_store);
@@ -235,25 +227,18 @@ impl QUICListener {
                     let use_h2 = negotiated.as_deref() == Some(b"h2");
 
                     let io = TokioIo::new(tls_stream);
-                    let alt_svc_conn = alt_svc.clone();
-
                     let svc = service_fn(
                         move |mut req: Request<Incoming>| -> BootstrapServiceFuture {
-                            let alt = alt_svc_conn.clone();
-                            let transport_pool = Arc::clone(&transport_pool);
-                            let backend_endpoints = Arc::clone(&backend_endpoints);
-                            let _backend_resolution_store = Arc::clone(&backend_resolution_store);
-                            let upstream_policies = Arc::clone(&upstream_policies);
-                            let metrics = Arc::clone(&metrics);
-                            let resilience = Arc::clone(&resilience);
-                            let upstream_pools = upstream_pools.clone();
-                            let routing_index = Arc::clone(&routing_index);
-                            let max_request_body_bytes = max_request_body_bytes;
-                            let max_response_body_bytes = max_response_body_bytes;
+                            let runtime_ctx = Arc::clone(&runtime_ctx);
                             let peer = peer;
 
                             Box::pin(async move {
                                 let request_start = Instant::now();
+                                let request_ctx = BootstrapRequestCtx {
+                                    runtime: runtime_ctx.as_ref(),
+                                    peer,
+                                    request_start,
+                                };
                                 let BootstrapRequestIntake {
                                     method,
                                     path,
@@ -265,43 +250,29 @@ impl QUICListener {
                                 } = match prepare_bootstrap_request_intake(
                                     &mut req,
                                     use_h2,
-                                    resilience.as_ref(),
-                                    metrics.as_ref(),
-                                    &alt,
+                                    runtime_ctx.resilience.as_ref(),
+                                    runtime_ctx.metrics.as_ref(),
+                                    &runtime_ctx.alt_svc,
                                     request_start,
                                 ) {
                                     Ok(intake) => intake,
                                     Err(response) => return Ok(response),
                                 };
 
-                                let BootstrapPreparedRoute {
-                                    endpoint,
-                                    backend_addr,
-                                    backend_index,
-                                    upstream_name,
-                                    upstream_policy,
-                                    upstream_pool,
-                                } = match evaluate_bootstrap_request_policy(
+                                let policy_intake = BootstrapRequestIntake {
+                                    method: method.clone(),
+                                    path: path.clone(),
+                                    authority: authority.clone(),
+                                    content_length,
+                                    suppress_downstream_body,
+                                    is_websocket_upgrade,
+                                    client_upgrade: None,
+                                };
+                                let prepared_route = match evaluate_bootstrap_request_policy(
                                     BootstrapPolicyEvaluationInput {
-                                        intake: &BootstrapRequestIntake {
-                                            method: method.clone(),
-                                            path: path.clone(),
-                                            authority: authority.clone(),
-                                            content_length,
-                                            suppress_downstream_body,
-                                            is_websocket_upgrade,
-                                            client_upgrade: None,
-                                        },
-                                        peer,
+                                        intake: &policy_intake,
                                         headers: req.headers(),
-                                        routing_index: &routing_index,
-                                        upstream_pools: &upstream_pools,
-                                        upstream_policies: &upstream_policies,
-                                        backend_endpoints: &backend_endpoints,
-                                        metrics: metrics.as_ref(),
-                                        resilience: resilience.as_ref(),
-                                        request_start,
-                                        alt_svc: &alt,
+                                        request_ctx,
                                     },
                                 ) {
                                     Ok(prepared) => prepared,
@@ -313,7 +284,9 @@ impl QUICListener {
                                     RequestBodyGuardrailConfig {
                                         idle_timeout: Duration::ZERO,
                                         total_timeout: Duration::ZERO,
-                                        max_body_bytes: max_request_body_bytes,
+                                        max_body_bytes: runtime_ctx
+                                            .body_limits
+                                            .max_request_body_bytes,
                                         max_buffered_bytes: usize::MAX,
                                     },
                                     RequestBodyGuardrailInput {
@@ -333,17 +306,17 @@ impl QUICListener {
                                     })
                                 ) {
                                     observe_bootstrap_request_proxy_error(
-                                        metrics.as_ref(),
-                                        &upstream_name,
-                                        &backend_addr,
-                                        backend_index,
+                                        runtime_ctx.metrics.as_ref(),
+                                        &prepared_route.upstream_name,
+                                        &prepared_route.backend_addr,
+                                        prepared_route.backend_index,
                                         request_start,
                                         StatusCode::PAYLOAD_TOO_LARGE,
                                         &ProxyError::Transport("request body too large".into()),
                                     );
                                     return Ok(Response::builder()
                                         .status(StatusCode::PAYLOAD_TOO_LARGE)
-                                        .header("alt-svc", &alt)
+                                        .header("alt-svc", &runtime_ctx.alt_svc)
                                         .body(boxed_full(Bytes::from_static(
                                             REQUEST_BODY_TOO_LARGE_BODY,
                                         )))
@@ -373,17 +346,10 @@ impl QUICListener {
                                     BootstrapBuildRequestInput {
                                         request: req,
                                         intake: &intake_for_build,
-                                        prepared_route: &BootstrapPreparedRoute {
-                                            endpoint: endpoint.clone(),
-                                            backend_addr: backend_addr.clone(),
-                                            backend_index,
-                                            upstream_name: upstream_name.clone(),
-                                            upstream_policy: upstream_policy.clone(),
-                                            upstream_pool: Arc::clone(&upstream_pool),
-                                        },
+                                        prepared_route: &prepared_route,
+                                        request_ctx,
                                         request_id,
                                         traceparent: traceparent.as_deref(),
-                                        peer,
                                     },
                                 ) {
                                     Ok(request) => request,
@@ -404,17 +370,17 @@ impl QUICListener {
                                         };
                                         let proxy_err = ProxyError::from(err);
                                         observe_bootstrap_request_proxy_error(
-                                            metrics.as_ref(),
-                                            &upstream_name,
-                                            &backend_addr,
-                                            backend_index,
+                                            runtime_ctx.metrics.as_ref(),
+                                            &prepared_route.upstream_name,
+                                            &prepared_route.backend_addr,
+                                            prepared_route.backend_index,
                                             request_start,
                                             status,
                                             &proxy_err,
                                         );
                                         return Ok(Response::builder()
                                             .status(status)
-                                            .header("alt-svc", &alt)
+                                            .header("alt-svc", &runtime_ctx.alt_svc)
                                             .body(boxed_full(Bytes::copy_from_slice(body)))
                                             .unwrap_or_else(|_| {
                                                 Response::new(boxed_full(Bytes::from_static(
@@ -423,25 +389,17 @@ impl QUICListener {
                                             }));
                                     }
                                 };
+                                let dispatch_ctx = BootstrapDispatchCtx {
+                                    request: request_ctx,
+                                    request_id,
+                                    request_path,
+                                    is_websocket_upgrade,
+                                };
                                 let upstream_resp =
                                     match dispatch_bootstrap_upstream(BootstrapDispatchInput {
                                         upstream_req,
-                                        prepared_route: &BootstrapPreparedRoute {
-                                            endpoint: endpoint.clone(),
-                                            backend_addr: backend_addr.clone(),
-                                            backend_index,
-                                            upstream_name: upstream_name.clone(),
-                                            upstream_policy: upstream_policy.clone(),
-                                            upstream_pool: Arc::clone(&upstream_pool),
-                                        },
-                                        transport_pool: transport_pool.as_ref(),
-                                        metrics: metrics.as_ref(),
-                                        request_start,
-                                        request_id,
-                                        backend_timeout,
-                                        request_path,
-                                        is_websocket_upgrade,
-                                        alt_svc: &alt,
+                                        prepared_route: &prepared_route,
+                                        dispatch_ctx,
                                     })
                                     .await
                                     {
@@ -451,21 +409,10 @@ impl QUICListener {
 
                                 write_bootstrap_response(BootstrapWritebackInput {
                                     upstream_resp,
-                                    prepared_route: &BootstrapPreparedRoute {
-                                        endpoint: endpoint.clone(),
-                                        backend_addr: backend_addr.clone(),
-                                        backend_index,
-                                        upstream_name: upstream_name.clone(),
-                                        upstream_policy: upstream_policy.clone(),
-                                        upstream_pool: Arc::clone(&upstream_pool),
-                                    },
-                                    metrics: metrics.as_ref(),
-                                    request_start,
-                                    alt_svc: &alt,
+                                    prepared_route: &prepared_route,
+                                    dispatch_ctx,
                                     suppress_downstream_body,
-                                    is_websocket_upgrade,
                                     client_upgrade,
-                                    max_response_body_bytes,
                                 })
                             })
                         },

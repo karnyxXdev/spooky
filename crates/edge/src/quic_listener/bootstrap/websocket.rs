@@ -49,18 +49,18 @@ pub(in crate::quic_listener) async fn dispatch_bootstrap_websocket(
 ) -> Result<Response<Incoming>, Response<BoxBody<Bytes, Infallible>>> {
     if input.prepared_route.endpoint.scheme() != BackendScheme::Http {
         return Err(bootstrap_error_response(
-            input.alt_svc,
+            &input.dispatch_ctx.request.runtime.alt_svc,
             StatusCode::BAD_GATEWAY,
             b"websocket bootstrap requires http upstream\n",
         ));
     }
 
     let backend_target = input.prepared_route.endpoint.authority().to_string();
-    let upstream_path_uri = match Uri::try_from(input.request_path) {
+    let upstream_path_uri = match Uri::try_from(input.dispatch_ctx.request_path) {
         Ok(uri) => uri,
         Err(_) => {
             return Err(bootstrap_error_response(
-                input.alt_svc,
+                &input.dispatch_ctx.request.runtime.alt_svc,
                 StatusCode::BAD_GATEWAY,
                 b"bad uri\n",
             ));
@@ -71,32 +71,37 @@ pub(in crate::quic_listener) async fn dispatch_bootstrap_websocket(
     let upstream_req = Request::from_parts(parts, body);
 
     let stream = match tokio::time::timeout(
-        input.backend_timeout,
+        input.dispatch_ctx.request.runtime.backend_timeout,
         tokio::net::TcpStream::connect(&backend_target),
     )
     .await
     {
         Ok(Ok(stream)) => {
             if let Ok(resolved_addr) = stream.peer_addr() {
-                input.metrics.record_backend_connect(
-                    &backend_target,
-                    input.prepared_route.endpoint.authority_host(),
-                    resolved_addr,
-                );
+                input
+                    .dispatch_ctx
+                    .request
+                    .runtime
+                    .metrics
+                    .record_backend_connect(
+                        &backend_target,
+                        input.prepared_route.endpoint.authority_host(),
+                        resolved_addr,
+                    );
             }
             stream
         }
         Ok(Err(err)) => {
             warn!("Bootstrap WebSocket connect error: {}", err);
             return Err(bootstrap_error_response(
-                input.alt_svc,
+                &input.dispatch_ctx.request.runtime.alt_svc,
                 StatusCode::BAD_GATEWAY,
                 b"upstream error\n",
             ));
         }
         Err(_) => {
             return Err(bootstrap_error_response(
-                input.alt_svc,
+                &input.dispatch_ctx.request.runtime.alt_svc,
                 StatusCode::GATEWAY_TIMEOUT,
                 b"upstream timeout\n",
             ));
@@ -109,7 +114,7 @@ pub(in crate::quic_listener) async fn dispatch_bootstrap_websocket(
         Err(err) => {
             warn!("Bootstrap WebSocket handshake setup failed: {}", err);
             return Err(bootstrap_error_response(
-                input.alt_svc,
+                &input.dispatch_ctx.request.runtime.alt_svc,
                 StatusCode::BAD_GATEWAY,
                 b"upstream error\n",
             ));
@@ -119,20 +124,25 @@ pub(in crate::quic_listener) async fn dispatch_bootstrap_websocket(
         let _ = conn.with_upgrades().await;
     });
 
-    match tokio::time::timeout(input.backend_timeout, sender.send_request(upstream_req)).await {
+    match tokio::time::timeout(
+        input.dispatch_ctx.request.runtime.backend_timeout,
+        sender.send_request(upstream_req),
+    )
+    .await
+    {
         Ok(Ok(resp)) => Ok(resp),
         Ok(Err(err)) => {
             let proxy_err = ProxyError::Transport(err.to_string());
             observe_bootstrap_dispatch_failure(
                 input.prepared_route,
-                input.metrics,
-                input.request_start,
-                input.request_id,
+                input.dispatch_ctx.request.runtime.metrics.as_ref(),
+                input.dispatch_ctx.request.request_start,
+                input.dispatch_ctx.request_id,
                 StatusCode::BAD_GATEWAY,
                 &proxy_err,
             );
             Err(bootstrap_error_response(
-                input.alt_svc,
+                &input.dispatch_ctx.request.runtime.alt_svc,
                 StatusCode::BAD_GATEWAY,
                 b"upstream error\n",
             ))
@@ -140,14 +150,14 @@ pub(in crate::quic_listener) async fn dispatch_bootstrap_websocket(
         Err(_) => {
             observe_bootstrap_dispatch_failure(
                 input.prepared_route,
-                input.metrics,
-                input.request_start,
-                input.request_id,
+                input.dispatch_ctx.request.runtime.metrics.as_ref(),
+                input.dispatch_ctx.request.request_start,
+                input.dispatch_ctx.request_id,
                 StatusCode::GATEWAY_TIMEOUT,
                 &ProxyError::Timeout,
             );
             Err(bootstrap_error_response(
-                input.alt_svc,
+                &input.dispatch_ctx.request.runtime.alt_svc,
                 StatusCode::GATEWAY_TIMEOUT,
                 b"upstream timeout\n",
             ))

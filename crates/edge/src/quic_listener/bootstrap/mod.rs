@@ -1,5 +1,6 @@
 mod dispatch;
 mod intake;
+mod outcome;
 mod request;
 mod response;
 mod startup;
@@ -12,6 +13,7 @@ pub(in crate::quic_listener) use self::dispatch::{
 pub(in crate::quic_listener) use self::intake::{
     BootstrapRequestIntake, bootstrap_error_response, prepare_bootstrap_request_intake,
 };
+pub(in crate::quic_listener) use self::outcome::observe_bootstrap_request_proxy_error;
 pub(in crate::quic_listener) use self::request::{
     BootstrapBuildRequestInput, BootstrapPolicyEvaluationInput, BootstrapPreparedRoute,
     build_bootstrap_upstream_request, evaluate_bootstrap_request_policy,

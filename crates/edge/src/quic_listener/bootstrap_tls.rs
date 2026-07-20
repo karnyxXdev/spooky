@@ -26,8 +26,8 @@ use super::{
         BootstrapBuildRequestInput, BootstrapDispatchInput, BootstrapPolicyEvaluationInput,
         BootstrapPreparedRoute, BootstrapRequestIntake, BootstrapWritebackInput, boxed_full,
         build_bootstrap_upstream_request, dispatch_bootstrap_upstream,
-        evaluate_bootstrap_request_policy, prepare_bootstrap_request_intake,
-        write_bootstrap_response,
+        evaluate_bootstrap_request_policy, observe_bootstrap_request_proxy_error,
+        prepare_bootstrap_request_intake, write_bootstrap_response,
     },
     bootstrap::{
         PreparedBootstrapListenerStartup, prepare_bootstrap_listener_startup,
@@ -39,13 +39,9 @@ use crate::{
     REQUEST_ID_COUNTER,
     runtime::{
         bundle::RuntimeBundleHandle,
-        connection::{
-            guardrails::{
-                BodyLimitKind, REQUEST_BODY_TOO_LARGE_BODY, RequestBodyGuardrailConfig,
-                RequestBodyGuardrailDecision, RequestBodyGuardrailInput,
-                checked_request_body_ingress,
-            },
-            outcome::{OutcomeBackendTarget, OutcomeRouteTarget, observe_proxy_error_outcome},
+        connection::guardrails::{
+            BodyLimitKind, REQUEST_BODY_TOO_LARGE_BODY, RequestBodyGuardrailConfig,
+            RequestBodyGuardrailDecision, RequestBodyGuardrailInput, checked_request_body_ingress,
         },
         shared_state::SharedRuntimeState,
     },
@@ -63,22 +59,6 @@ type BootstrapServiceFuture = std::pin::Pin<
             > + Send,
     >,
 >;
-
-fn bootstrap_route_target<'a>(route: &'a str) -> OutcomeRouteTarget<'a> {
-    OutcomeRouteTarget { route }
-}
-
-fn bootstrap_backend_target<'a>(
-    upstream_name: &'a str,
-    backend_addr: &'a str,
-    backend_index: usize,
-) -> OutcomeBackendTarget<'a> {
-    OutcomeBackendTarget {
-        upstream: upstream_name,
-        backend_addr: Some(backend_addr),
-        backend_index: Some(backend_index),
-    }
-}
 
 impl QUICListener {
     pub fn spawn_bootstrap_tls_listener(
@@ -352,18 +332,14 @@ impl QUICListener {
                                         kind: BodyLimitKind::BodySize,
                                     })
                                 ) {
-                                    let _ = observe_proxy_error_outcome(
+                                    observe_bootstrap_request_proxy_error(
                                         metrics.as_ref(),
-                                        bootstrap_route_target(&upstream_name),
-                                        Some(bootstrap_backend_target(
-                                            &upstream_name,
-                                            &backend_addr,
-                                            backend_index,
-                                        )),
-                                        request_start.elapsed(),
-                                        Some(StatusCode::PAYLOAD_TOO_LARGE),
+                                        &upstream_name,
+                                        &backend_addr,
+                                        backend_index,
+                                        request_start,
+                                        StatusCode::PAYLOAD_TOO_LARGE,
                                         &ProxyError::Transport("request body too large".into()),
-                                        None,
                                     );
                                     return Ok(Response::builder()
                                         .status(StatusCode::PAYLOAD_TOO_LARGE)
@@ -427,18 +403,14 @@ impl QUICListener {
                                             )
                                         };
                                         let proxy_err = ProxyError::from(err);
-                                        let _ = observe_proxy_error_outcome(
+                                        observe_bootstrap_request_proxy_error(
                                             metrics.as_ref(),
-                                            bootstrap_route_target(&upstream_name),
-                                            Some(bootstrap_backend_target(
-                                                &upstream_name,
-                                                &backend_addr,
-                                                backend_index,
-                                            )),
-                                            request_start.elapsed(),
-                                            Some(status),
+                                            &upstream_name,
+                                            &backend_addr,
+                                            backend_index,
+                                            request_start,
+                                            status,
                                             &proxy_err,
-                                            None,
                                         );
                                         return Ok(Response::builder()
                                             .status(status)

@@ -14,26 +14,21 @@ use spooky_bridge::response::{
     ResponseBodyMode, ResponseBodyPolicy, ResponseNormalizationInput,
     ResponseNormalizationProtocol, ResponseProtocolConstraints, normalize_upstream_response,
 };
-use spooky_errors::ProxyError;
 use spooky_lb::upstream_pool::UpstreamPool;
 
 use crate::{
-    Metrics, OverloadShedReason,
-    quic_listener::bootstrap::{
-        BootstrapPreparedRoute,
-        request::{bootstrap_backend_target_for_prepared, bootstrap_route_target_for_prepared},
-        write_bootstrap_websocket_upgrade,
+    Metrics,
+    quic_listener::bootstrap::{BootstrapPreparedRoute, write_bootstrap_websocket_upgrade},
+    runtime::connection::guardrails::{
+        BodyLimitKind, RESPONSE_BODY_TOO_LARGE_BODY, ResponseBodyGuardrailConfig,
+        ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput,
+        checked_response_body_guardrails,
     },
-    runtime::connection::{
-        guardrails::{
-            BodyLimitKind, RESPONSE_BODY_TOO_LARGE_BODY, ResponseBodyGuardrailConfig,
-            ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput,
-            checked_response_body_guardrails,
-        },
-        outcome::{
-            observe_backend_response_status, observe_proxy_error_outcome, observe_status_outcome,
-        },
-    },
+};
+
+use super::outcome::{
+    finish_bootstrap_backend_request_accounting, observe_bootstrap_response_prebuffer_overflow,
+    observe_bootstrap_response_status,
 };
 
 pub(in crate::quic_listener) struct BootstrapStreamingBody {
@@ -254,16 +249,10 @@ pub(in crate::quic_listener) fn write_bootstrap_response(
             kind: BodyLimitKind::BodySize,
         })
     ) {
-        let _ = observe_proxy_error_outcome(
+        observe_bootstrap_response_prebuffer_overflow(
             input.metrics,
-            bootstrap_route_target_for_prepared(input.prepared_route),
-            Some(bootstrap_backend_target_for_prepared(input.prepared_route)),
-            input.request_start.elapsed(),
-            Some(StatusCode::SERVICE_UNAVAILABLE),
-            &ProxyError::Pool(spooky_errors::PoolError::BackendOverloaded(
-                "response prebuffer cap".into(),
-            )),
-            Some(OverloadShedReason::ResponsePrebufferCap),
+            input.prepared_route,
+            input.request_start,
         );
         return Ok(Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -271,26 +260,12 @@ pub(in crate::quic_listener) fn write_bootstrap_response(
             .body(boxed_full(Bytes::from_static(RESPONSE_BODY_TOO_LARGE_BODY)))
             .unwrap_or_else(|_| Response::new(boxed_full(Bytes::from_static(b"error\n")))));
     }
-    let _ = observe_status_outcome(
+    observe_bootstrap_response_status(
         input.metrics,
-        bootstrap_route_target_for_prepared(input.prepared_route),
-        Some(bootstrap_backend_target_for_prepared(input.prepared_route)),
-        input.request_start.elapsed(),
+        input.prepared_route,
+        input.request_start,
         status,
     );
-    if let Some(transition) = observe_backend_response_status(
-        crate::runtime::connection::outcome::BackendHealthObservationInput {
-            backend_addr: &input.prepared_route.backend_addr,
-            backend_index: input.prepared_route.backend_index,
-            upstream_pool: Some(&input.prepared_route.upstream_pool),
-            status,
-        },
-    ) {
-        crate::runtime::connection::outcome::log_backend_health_transition(
-            &input.prepared_route.backend_addr,
-            transition,
-        );
-    }
 
     let mut resp_builder = Response::builder().status(normalized_response.head.status);
     for header in &normalized_response.head.headers {
@@ -315,13 +290,10 @@ pub(in crate::quic_listener) fn write_bootstrap_response(
         normalized_response.emission.body,
         ResponseBodyPolicy::Suppress
     ) {
-        crate::runtime::connection::outcome::finish_backend_request_accounting(
-            crate::runtime::connection::outcome::BackendRequestFinishInput {
-                upstream_pool: Some(&input.prepared_route.upstream_pool),
-                backend_index: Some(input.prepared_route.backend_index),
-                elapsed: input.request_start.elapsed(),
-                status: Some(status.as_u16()),
-            },
+        finish_bootstrap_backend_request_accounting(
+            input.prepared_route,
+            input.request_start,
+            Some(status.as_u16()),
         );
         boxed_full(Bytes::new())
     } else {

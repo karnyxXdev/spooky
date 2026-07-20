@@ -14,7 +14,9 @@ use crate::quic_listener::{
     protocol::is_websocket_upgrade_request,
 };
 
-use super::dispatch::observe_bootstrap_dispatch_failure;
+use super::outcome::{
+    finish_bootstrap_backend_request_accounting, observe_bootstrap_dispatch_failure,
+};
 
 pub(in crate::quic_listener) struct BootstrapWebsocketFlow {
     pub(in crate::quic_listener) is_websocket_upgrade: bool,
@@ -185,13 +187,10 @@ pub(in crate::quic_listener) fn write_bootstrap_websocket_upgrade(
         let mut upstream = TokioIo::new(upstream);
         let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
     });
-    crate::runtime::connection::outcome::finish_backend_request_accounting(
-        crate::runtime::connection::outcome::BackendRequestFinishInput {
-            upstream_pool: Some(&prepared_route.upstream_pool),
-            backend_index: Some(prepared_route.backend_index),
-            elapsed: request_start.elapsed(),
-            status: Some(status.as_u16()),
-        },
+    finish_bootstrap_backend_request_accounting(
+        prepared_route,
+        request_start,
+        Some(status.as_u16()),
     );
     Ok(resp_builder
         .body(boxed_full(Bytes::new()))

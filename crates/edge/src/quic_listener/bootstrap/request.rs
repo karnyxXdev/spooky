@@ -28,13 +28,8 @@ use spooky_errors::ProxyError;
 use spooky_lb::upstream_pool::UpstreamPool;
 
 use crate::{
-    Metrics,
-    resilience::runtime::RuntimeResilience,
-    routing::index::RouteIndex,
-    runtime::connection::outcome::{
-        AdmissionOutcomeClass, OutcomeBackendTarget, OutcomeRouteTarget, observe_admission_outcome,
-        observe_proxy_error_outcome,
-    },
+    Metrics, resilience::runtime::RuntimeResilience, routing::index::RouteIndex,
+    runtime::connection::outcome::AdmissionOutcomeClass,
 };
 
 use super::{
@@ -48,6 +43,7 @@ use super::{
     },
     BootstrapStreamingBody, bootstrap_error_response, boxed_full,
     intake::BootstrapRequestIntake,
+    outcome::{observe_bootstrap_admission_outcome, observe_bootstrap_request_proxy_error},
 };
 
 pub(in crate::quic_listener) struct BootstrapPreparedRoute {
@@ -127,40 +123,6 @@ fn bootstrap_request_build_input<'a>(
         },
         forwarded: RequestForwardedContext { client_addr: peer },
     }
-}
-
-pub(in crate::quic_listener) fn bootstrap_route_target<'a>(
-    route: &'a str,
-) -> OutcomeRouteTarget<'a> {
-    OutcomeRouteTarget { route }
-}
-
-pub(in crate::quic_listener) fn bootstrap_backend_target<'a>(
-    upstream_name: &'a str,
-    backend_addr: &'a str,
-    backend_index: usize,
-) -> OutcomeBackendTarget<'a> {
-    OutcomeBackendTarget {
-        upstream: upstream_name,
-        backend_addr: Some(backend_addr),
-        backend_index: Some(backend_index),
-    }
-}
-
-pub(in crate::quic_listener) fn bootstrap_route_target_for_prepared(
-    prepared_route: &BootstrapPreparedRoute,
-) -> OutcomeRouteTarget<'_> {
-    bootstrap_route_target(&prepared_route.upstream_name)
-}
-
-pub(in crate::quic_listener) fn bootstrap_backend_target_for_prepared(
-    prepared_route: &BootstrapPreparedRoute,
-) -> OutcomeBackendTarget<'_> {
-    bootstrap_backend_target(
-        &prepared_route.upstream_name,
-        &prepared_route.backend_addr,
-        prepared_route.backend_index,
-    )
 }
 
 fn internal_proxy_error_response(alt_svc: &str) -> Response<BoxBody<Bytes, Infallible>> {
@@ -245,15 +207,12 @@ pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
         AdmissionPolicyDecision::AdmitReady => {}
         AdmissionPolicyDecision::Unauthorized(_) => {
             input.metrics.inc_policy_denied();
-            let _ = observe_admission_outcome(
+            observe_bootstrap_admission_outcome(
                 input.metrics,
-                bootstrap_route_target(&resolved.upstream_name),
-                Some(bootstrap_backend_target(
-                    &resolved.upstream_name,
-                    &resolved.backend_addr,
-                    resolved.backend_index,
-                )),
-                input.request_start.elapsed(),
+                &resolved.upstream_name,
+                &resolved.backend_addr,
+                resolved.backend_index,
+                input.request_start,
                 StatusCode::UNAUTHORIZED,
                 AdmissionOutcomeClass::AuthDenied,
             );
@@ -284,15 +243,12 @@ pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
         }
         AdmissionPolicyDecision::RateLimited(decision) => {
             input.metrics.inc_request_rate_limited();
-            let _ = observe_admission_outcome(
+            observe_bootstrap_admission_outcome(
                 input.metrics,
-                bootstrap_route_target(&resolved.upstream_name),
-                Some(bootstrap_backend_target(
-                    &resolved.upstream_name,
-                    &resolved.backend_addr,
-                    resolved.backend_index,
-                )),
-                input.request_start.elapsed(),
+                &resolved.upstream_name,
+                &resolved.backend_addr,
+                resolved.backend_index,
+                input.request_start,
                 StatusCode::TOO_MANY_REQUESTS,
                 AdmissionOutcomeClass::RateLimited,
             );
@@ -322,15 +278,12 @@ pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
                 .unwrap_or_else(|_| Response::new(boxed_full(Bytes::from_static(b"error\n")))));
         }
         AdmissionPolicyDecision::Overloaded(decision) => {
-            let _ = observe_admission_outcome(
+            observe_bootstrap_admission_outcome(
                 input.metrics,
-                bootstrap_route_target(&resolved.upstream_name),
-                Some(bootstrap_backend_target(
-                    &resolved.upstream_name,
-                    &resolved.backend_addr,
-                    resolved.backend_index,
-                )),
-                input.request_start.elapsed(),
+                &resolved.upstream_name,
+                &resolved.backend_addr,
+                resolved.backend_index,
+                input.request_start,
                 StatusCode::SERVICE_UNAVAILABLE,
                 AdmissionOutcomeClass::OverloadShed {
                     reason: Some(decision.reason.metrics_reason()),
@@ -366,18 +319,14 @@ pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
     let endpoint = match input.backend_endpoints.get(&resolved.backend_addr) {
         Some(endpoint) => endpoint.clone(),
         None => {
-            let _ = observe_proxy_error_outcome(
+            observe_bootstrap_request_proxy_error(
                 input.metrics,
-                bootstrap_route_target(&resolved.upstream_name),
-                Some(bootstrap_backend_target(
-                    &resolved.upstream_name,
-                    &resolved.backend_addr,
-                    resolved.backend_index,
-                )),
-                input.request_start.elapsed(),
-                Some(StatusCode::BAD_GATEWAY),
+                &resolved.upstream_name,
+                &resolved.backend_addr,
+                resolved.backend_index,
+                input.request_start,
+                StatusCode::BAD_GATEWAY,
                 &ProxyError::Transport("no endpoint".into()),
-                None,
             );
             return Err(bootstrap_error_response(
                 input.alt_svc,

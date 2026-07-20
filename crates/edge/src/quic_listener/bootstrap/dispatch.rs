@@ -7,21 +7,17 @@ use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
-use log::warn;
-use spooky_errors::{ProxyError, classify_upstream_proxy_error};
+use spooky_errors::ProxyError;
 use spooky_transport::transport_pool::UpstreamTransportPool;
 
 use crate::{
     Metrics,
-    quic_listener::{
-        QUICListener,
-        bootstrap::{
-            BootstrapPreparedRoute, bootstrap_error_response, dispatch_bootstrap_websocket,
-            request::bootstrap_backend_target_for_prepared,
-            request::bootstrap_route_target_for_prepared,
-        },
+    quic_listener::bootstrap::{
+        BootstrapPreparedRoute, bootstrap_error_response, dispatch_bootstrap_websocket,
     },
 };
+
+use super::outcome::observe_bootstrap_dispatch_failure;
 
 pub(in crate::quic_listener) struct BootstrapDispatchInput<'a> {
     pub(in crate::quic_listener) upstream_req: Request<BoxBody<Bytes, Infallible>>,
@@ -34,56 +30,6 @@ pub(in crate::quic_listener) struct BootstrapDispatchInput<'a> {
     pub(in crate::quic_listener) request_path: &'a str,
     pub(in crate::quic_listener) is_websocket_upgrade: bool,
     pub(in crate::quic_listener) alt_svc: &'a str,
-}
-
-pub(in crate::quic_listener) fn observe_bootstrap_dispatch_failure(
-    prepared_route: &BootstrapPreparedRoute,
-    metrics: &Metrics,
-    request_start: Instant,
-    request_id: u64,
-    status: StatusCode,
-    proxy_err: &ProxyError,
-) {
-    let _ = crate::runtime::connection::outcome::observe_proxy_error_outcome(
-        metrics,
-        bootstrap_route_target_for_prepared(prepared_route),
-        Some(bootstrap_backend_target_for_prepared(prepared_route)),
-        request_start.elapsed(),
-        Some(status),
-        proxy_err,
-        None,
-    );
-    if let Some(classified) = classify_upstream_proxy_error(proxy_err) {
-        QUICListener::log_classified_upstream_failure(
-            "bootstrap",
-            Some(request_id),
-            Some(&prepared_route.upstream_name),
-            &prepared_route.backend_addr,
-            &classified,
-        );
-        if let Some(transition) =
-            crate::runtime::connection::outcome::observe_classified_backend_failure(
-                crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
-                    metrics_phase: "bootstrap",
-                    backend_addr: &prepared_route.backend_addr,
-                    backend_index: prepared_route.backend_index,
-                    upstream_pool: Some(&prepared_route.upstream_pool),
-                    metrics,
-                    classified: &classified,
-                },
-            )
-        {
-            crate::runtime::connection::outcome::log_backend_health_transition(
-                &prepared_route.backend_addr,
-                transition,
-            );
-        }
-    } else {
-        warn!(
-            "Bootstrap upstream error route={} backend={}: {}",
-            prepared_route.upstream_name, prepared_route.backend_addr, proxy_err
-        );
-    }
 }
 
 async fn dispatch_bootstrap_http(

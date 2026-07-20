@@ -60,30 +60,30 @@ pub(super) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> Stre
 }
 
 // Shared forwarding dependencies passed through extracted submodules.
-pub(crate) struct ForwardingSharedCtx<'a> {
-    pub(crate) metrics: Arc<Metrics>,
-    pub(crate) resilience: &'a RuntimeResilience,
-    pub(crate) routing_index: &'a RouteIndex,
-    pub(crate) upstream_pools: &'a HashMap<String, Arc<RwLock<UpstreamPool>>>,
+pub(in crate::quic_listener) struct ForwardingSharedCtx<'a> {
+    pub(in crate::quic_listener) metrics: Arc<Metrics>,
+    pub(in crate::quic_listener) resilience: &'a RuntimeResilience,
+    pub(in crate::quic_listener) routing_index: &'a RouteIndex,
+    pub(in crate::quic_listener) upstream_pools: &'a HashMap<String, Arc<RwLock<UpstreamPool>>>,
 }
 
-pub(crate) struct ForwardingExecutionCtx<'a> {
-    pub(crate) transport_pool: Arc<UpstreamTransportPool>,
-    pub(crate) backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
-    pub(crate) backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
-    pub(crate) upstream_inflight: &'a HashMap<String, Arc<Semaphore>>,
-    pub(crate) global_inflight: Arc<Semaphore>,
-    pub(crate) backend_timeout: Duration,
-    pub(crate) inflight_acquire_wait: Duration,
+pub(in crate::quic_listener) struct ForwardingExecutionCtx<'a> {
+    pub(in crate::quic_listener) transport_pool: Arc<UpstreamTransportPool>,
+    pub(in crate::quic_listener) backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+    pub(in crate::quic_listener) backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
+    pub(in crate::quic_listener) upstream_inflight: &'a HashMap<String, Arc<Semaphore>>,
+    pub(in crate::quic_listener) global_inflight: Arc<Semaphore>,
+    pub(in crate::quic_listener) backend_timeout: Duration,
+    pub(in crate::quic_listener) inflight_acquire_wait: Duration,
 }
 
-pub(crate) struct StreamProgressConfig {
-    pub(crate) backend_body_idle_timeout: Duration,
-    pub(crate) backend_body_total_timeout: Duration,
-    pub(crate) max_response_body_bytes: usize,
-    pub(crate) unknown_length_response_prebuffer_bytes: usize,
-    pub(crate) client_body_idle_timeout: Duration,
-    pub(crate) listen_port: u16,
+pub(in crate::quic_listener) struct StreamProgressConfig {
+    pub(in crate::quic_listener) backend_body_idle_timeout: Duration,
+    pub(in crate::quic_listener) backend_body_total_timeout: Duration,
+    pub(in crate::quic_listener) max_response_body_bytes: usize,
+    pub(in crate::quic_listener) unknown_length_response_prebuffer_bytes: usize,
+    pub(in crate::quic_listener) client_body_idle_timeout: Duration,
+    pub(in crate::quic_listener) listen_port: u16,
 }
 
 impl QUICListener {

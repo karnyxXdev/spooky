@@ -11,8 +11,7 @@ use log::{error, info};
 use spooky_config::runtime::{ListenerRuntimeConfig, RuntimeConfig};
 use spooky_edge::{
     quic_listener::{
-        ListenerWorkerRuntimeState,
-        workers::{ListenerWorkerGroupConfig, spawn_listener_worker_group},
+        ListenerWorkerGroupConfig, ListenerWorkerRuntimeState, spawn_listener_worker_group,
     },
     runtime::{
         bundle::RuntimeBundleHandle, listener::QUICListener, shared_state::SharedRuntimeState,

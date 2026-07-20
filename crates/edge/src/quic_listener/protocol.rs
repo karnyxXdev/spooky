@@ -1,7 +1,9 @@
 use super::*;
 
 #[cfg(test)]
-pub(crate) fn connection_header_tokens(headers: &http::HeaderMap) -> HashSet<String> {
+pub(in crate::quic_listener) fn connection_header_tokens(
+    headers: &http::HeaderMap,
+) -> HashSet<String> {
     let mut tokens = HashSet::new();
     for value in headers.get_all(http::header::CONNECTION) {
         let Ok(raw) = value.to_str() else {
@@ -19,7 +21,7 @@ pub(crate) fn connection_header_tokens(headers: &http::HeaderMap) -> HashSet<Str
 }
 
 #[cfg(test)]
-pub(crate) fn should_strip_bootstrap_request_header(
+pub(in crate::quic_listener) fn should_strip_bootstrap_request_header(
     name: &http::header::HeaderName,
     connection_tokens: &HashSet<String>,
 ) -> bool {
@@ -52,7 +54,7 @@ pub(crate) fn should_strip_bootstrap_request_header(
 }
 
 #[cfg(test)]
-pub(crate) fn should_strip_h3_response_header(
+pub(in crate::quic_listener) fn should_strip_h3_response_header(
     name: &http::header::HeaderName,
     connection_tokens: &HashSet<String>,
 ) -> bool {
@@ -68,7 +70,9 @@ pub(crate) fn should_strip_h3_response_header(
     )
 }
 
-pub(crate) fn collect_h3_trailers(trailers: &http::HeaderMap) -> Vec<(Vec<u8>, Vec<u8>)> {
+pub(in crate::quic_listener) fn collect_h3_trailers(
+    trailers: &http::HeaderMap,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     normalize_response_trailers(
         trailers,
         ResponseProtocolConstraints {
@@ -89,7 +93,7 @@ pub(crate) fn collect_h3_trailers(trailers: &http::HeaderMap) -> Vec<(Vec<u8>, V
 }
 
 #[cfg(test)]
-pub(crate) fn should_strip_bootstrap_response_header(
+pub(in crate::quic_listener) fn should_strip_bootstrap_response_header(
     name: &http::header::HeaderName,
     connection_tokens: &HashSet<String>,
 ) -> bool {
@@ -105,33 +109,42 @@ pub(crate) fn should_strip_bootstrap_response_header(
     )
 }
 
-pub(crate) fn is_connect_method(method: &str) -> bool {
+pub(in crate::quic_listener) fn is_connect_method(method: &str) -> bool {
     method.eq_ignore_ascii_case("CONNECT")
 }
 
-pub(crate) fn is_head_method(method: &str) -> bool {
+pub(in crate::quic_listener) fn is_head_method(method: &str) -> bool {
     method.eq_ignore_ascii_case("HEAD")
 }
 
-pub(crate) fn is_bodyless_request_mode(method: &str, content_length: Option<usize>) -> bool {
+pub(in crate::quic_listener) fn is_bodyless_request_mode(
+    method: &str,
+    content_length: Option<usize>,
+) -> bool {
     content_length.unwrap_or(0) == 0
         && (method.eq_ignore_ascii_case("GET") || is_head_method(method))
 }
 
-pub(crate) fn is_tunnel_mode(tunnel_mode: TunnelMode) -> bool {
+pub(in crate::quic_listener) fn is_tunnel_mode(tunnel_mode: TunnelMode) -> bool {
     tunnel_mode != TunnelMode::None
 }
 
-pub(crate) fn is_tunnel_response(tunnel_mode: TunnelMode, status: StatusCode) -> bool {
+pub(in crate::quic_listener) fn is_tunnel_response(
+    tunnel_mode: TunnelMode,
+    status: StatusCode,
+) -> bool {
     is_tunnel_mode(tunnel_mode) && status.is_success()
 }
 
 #[cfg(test)]
-pub(crate) fn is_connect_tunnel_response(method: &str, status: StatusCode) -> bool {
+pub(in crate::quic_listener) fn is_connect_tunnel_response(
+    method: &str,
+    status: StatusCode,
+) -> bool {
     is_connect_method(method) && status.is_success()
 }
 
-pub(crate) fn can_poll_upstream_result(req: &RequestEnvelope) -> bool {
+pub(in crate::quic_listener) fn can_poll_upstream_result(req: &RequestEnvelope) -> bool {
     if req.admission_state != StreamAdmissionState::ReadyToForward {
         return false;
     }
@@ -160,7 +173,10 @@ fn header_has_token(value: &http::HeaderValue, token: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn is_websocket_upgrade_request(req: &Request<Incoming>, use_h2: bool) -> bool {
+pub(in crate::quic_listener) fn is_websocket_upgrade_request(
+    req: &Request<Incoming>,
+    use_h2: bool,
+) -> bool {
     if use_h2 || req.method() != http::Method::GET {
         return false;
     }

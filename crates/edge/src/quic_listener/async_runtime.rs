@@ -23,14 +23,14 @@ pub fn configure_async_runtime(worker_threads: usize) {
     FALLBACK_RT_THREADS.store(threads, Ordering::Relaxed);
 }
 
-pub(crate) fn runtime_handle() -> Option<Handle> {
+pub(in crate::quic_listener) fn runtime_handle() -> Option<Handle> {
     if let Ok(handle) = Handle::try_current() {
         return Some(handle);
     }
     fallback_runtime().map(|rt| rt.handle().clone())
 }
 
-pub(crate) fn spawn_async_task<F>(fut: F, _task_name: &str) -> bool
+pub(in crate::quic_listener) fn spawn_async_task<F>(fut: F, _task_name: &str) -> bool
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
@@ -43,7 +43,7 @@ where
     }
 }
 
-pub(crate) fn spawn_supervised_async_task<F>(
+pub(in crate::quic_listener) fn spawn_supervised_async_task<F>(
     handle: &Handle,
     task_name: &'static str,
     metrics: Option<Arc<Metrics>>,

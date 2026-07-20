@@ -111,10 +111,12 @@ mod startup;
 mod tls_runtime;
 mod token_bucket;
 mod validation;
-pub mod workers;
+mod workers;
 
 pub use async_runtime::configure_async_runtime;
-pub(crate) use async_runtime::{runtime_handle, spawn_async_task, spawn_supervised_async_task};
+pub(in crate::quic_listener) use async_runtime::{
+    runtime_handle, spawn_async_task, spawn_supervised_async_task,
+};
 #[cfg(test)]
 use bootstrap_tls::BootstrapStartupState;
 use connection::maybe_log_quic_connection_error;
@@ -126,12 +128,12 @@ pub(crate) use connection::{ConnectionRoutes, sweep_closed_connections};
 use forwarding::{ForwardingExecutionCtx, ForwardingSharedCtx, StreamProgressConfig, abort_stream};
 #[cfg(test)]
 use health_check::classify_active_health_check_response;
-pub(crate) use protocol::{
+pub(in crate::quic_listener) use protocol::{
     can_poll_upstream_result, collect_h3_trailers, is_bodyless_request_mode, is_connect_method,
     is_head_method, is_tunnel_mode, is_tunnel_response, is_websocket_upgrade_request,
 };
 #[cfg(test)]
-pub(crate) use protocol::{
+pub(in crate::quic_listener) use protocol::{
     connection_header_tokens, is_connect_tunnel_response, should_strip_bootstrap_request_header,
     should_strip_bootstrap_response_header, should_strip_h3_response_header,
 };
@@ -141,6 +143,7 @@ use validation::{
     RequestBufferError, extract_header_value, generated_span_id, generated_trace_id,
     parse_traceparent, validate_http_request, validate_request_headers,
 };
+pub use workers::{ListenerWorkerGroupConfig, spawn_listener_worker_group};
 use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
 struct ListenerRuntimeSettings {

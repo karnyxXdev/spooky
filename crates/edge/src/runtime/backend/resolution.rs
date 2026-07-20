@@ -1,5 +1,7 @@
 use std::{net::SocketAddr, time::SystemTime};
 
+use crate::runtime::backend::state::{BackendIdentity, BackendResolutionState};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeBackendResolution {
     pub backend_addr: String,
@@ -43,6 +45,14 @@ impl RuntimeBackendResolution {
 
     pub fn is_hostname(&self) -> bool {
         self.address_kind == RuntimeBackendAddressKind::Hostname
+    }
+
+    pub fn identity(&self) -> BackendIdentity {
+        BackendIdentity::from(self)
+    }
+
+    pub fn resolution_state(&self) -> BackendResolutionState {
+        BackendResolutionState::from(self)
     }
 }
 

@@ -143,7 +143,7 @@ fn resolve_scoped_rate_limit_key_for_bootstrap(
 
 pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
     input: BootstrapPolicyEvaluationInput<'_>,
-) -> Result<BootstrapPreparedRoute, Response<BoxBody<Bytes, Infallible>>> {
+) -> Result<BootstrapPreparedRoute, Box<Response<BoxBody<Bytes, Infallible>>>> {
     let lb_header_lookup = |name: &str| {
         input
             .headers
@@ -166,11 +166,11 @@ pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
         Ok(value) => value,
         Err(err) => {
             let (status, body) = QUICListener::bootstrap_route_resolution_error_response(&err);
-            return Err(bootstrap_error_response(
+            return Err(Box::new(bootstrap_error_response(
                 &input.request_ctx.runtime.alt_svc,
                 status,
                 body,
-            ));
+            )));
         }
     };
 
@@ -230,25 +230,27 @@ pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
                     "Bootstrap request route={} missing admission rejection response for unauthorized decision",
                     resolved.upstream_name
                 );
-                return Err(internal_proxy_error_response(
+                return Err(Box::new(internal_proxy_error_response(
                     &input.request_ctx.runtime.alt_svc,
-                ));
+                )));
             };
             let Some(challenge) = response.www_authenticate else {
                 warn!(
                     "Bootstrap request route={} missing auth challenge in admission rejection response",
                     resolved.upstream_name
                 );
-                return Err(internal_proxy_error_response(
+                return Err(Box::new(internal_proxy_error_response(
                     &input.request_ctx.runtime.alt_svc,
-                ));
+                )));
             };
-            return Err(Response::builder()
-                .status(response.status)
-                .header("alt-svc", &input.request_ctx.runtime.alt_svc)
-                .header("www-authenticate", challenge)
-                .body(boxed_full(Bytes::from_static(response.body)))
-                .unwrap_or_else(|_| Response::new(boxed_full(Bytes::from_static(b"error\n")))));
+            return Err(Box::new(
+                Response::builder()
+                    .status(response.status)
+                    .header("alt-svc", &input.request_ctx.runtime.alt_svc)
+                    .header("www-authenticate", challenge)
+                    .body(boxed_full(Bytes::from_static(response.body)))
+                    .unwrap_or_else(|_| Response::new(boxed_full(Bytes::from_static(b"error\n")))),
+            ));
         }
         AdmissionPolicyDecision::RateLimited(decision) => {
             input.request_ctx.runtime.metrics.inc_request_rate_limited();
@@ -270,25 +272,27 @@ pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
                     "Bootstrap request route={} missing admission rejection response for rate-limited decision",
                     resolved.upstream_name
                 );
-                return Err(internal_proxy_error_response(
+                return Err(Box::new(internal_proxy_error_response(
                     &input.request_ctx.runtime.alt_svc,
-                ));
+                )));
             };
             let Some(retry_after_seconds) = response.retry_after_seconds else {
                 warn!(
                     "Bootstrap request route={} missing retry-after in rate-limited admission rejection response",
                     resolved.upstream_name
                 );
-                return Err(internal_proxy_error_response(
+                return Err(Box::new(internal_proxy_error_response(
                     &input.request_ctx.runtime.alt_svc,
-                ));
+                )));
             };
-            return Err(Response::builder()
-                .status(response.status)
-                .header("alt-svc", &input.request_ctx.runtime.alt_svc)
-                .header("retry-after", retry_after_seconds.to_string())
-                .body(boxed_full(Bytes::from_static(response.body)))
-                .unwrap_or_else(|_| Response::new(boxed_full(Bytes::from_static(b"error\n")))));
+            return Err(Box::new(
+                Response::builder()
+                    .status(response.status)
+                    .header("alt-svc", &input.request_ctx.runtime.alt_svc)
+                    .header("retry-after", retry_after_seconds.to_string())
+                    .body(boxed_full(Bytes::from_static(response.body)))
+                    .unwrap_or_else(|_| Response::new(boxed_full(Bytes::from_static(b"error\n")))),
+            ));
         }
         AdmissionPolicyDecision::Overloaded(decision) => {
             observe_bootstrap_admission_outcome(
@@ -313,25 +317,27 @@ pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
                     "Bootstrap request route={} missing admission rejection response for overload decision",
                     resolved.upstream_name
                 );
-                return Err(internal_proxy_error_response(
+                return Err(Box::new(internal_proxy_error_response(
                     &input.request_ctx.runtime.alt_svc,
-                ));
+                )));
             };
             let Some(retry_after_seconds) = response.retry_after_seconds else {
                 warn!(
                     "Bootstrap request route={} missing retry-after in overload admission rejection response",
                     resolved.upstream_name
                 );
-                return Err(internal_proxy_error_response(
+                return Err(Box::new(internal_proxy_error_response(
                     &input.request_ctx.runtime.alt_svc,
-                ));
+                )));
             };
-            return Err(Response::builder()
-                .status(response.status)
-                .header("alt-svc", &input.request_ctx.runtime.alt_svc)
-                .header("retry-after", retry_after_seconds.to_string())
-                .body(boxed_full(Bytes::from_static(response.body)))
-                .unwrap_or_else(|_| Response::new(boxed_full(Bytes::from_static(b"error\n")))));
+            return Err(Box::new(
+                Response::builder()
+                    .status(response.status)
+                    .header("alt-svc", &input.request_ctx.runtime.alt_svc)
+                    .header("retry-after", retry_after_seconds.to_string())
+                    .body(boxed_full(Bytes::from_static(response.body)))
+                    .unwrap_or_else(|_| Response::new(boxed_full(Bytes::from_static(b"error\n")))),
+            ));
         }
     }
 
@@ -352,11 +358,11 @@ pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
                 StatusCode::BAD_GATEWAY,
                 &ProxyError::Transport("no endpoint".into()),
             );
-            return Err(bootstrap_error_response(
+            return Err(Box::new(bootstrap_error_response(
                 &input.request_ctx.runtime.alt_svc,
                 StatusCode::BAD_GATEWAY,
                 b"no endpoint\n",
-            ));
+            )));
         }
     };
 

@@ -248,7 +248,7 @@ pub(in crate::quic_listener) fn spawn_bootstrap_tls_listener(
                                 request_start,
                             ) {
                                 Ok(intake) => intake,
-                                Err(response) => return Ok(response),
+                                Err(response) => return Ok(*response),
                             };
 
                             let policy_intake = BootstrapRequestIntake {
@@ -268,7 +268,7 @@ pub(in crate::quic_listener) fn spawn_bootstrap_tls_listener(
                                 },
                             ) {
                                 Ok(prepared) => prepared,
-                                Err(response) => return Ok(response),
+                                Err(response) => return Ok(*response),
                             };
 
                             let request_path = if path.is_empty() { "/" } else { &path };

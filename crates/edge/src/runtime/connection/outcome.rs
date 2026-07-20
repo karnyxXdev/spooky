@@ -14,8 +14,14 @@ use crate::{
     Metrics, OverloadShedReason, RouteOutcome,
     runtime::{
         backend::{
-            event::BackendRequestFeedback,
-            lifecycle::{apply_backend_request_accounting, apply_backend_request_feedback},
+            event::{
+                BackendHealthObservation, BackendHealthObservationOutcome,
+                BackendHealthObservationSource, BackendRequestFeedback,
+            },
+            lifecycle::{
+                apply_backend_health_observation, apply_backend_request_accounting,
+                apply_backend_request_feedback,
+            },
             state::BackendIdentity,
         },
     },
@@ -409,13 +415,42 @@ pub(crate) fn observe_backend_response_status(
         status,
     } = input;
 
-    let feedback = BackendRequestFeedback::from_status(
-        BackendIdentity::new(backend_addr),
-        Duration::ZERO,
-        status,
-    );
+    let observation = BackendHealthObservation {
+        identity: BackendIdentity::new(backend_addr),
+        source: BackendHealthObservationSource::PassiveRequest,
+        outcome: if status.is_server_error() {
+            BackendHealthObservationOutcome::Failure
+        } else if status.is_client_error() {
+            BackendHealthObservationOutcome::Neutral
+        } else {
+            BackendHealthObservationOutcome::Success
+        },
+        reason: if status.is_server_error() {
+            Some(HealthFailureReason::HttpStatus5xx)
+        } else {
+            None
+        },
+    };
 
-    apply_backend_request_feedback(upstream_pool, Some(backend_index), &feedback)
+    apply_backend_health_observation(upstream_pool, Some(backend_index), &observation)
+}
+
+pub(crate) fn record_classified_backend_failure_metrics(
+    metrics_phase: &str,
+    backend_addr: &str,
+    metrics: &Metrics,
+    classified: &ClassifiedUpstreamProxyError,
+) -> Option<HealthFailureReason> {
+    let health_mapping = classified.health_failure?;
+    metrics.inc_health_failure(health_mapping.failure_reason);
+    if health_mapping.failure_reason == HealthFailureReason::Tls {
+        metrics.record_upstream_tls_failure(
+            backend_addr,
+            metrics_phase,
+            health_mapping.metrics_reason,
+        );
+    }
+    Some(health_mapping.failure_reason)
 }
 
 pub(crate) fn observe_classified_backend_failure(
@@ -430,20 +465,13 @@ pub(crate) fn observe_classified_backend_failure(
         classified,
     } = input;
 
-    let health_mapping = classified.health_failure?;
-    metrics.inc_health_failure(health_mapping.failure_reason);
-    if health_mapping.failure_reason == HealthFailureReason::Tls {
-        metrics.record_upstream_tls_failure(
-            backend_addr,
-            metrics_phase,
-            health_mapping.metrics_reason,
-        );
-    }
+    let reason =
+        record_classified_backend_failure_metrics(metrics_phase, backend_addr, metrics, classified)?;
     let feedback = BackendRequestFeedback::failure(
         BackendIdentity::new(backend_addr),
         Duration::ZERO,
         None,
-        Some(health_mapping.failure_reason),
+        Some(reason),
     );
 
     apply_backend_request_feedback(upstream_pool, Some(backend_index), &feedback)

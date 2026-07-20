@@ -6,7 +6,10 @@ use std::{
 use spooky_lb::{backend::HealthTransition, upstream_pool::UpstreamPool};
 
 use super::{
-    event::{BackendRequestFeedback, BackendRequestFeedbackOutcome},
+    event::{
+        BackendHealthObservation, BackendHealthObservationOutcome, BackendHealthObservationSource,
+        BackendRequestFeedback, BackendRequestFeedbackOutcome,
+    },
     resolution::RuntimeBackendResolution,
     state::{
         BackendHealthState, BackendIdentity, BackendLifecycleSnapshot, BackendMembershipState,
@@ -68,6 +71,13 @@ impl From<&RuntimeBackendLifecycleState> for BackendLifecycleSnapshot {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveHealthCheckEvaluation {
+    pub observation: BackendHealthObservation,
+    pub next_consecutive_failures: u32,
+    pub next_delay: Duration,
+}
+
 pub fn apply_backend_request_accounting(
     upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
     backend_index: Option<usize>,
@@ -99,6 +109,57 @@ pub fn apply_backend_request_feedback(
     }
 }
 
+pub fn evaluate_active_health_check(
+    identity: BackendIdentity,
+    outcome: BackendHealthObservationOutcome,
+    reason: Option<spooky_lb::health::HealthFailureReason>,
+    base_interval_ms: u64,
+    consecutive_failures: u32,
+) -> ActiveHealthCheckEvaluation {
+    let next_consecutive_failures = match outcome {
+        BackendHealthObservationOutcome::Failure => consecutive_failures.saturating_add(1),
+        BackendHealthObservationOutcome::Success | BackendHealthObservationOutcome::Neutral => 0,
+    };
+    let backoff_multiplier = 1u64 << next_consecutive_failures.min(2);
+    let delay_ms = base_interval_ms.saturating_mul(backoff_multiplier);
+
+    ActiveHealthCheckEvaluation {
+        observation: BackendHealthObservation::active_check(identity, outcome, reason),
+        next_consecutive_failures,
+        next_delay: Duration::from_millis(delay_ms),
+    }
+}
+
+pub fn apply_backend_health_observation(
+    upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
+    backend_index: Option<usize>,
+    observation: &BackendHealthObservation,
+) -> Option<HealthTransition> {
+    let (Some(pool), Some(index)) = (upstream_pool, backend_index) else {
+        return None;
+    };
+    let mut pool = pool.write().ok()?;
+    match (observation.source, observation.outcome) {
+        (
+            BackendHealthObservationSource::ActiveCheck,
+            BackendHealthObservationOutcome::Success,
+        ) => pool.mark_backend_healthy(index),
+        (
+            BackendHealthObservationSource::ActiveCheck,
+            BackendHealthObservationOutcome::Failure,
+        ) => pool.mark_backend_failure_from_active_check(index),
+        (
+            BackendHealthObservationSource::ActiveCheck,
+            BackendHealthObservationOutcome::Neutral,
+        ) => None,
+        (_, BackendHealthObservationOutcome::Success) => pool.mark_backend_healthy(index),
+        (_, BackendHealthObservationOutcome::Neutral) => None,
+        (_, BackendHealthObservationOutcome::Failure) => observation
+            .reason
+            .and_then(|reason| pool.mark_backend_request_failure(index, reason)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -108,7 +169,9 @@ mod tests {
         runtime::RuntimeConfig,
     };
 
-    use crate::runtime::backend::event::BackendRequestFeedback;
+    use crate::runtime::backend::event::{
+        BackendHealthObservationOutcome, BackendRequestFeedback,
+    };
 
     use super::*;
 
@@ -232,5 +295,36 @@ mod tests {
         let guard = pool.read().expect("read");
         assert_eq!(guard.pool.backends[0].active_requests(), 0);
         assert!(guard.pool.backends[0].ewma_latency_ms().is_some());
+    }
+
+    #[test]
+    fn active_health_check_evaluation_tracks_backoff_and_transition() {
+        let pool = test_upstream_pool();
+
+        let failure = evaluate_active_health_check(
+            BackendIdentity::new("127.0.0.1:8080"),
+            BackendHealthObservationOutcome::Failure,
+            Some(spooky_lb::health::HealthFailureReason::Transport),
+            100,
+            0,
+        );
+        assert_eq!(failure.next_consecutive_failures, 1);
+        assert_eq!(failure.next_delay, Duration::from_millis(200));
+        let transition =
+            apply_backend_health_observation(Some(&pool), Some(0), &failure.observation);
+        assert!(matches!(transition, Some(HealthTransition::BecameUnhealthy)));
+
+        let success = evaluate_active_health_check(
+            BackendIdentity::new("127.0.0.1:8080"),
+            BackendHealthObservationOutcome::Success,
+            None,
+            100,
+            failure.next_consecutive_failures,
+        );
+        assert_eq!(success.next_consecutive_failures, 0);
+        assert_eq!(success.next_delay, Duration::from_millis(100));
+        let transition =
+            apply_backend_health_observation(Some(&pool), Some(0), &success.observation);
+        assert!(matches!(transition, Some(HealthTransition::BecameHealthy)));
     }
 }

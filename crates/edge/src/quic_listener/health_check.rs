@@ -2,6 +2,14 @@ use http_body_util::Full;
 use spooky_errors::{classify_upstream_proxy_error, classify_upstream_send_error};
 
 use super::*;
+use crate::runtime::{
+    backend::{
+        event::BackendHealthObservationOutcome,
+        lifecycle::{apply_backend_health_observation, evaluate_active_health_check},
+        state::BackendIdentity,
+    },
+    connection::outcome::record_classified_backend_failure_metrics,
+};
 
 impl QUICListener {
     pub(super) fn spawn_health_checks(
@@ -129,9 +137,28 @@ impl QUICListener {
                             )
                             .await;
 
-                            let outcome = match result {
+                            let evaluation = match result {
                                 Ok(Ok(response)) => {
-                                    classify_active_health_check_response(response.status())
+                                    let outcome =
+                                        match classify_active_health_check_response(response.status())
+                                        {
+                                            HealthClassification::Success => {
+                                                BackendHealthObservationOutcome::Success
+                                            }
+                                            HealthClassification::Failure => {
+                                                BackendHealthObservationOutcome::Failure
+                                            }
+                                            HealthClassification::Neutral => {
+                                                BackendHealthObservationOutcome::Neutral
+                                            }
+                                        };
+                                    evaluate_active_health_check(
+                                        BackendIdentity::new(job.backend_identity.clone()),
+                                        outcome,
+                                        None,
+                                        job.base_interval_ms,
+                                        job.consecutive_failures,
+                                    )
                                 }
                                 Ok(Err(PoolError::Send(send_err))) => {
                                     let classified = classify_upstream_send_error(&send_err);
@@ -142,22 +169,19 @@ impl QUICListener {
                                         &job.backend_identity,
                                         &classified,
                                     );
-                                    if let Some(transition) = crate::runtime::connection::outcome::observe_classified_backend_failure(
-                                        crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
-                                            metrics_phase: "health_check",
-                                            backend_addr: &job.backend_identity,
-                                            backend_index: job.index,
-                                            upstream_pool: Some(&job.upstream_pool),
-                                            metrics: task_metrics.as_ref(),
-                                            classified: &classified,
-                                        },
-                                    ) {
-                                        crate::runtime::connection::outcome::log_backend_health_transition(
-                                            &job.backend_identity,
-                                            transition,
-                                        );
-                                    }
-                                    HealthClassification::Failure
+                                    let reason = record_classified_backend_failure_metrics(
+                                        "health_check",
+                                        &job.backend_identity,
+                                        task_metrics.as_ref(),
+                                        &classified,
+                                    );
+                                    evaluate_active_health_check(
+                                        BackendIdentity::new(job.backend_identity.clone()),
+                                        BackendHealthObservationOutcome::Failure,
+                                        reason,
+                                        job.base_interval_ms,
+                                        job.consecutive_failures,
+                                    )
                                 }
                                 Ok(Err(pool_err)) => {
                                     let proxy_err = ProxyError::Pool(pool_err);
@@ -171,26 +195,30 @@ impl QUICListener {
                                             &job.backend_identity,
                                             &classified,
                                         );
-                                        if let Some(transition) = crate::runtime::connection::outcome::observe_classified_backend_failure(
-                                            crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
-                                                metrics_phase: "health_check",
-                                                backend_addr: &job.backend_identity,
-                                                backend_index: job.index,
-                                                upstream_pool: Some(&job.upstream_pool),
-                                                metrics: task_metrics.as_ref(),
-                                                classified: &classified,
-                                            },
-                                        ) {
-                                            crate::runtime::connection::outcome::log_backend_health_transition(
-                                                &job.backend_identity,
-                                                transition,
-                                            );
-                                        }
+                                        let reason = record_classified_backend_failure_metrics(
+                                            "health_check",
+                                            &job.backend_identity,
+                                            task_metrics.as_ref(),
+                                            &classified,
+                                        );
+                                        evaluate_active_health_check(
+                                            BackendIdentity::new(job.backend_identity.clone()),
+                                            BackendHealthObservationOutcome::Failure,
+                                            reason,
+                                            job.base_interval_ms,
+                                            job.consecutive_failures,
+                                        )
                                     } else {
                                         task_metrics
                                             .inc_health_failure(HealthFailureReason::Transport);
+                                        evaluate_active_health_check(
+                                            BackendIdentity::new(job.backend_identity.clone()),
+                                            BackendHealthObservationOutcome::Failure,
+                                            Some(HealthFailureReason::Transport),
+                                            job.base_interval_ms,
+                                            job.consecutive_failures,
+                                        )
                                     }
-                                    HealthClassification::Failure
                                 }
                                 Err(_) => {
                                     if let Some(classified) =
@@ -203,53 +231,51 @@ impl QUICListener {
                                             &job.backend_identity,
                                             &classified,
                                         );
-                                        if let Some(transition) = crate::runtime::connection::outcome::observe_classified_backend_failure(
-                                            crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
-                                                metrics_phase: "health_check",
-                                                backend_addr: &job.backend_identity,
-                                                backend_index: job.index,
-                                                upstream_pool: Some(&job.upstream_pool),
-                                                metrics: task_metrics.as_ref(),
-                                                classified: &classified,
-                                            },
-                                        ) {
-                                            crate::runtime::connection::outcome::log_backend_health_transition(
-                                                &job.backend_identity,
-                                                transition,
-                                            );
-                                        }
+                                        let reason = record_classified_backend_failure_metrics(
+                                            "health_check",
+                                            &job.backend_identity,
+                                            task_metrics.as_ref(),
+                                            &classified,
+                                        );
+                                        evaluate_active_health_check(
+                                            BackendIdentity::new(job.backend_identity.clone()),
+                                            BackendHealthObservationOutcome::Failure,
+                                            reason,
+                                            job.base_interval_ms,
+                                            job.consecutive_failures,
+                                        )
                                     } else {
                                         task_metrics
                                             .inc_health_failure(HealthFailureReason::Timeout);
+                                        evaluate_active_health_check(
+                                            BackendIdentity::new(job.backend_identity.clone()),
+                                            BackendHealthObservationOutcome::Failure,
+                                            Some(HealthFailureReason::Timeout),
+                                            job.base_interval_ms,
+                                            job.consecutive_failures,
+                                        )
                                     }
-                                    HealthClassification::Failure
                                 }
                             };
 
-                            let transition = match job.upstream_pool.write() {
-                                Ok(mut pool) => match outcome {
-                                    HealthClassification::Success => {
-                                        task_metrics.inc_health_check_success();
-                                        job.consecutive_failures = 0;
-                                        pool.mark_backend_healthy(job.index)
-                                    }
-                                    HealthClassification::Failure => {
-                                        task_metrics.inc_health_check_failure();
-                                        job.consecutive_failures =
-                                            job.consecutive_failures.saturating_add(1);
-                                        pool.mark_backend_failure_from_active_check(job.index)
-                                    }
-                                    HealthClassification::Neutral => {
-                                        job.consecutive_failures = 0;
-                                        None
-                                    }
-                                },
-                                Err(_) => None,
-                            };
+                            let transition = apply_backend_health_observation(
+                                Some(&job.upstream_pool),
+                                Some(job.index),
+                                &evaluation.observation,
+                            );
 
-                            let backoff_multiplier = 1u64 << job.consecutive_failures.min(2);
-                            let delay_ms = job.base_interval_ms.saturating_mul(backoff_multiplier);
-                            job.next_due_at = Instant::now() + Duration::from_millis(delay_ms);
+                            match evaluation.observation.outcome {
+                                BackendHealthObservationOutcome::Success => {
+                                    task_metrics.inc_health_check_success();
+                                }
+                                BackendHealthObservationOutcome::Failure => {
+                                    task_metrics.inc_health_check_failure();
+                                }
+                                BackendHealthObservationOutcome::Neutral => {}
+                            }
+
+                            job.consecutive_failures = evaluation.next_consecutive_failures;
+                            job.next_due_at = Instant::now() + evaluation.next_delay;
 
                             if let Some(transition) = transition {
                                 crate::runtime::connection::outcome::log_backend_health_transition(

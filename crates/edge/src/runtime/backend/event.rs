@@ -101,6 +101,21 @@ pub struct BackendHealthObservation {
     pub reason: Option<HealthFailureReason>,
 }
 
+impl BackendHealthObservation {
+    pub fn active_check(
+        identity: BackendIdentity,
+        outcome: BackendHealthObservationOutcome,
+        reason: Option<HealthFailureReason>,
+    ) -> Self {
+        Self {
+            identity,
+            source: BackendHealthObservationSource::ActiveCheck,
+            outcome,
+            reason,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendHealthObservationSource {
     ActiveCheck,

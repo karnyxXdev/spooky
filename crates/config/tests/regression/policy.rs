@@ -1,7 +1,6 @@
 //! Policy-combination and route-matcher rejection cases.
 
-use spooky_config::config::UpstreamHostPolicyMode;
-use spooky_config::runtime::RuntimeConfig;
+use spooky_config::{config::UpstreamHostPolicyMode, runtime::RuntimeConfig};
 
 use crate::common::sample_config;
 

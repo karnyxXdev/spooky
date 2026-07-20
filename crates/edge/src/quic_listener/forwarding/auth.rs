@@ -1,5 +1,6 @@
-use std::convert::Infallible;
+use std::{convert::Infallible, sync::OnceLock};
 
+use http_body_util::Full;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use serde_json::Value;

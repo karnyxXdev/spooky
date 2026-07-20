@@ -2,8 +2,7 @@
 
 use std::time::Duration;
 
-use spooky_config::config::HealthCheck;
-use spooky_config::runtime::RuntimeConfig;
+use spooky_config::{config::HealthCheck, runtime::RuntimeConfig};
 
 use crate::common::sample_config;
 

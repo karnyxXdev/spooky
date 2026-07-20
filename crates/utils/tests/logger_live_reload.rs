@@ -1,8 +1,7 @@
 use std::fs;
 
-use tempfile::tempdir;
-
 use spooky_utils::logger::{LoggerInitStatus, set_log_level, try_init_logger};
+use tempfile::tempdir;
 
 #[test]
 fn raising_log_level_live_enables_new_debug_emission() {

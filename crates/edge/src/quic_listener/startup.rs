@@ -1,0 +1,667 @@
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr, SocketAddr as StdSocketAddr, ToSocketAddrs, UdpSocket},
+    sync::{Arc, RwLock},
+    time::Duration,
+};
+
+use log::{debug, info, warn};
+use socket2::{Domain, Protocol, Socket, Type};
+use spooky_config::runtime::{ListenerRuntimeConfig, RuntimeBackendAddressKind, RuntimeConfig};
+use spooky_errors::ProxyError;
+use spooky_lb::upstream_pool::UpstreamPool;
+use spooky_transport::{h2_client::SharedDnsResolver, transport_pool::UpstreamTransportPool};
+use tokio::sync::Semaphore;
+
+use crate::{
+    constants::UDP_READ_TIMEOUT_MS,
+    quic_listener::{ListenerRuntimeSettings, TokenBucket},
+    resilience::runtime::RuntimeResilience,
+    routing::index::RouteIndex,
+    runtime::{
+        backend::{resolution::RuntimeBackendResolution, store::RuntimeBackendResolutionStore},
+        bundle::{RuntimeBundle, RuntimeBundleHandle},
+        listener::QUICListener,
+        shared_state::SharedRuntimeState,
+        tasks::RuntimeTaskRegistry,
+    },
+    watchdog::{config::WatchdogRuntimeConfig, coordinator::WatchdogCoordinator},
+};
+
+struct PreparedListenerStartup {
+    listener_config: ListenerRuntimeConfig,
+    shared_state: Arc<SharedRuntimeState>,
+    socket: UdpSocket,
+}
+
+impl QUICListener {
+    pub(super) fn listener_runtime_settings(
+        config: &ListenerRuntimeConfig,
+    ) -> ListenerRuntimeSettings {
+        let transport_policy = &config.policies.transport;
+        let timeout_policy = &config.policies.timeouts;
+        ListenerRuntimeSettings {
+            backend_timeout: timeout_policy.backend_request,
+            backend_body_idle_timeout: timeout_policy.backend_body_idle,
+            backend_body_total_timeout: timeout_policy.backend_body_total,
+            client_body_idle_timeout: timeout_policy.client_body_idle,
+            backend_total_request_timeout: timeout_policy.backend_total_request,
+            inflight_acquire_wait: timeout_policy.inflight_acquire_wait,
+            drain_timeout: timeout_policy.shutdown_drain,
+            max_active_connections: transport_policy
+                .connection_limits
+                .max_active_connections
+                .max(1),
+            max_streams_per_connection: usize::try_from(
+                transport_policy.quic_initial_max_streams_bidi,
+            )
+            .unwrap_or(usize::MAX)
+            .max(1),
+            max_request_body_bytes: transport_policy.max_request_body_bytes,
+            max_response_body_bytes: transport_policy.max_response_body_bytes,
+            request_buffer_global_cap_bytes: transport_policy.request_buffer_global_cap_bytes,
+            unknown_length_response_prebuffer_bytes: transport_policy
+                .unknown_length_response_prebuffer_bytes,
+            new_connections_per_sec: transport_policy.new_connections_per_sec,
+            new_connections_burst: transport_policy.new_connections_burst,
+        }
+    }
+
+    pub fn new(config: spooky_config::config::Config) -> Result<Self, ProxyError> {
+        let prepared = Self::prepare_listener_startup(config)?;
+        Self::new_with_socket_and_shared_state(
+            prepared.listener_config,
+            prepared.socket,
+            prepared.shared_state,
+        )
+    }
+
+    fn prepare_listener_startup(
+        config: spooky_config::config::Config,
+    ) -> Result<PreparedListenerStartup, ProxyError> {
+        let runtime_config = RuntimeConfig::from_config(&config)
+            .map_err(|err| ProxyError::Transport(err.to_string()))?;
+        let listener_config = runtime_config
+            .listener_runtime_configs()
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                ProxyError::Transport("no effective listeners configured".to_string())
+            })?;
+        let shared_state = Arc::new(Self::build_shared_state(&runtime_config)?);
+        Self::spawn_control_plane_tasks(&runtime_config, &shared_state, 1)?;
+        let socket = Self::bind_socket(&listener_config, false)?;
+
+        Ok(PreparedListenerStartup {
+            listener_config,
+            shared_state,
+            socket,
+        })
+    }
+
+    fn record_backend_connect(
+        metrics: &crate::Metrics,
+        backend: &str,
+        hostname: &str,
+        resolved_addr: StdSocketAddr,
+    ) {
+        metrics.record_backend_connect(backend, hostname, resolved_addr);
+    }
+
+    pub fn build_shared_state(config: &RuntimeConfig) -> Result<SharedRuntimeState, ProxyError> {
+        let transport_policy = &config.policies.transport;
+        let timeout_policy = &config.policies.timeouts;
+        let worker_threads = transport_policy.worker_threads.max(1);
+        let shard_count = transport_policy.packet_shards_per_worker.max(1);
+        let active_worker_threads = if worker_threads > 1 && !transport_policy.reuseport {
+            1
+        } else {
+            worker_threads
+        };
+        let worker_slots = active_worker_threads.saturating_mul(shard_count).max(1);
+        let per_upstream_limit = transport_policy
+            .connection_limits
+            .per_upstream_inflight
+            .max(1);
+        let global_inflight_limit = transport_policy.connection_limits.global_inflight.max(1);
+        info!(
+            "Runtime performance concurrency worker_threads={} control_plane_threads={} packet_shards_per_worker={} reuseport={} pin_workers={}",
+            worker_threads,
+            transport_policy.control_plane_threads.max(1),
+            shard_count,
+            transport_policy.reuseport,
+            transport_policy.pin_workers,
+        );
+        info!(
+            "Runtime performance inflight_limits global_inflight_limit={} per_upstream_inflight_limit={} per_backend_inflight_limit={} max_active_connections={}",
+            global_inflight_limit,
+            per_upstream_limit,
+            transport_policy.connection_limits.per_backend,
+            transport_policy.connection_limits.max_active_connections,
+        );
+        info!(
+            "Runtime performance upstream_timeouts backend_connect_timeout_ms={} backend_timeout_ms={} backend_body_idle_timeout_ms={} backend_body_total_timeout_ms={} backend_total_request_timeout_ms={}",
+            timeout_policy.backend_connect.as_millis(),
+            timeout_policy.backend_request.as_millis(),
+            timeout_policy.backend_body_idle.as_millis(),
+            timeout_policy.backend_body_total.as_millis(),
+            timeout_policy.backend_total_request.as_millis(),
+        );
+        info!(
+            "Runtime performance request_limits client_body_idle_timeout_ms={} max_request_body_bytes={} max_response_body_bytes={} request_buffer_global_cap_bytes={} unknown_length_response_prebuffer_bytes={}",
+            timeout_policy.client_body_idle.as_millis(),
+            transport_policy.max_request_body_bytes,
+            transport_policy.max_response_body_bytes,
+            transport_policy.request_buffer_global_cap_bytes,
+            transport_policy.unknown_length_response_prebuffer_bytes,
+        );
+        info!(
+            "Runtime performance transport_buffers udp_recv_buffer_bytes={} udp_send_buffer_bytes={} h2_pool_max_idle_per_backend={} h2_pool_idle_timeout_ms={}",
+            transport_policy.udp_recv_buffer_bytes,
+            transport_policy.udp_send_buffer_bytes,
+            transport_policy.backend_connections.max_idle_per_backend,
+            transport_policy
+                .backend_connections
+                .pool_idle_timeout
+                .as_millis(),
+        );
+
+        let listener_runtime_configs = config
+            .listener_runtime_configs()
+            .into_iter()
+            .map(|listener_config| (Self::listener_label(&listener_config), listener_config))
+            .collect::<HashMap<_, _>>();
+        let listener_tls_store = Arc::new(Self::build_listener_tls_reload_store(config)?);
+
+        let mut backend_resolutions = Vec::new();
+        let mut seen_backend_origins: HashMap<String, (String, String)> = HashMap::new();
+        let mut backend_endpoints = HashMap::new();
+        let mut backend_health_checks = HashMap::new();
+        for (upstream_name, upstream) in &config.upstreams {
+            for backend in &upstream.backends {
+                let endpoint = backend.endpoint.canonical.clone();
+                let origin = backend.endpoint.origin.clone();
+                if let Some((existing_upstream, existing_backend)) = seen_backend_origins.insert(
+                    origin.clone(),
+                    (upstream_name.clone(), backend.backend.id.clone()),
+                ) {
+                    return Err(ProxyError::Transport(format!(
+                        "duplicate backend address '{}' detected while building upstream transport pool: upstream '{}' backend '{}' conflicts with upstream '{}' backend '{}'",
+                        origin,
+                        upstream_name,
+                        backend.backend.id,
+                        existing_upstream,
+                        existing_backend
+                    )));
+                }
+                let authority_host = backend.endpoint.authority_host.clone();
+                let authority_port = backend.endpoint.authority_port;
+                let resolution = if matches!(
+                    backend.endpoint.address_kind,
+                    RuntimeBackendAddressKind::IpLiteral
+                ) {
+                    let ip_addr = authority_host.parse::<IpAddr>().map_err(|err| {
+                        ProxyError::Transport(format!(
+                            "failed to parse IP literal backend '{}' in upstream '{}' (backend '{}'): {}",
+                            backend.backend.address, upstream_name, backend.backend.id, err
+                        ))
+                    })?;
+                    RuntimeBackendResolution::ip_literal(
+                        backend.backend.address.clone(),
+                        authority_host,
+                        authority_port,
+                        vec![StdSocketAddr::new(ip_addr, authority_port)],
+                    )
+                } else {
+                    RuntimeBackendResolution::hostname(
+                        backend.backend.address.clone(),
+                        authority_host,
+                        authority_port,
+                    )
+                };
+                backend_resolutions.push(resolution);
+                let authority_kind = match backend.endpoint.address_kind {
+                    RuntimeBackendAddressKind::IpLiteral => "ip_literal",
+                    RuntimeBackendAddressKind::Hostname => "hostname",
+                };
+                debug!(
+                    "Configured upstream TLS policy backend={} upstream={} verify_certificates={} strict_sni={} ca_file={:?} ca_dir={:?} authority_kind={}",
+                    backend.backend.address,
+                    upstream_name,
+                    upstream.policy_set.transport.tls.verify_certificates,
+                    upstream.policy_set.transport.tls.strict_sni,
+                    upstream.policy_set.transport.tls.ca_file,
+                    upstream.policy_set.transport.tls.ca_dir,
+                    authority_kind
+                );
+                backend_endpoints.insert(backend.backend.address.clone(), endpoint);
+                if let Some(health_check) = backend.health_check.clone() {
+                    backend_health_checks.insert(backend.backend.address.clone(), health_check);
+                }
+            }
+        }
+
+        let mut route_labels = config.upstreams.keys().cloned().collect::<Vec<_>>();
+        route_labels.push("unrouted".to_string());
+        let routing_index = Arc::new(RouteIndex::from_runtime_upstreams(&config.upstreams));
+        let metrics = Arc::new(crate::Metrics::new(worker_slots, route_labels));
+        let backend_dns_resolver = SharedDnsResolver::new();
+        let backend_resolution_store =
+            Arc::new(RuntimeBackendResolutionStore::new(backend_resolutions));
+        let connect_metrics = Arc::clone(&metrics);
+        let connect_observer: spooky_transport::h2_client::ConnectObserver = Arc::new(
+            move |observation: spooky_transport::h2_client::ConnectObservation| {
+                Self::record_backend_connect(
+                    &connect_metrics,
+                    &observation.backend,
+                    &observation.hostname,
+                    observation.resolved_addr,
+                );
+            },
+        );
+        let transport_pool = Arc::new(
+            UpstreamTransportPool::from_runtime_upstreams(
+                config.upstreams.values(),
+                &transport_policy.backend_connections,
+                backend_dns_resolver.clone(),
+                Some(connect_observer),
+            )
+            .map_err(ProxyError::Tls)?,
+        );
+        let mut upstream_pools = HashMap::new();
+        let mut upstream_inflight = HashMap::new();
+        for (name, runtime_upstream) in &config.upstreams {
+            let upstream_pool =
+                UpstreamPool::from_runtime_upstream(runtime_upstream).map_err(|err| {
+                    ProxyError::Transport(format!(
+                        "failed to create upstream pool '{}': {}",
+                        name, err
+                    ))
+                })?;
+            upstream_pools.insert(name.clone(), Arc::new(RwLock::new(upstream_pool)));
+            upstream_inflight.insert(name.clone(), Arc::new(Semaphore::new(per_upstream_limit)));
+        }
+
+        let mut effective_admission = config.policies.admission.clone();
+        let default_route_cap_limit = per_upstream_limit.saturating_mul(2).max(1);
+        if effective_admission.route_queue.default_cap > default_route_cap_limit {
+            warn!(
+                "resilience.route_queue.default_cap={} is above tuned limit {}; clamping for steadier timeout/admission behavior",
+                effective_admission.route_queue.default_cap, default_route_cap_limit
+            );
+        }
+        let global_route_cap_limit = global_inflight_limit.saturating_mul(2).max(1);
+        if effective_admission.route_queue.global_cap > global_route_cap_limit {
+            warn!(
+                "resilience.route_queue.global_cap={} is above tuned limit {}; clamping for steadier timeout/admission behavior",
+                effective_admission.route_queue.global_cap, global_route_cap_limit
+            );
+        }
+        let backend_timeout_ms =
+            u64::try_from(timeout_policy.backend_request.as_millis()).unwrap_or(u64::MAX);
+        let tuned_high_latency = (backend_timeout_ms.saturating_mul(7) / 10).max(50);
+        if effective_admission.adaptive_admission.high_latency
+            > Duration::from_millis(tuned_high_latency)
+        {
+            warn!(
+                "resilience.adaptive_admission.high_latency_ms={} is above tuned limit {}; clamping for faster overload reaction",
+                effective_admission
+                    .adaptive_admission
+                    .high_latency
+                    .as_millis(),
+                tuned_high_latency
+            );
+        }
+        effective_admission = effective_admission.with_runtime_overrides(
+            default_route_cap_limit,
+            global_route_cap_limit,
+            Duration::from_millis(tuned_high_latency),
+        );
+        let resilience = Arc::new(RuntimeResilience::from_policies(
+            &effective_admission,
+            &config.policies.rate_limits,
+        ));
+        let watchdog = Arc::new(WatchdogCoordinator::from_runtime_config(
+            &WatchdogRuntimeConfig::from(&config.policies.admission.watchdog),
+        ));
+        for (listener_label, inventory) in listener_tls_store.snapshot() {
+            Self::update_listener_tls_expiry_metrics(&metrics, &listener_label, &inventory);
+        }
+
+        Ok(SharedRuntimeState {
+            listener_runtime_configs: Arc::new(listener_runtime_configs),
+            listener_tls_store,
+            transport_pool,
+            backend_endpoints: Arc::new(backend_endpoints),
+            backend_health_checks: Arc::new(backend_health_checks),
+            backend_resolution_store,
+            backend_dns_resolver,
+            upstream_policies: Arc::new(
+                config
+                    .upstreams
+                    .iter()
+                    .map(|(name, upstream)| (name.clone(), upstream.policy.clone()))
+                    .collect(),
+            ),
+            upstream_pools,
+            upstream_inflight,
+            global_inflight: Arc::new(Semaphore::new(global_inflight_limit)),
+            routing_index,
+            metrics,
+            resilience,
+            watchdog,
+            generation_tasks: Arc::new(RuntimeTaskRegistry::new()),
+        })
+    }
+
+    pub fn build_runtime_bundle(
+        config_path: String,
+        log_config: spooky_config::config::Log,
+        runtime_config: &RuntimeConfig,
+    ) -> Result<RuntimeBundle, ProxyError> {
+        let shared_state = Arc::new(Self::build_shared_state(runtime_config)?);
+        Ok(RuntimeBundle {
+            generation: 0,
+            config_path,
+            log_config,
+            runtime_config: runtime_config.clone(),
+            shared_state,
+        })
+    }
+
+    pub fn spawn_control_plane_tasks(
+        config: &RuntimeConfig,
+        shared_state: &SharedRuntimeState,
+        worker_count: usize,
+    ) -> Result<(), ProxyError> {
+        shared_state
+            .watchdog
+            .set_expected_workers(worker_count.max(1));
+        Self::spawn_generation_background_tasks(config, shared_state);
+        Self::spawn_metrics_endpoint(config, Arc::clone(&shared_state.metrics), None)?;
+        Self::spawn_control_api_endpoint(config, shared_state, None, worker_count)?;
+        Ok(())
+    }
+
+    pub fn spawn_control_plane_tasks_with_runtime_bundle(
+        config: &RuntimeConfig,
+        shared_state: &SharedRuntimeState,
+        runtime_bundle: Arc<RuntimeBundleHandle>,
+        worker_count: usize,
+    ) -> Result<(), ProxyError> {
+        shared_state
+            .watchdog
+            .set_expected_workers(worker_count.max(1));
+        Self::spawn_generation_background_tasks(config, shared_state);
+        Self::spawn_metrics_endpoint(
+            config,
+            Arc::clone(&shared_state.metrics),
+            Some(Arc::clone(&runtime_bundle)),
+        )?;
+        Self::spawn_control_api_endpoint(config, shared_state, Some(runtime_bundle), worker_count)?;
+        Ok(())
+    }
+
+    pub(super) fn spawn_generation_background_tasks(
+        config: &RuntimeConfig,
+        shared_state: &SharedRuntimeState,
+    ) {
+        shared_state.watchdog.set_expected_workers(
+            config
+                .policies
+                .transport
+                .worker_threads
+                .max(1)
+                .saturating_mul(config.policies.transport.packet_shards_per_worker.max(1))
+                .max(1),
+        );
+        let task_registry = Arc::clone(&shared_state.generation_tasks);
+        Self::spawn_backend_dns_refresh(
+            config,
+            Arc::clone(&shared_state.transport_pool),
+            Arc::clone(&shared_state.backend_resolution_store),
+            shared_state.backend_dns_resolver.clone(),
+            Arc::clone(&shared_state.metrics),
+            Arc::clone(&task_registry),
+        );
+        Self::spawn_health_checks(
+            shared_state.upstream_pools.clone(),
+            Arc::clone(&shared_state.transport_pool),
+            Arc::clone(&shared_state.backend_endpoints),
+            Arc::clone(&shared_state.backend_health_checks),
+            Arc::clone(&shared_state.backend_resolution_store),
+            Arc::clone(&shared_state.metrics),
+            Arc::clone(&task_registry),
+        );
+        Self::spawn_watchdog(
+            config,
+            Arc::clone(&shared_state.metrics),
+            Arc::clone(&shared_state.resilience),
+            Arc::clone(&shared_state.watchdog),
+            task_registry,
+        );
+    }
+
+    pub fn bind_reuseport_sockets(
+        config: &ListenerRuntimeConfig,
+        workers: usize,
+    ) -> Result<Vec<UdpSocket>, ProxyError> {
+        let workers = workers.max(1);
+        let mut sockets = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            sockets.push(Self::bind_socket(config, true)?);
+        }
+        Ok(sockets)
+    }
+
+    pub fn bind_socket(
+        config: &ListenerRuntimeConfig,
+        reuse_port: bool,
+    ) -> Result<UdpSocket, ProxyError> {
+        let bind_addr = Self::resolve_bind_addr(config)?;
+        let transport_policy = &config.policies.transport;
+        let socket = Self::create_udp_socket(
+            bind_addr,
+            reuse_port,
+            transport_policy.udp_recv_buffer_bytes,
+            transport_policy.udp_send_buffer_bytes,
+        )?;
+        socket
+            .set_read_timeout(Some(Duration::from_millis(UDP_READ_TIMEOUT_MS)))
+            .map_err(|err| {
+                ProxyError::Transport(format!("failed to set UDP read timeout: {}", err))
+            })?;
+
+        Ok(socket)
+    }
+
+    pub fn new_with_socket_and_shared_state(
+        config: ListenerRuntimeConfig,
+        socket: UdpSocket,
+        shared_state: Arc<SharedRuntimeState>,
+    ) -> Result<Self, ProxyError> {
+        let local_addr = socket.local_addr().map_err(|err| {
+            ProxyError::Transport(format!("failed to read UDP socket local address: {}", err))
+        })?;
+        debug!("Listening on {}", local_addr);
+
+        let listener_label = Self::listener_label(&config);
+        let listener_tls_store = Arc::clone(&shared_state.listener_tls_store);
+        let tls_reload_generation =
+            listener_tls_store
+                .generation(&listener_label)
+                .ok_or_else(|| {
+                    ProxyError::Transport(format!(
+                        "missing TLS reload state for listener '{}'",
+                        listener_label
+                    ))
+                })?;
+        let quic_config = Self::build_quic_config(&config)?;
+        let h3_config = Arc::new({
+            let mut config = quiche::h3::Config::new().map_err(|err| {
+                ProxyError::Transport(format!("failed to create h3 config: {err}"))
+            })?;
+            config.enable_extended_connect(true);
+            config
+        });
+        let settings = Self::listener_runtime_settings(&config);
+        let require_client_cert = Self::runtime_listener_tls(&config)?
+            .client_auth
+            .require_client_cert;
+        let conn_rate_limiter = TokenBucket::new(
+            settings.new_connections_per_sec,
+            settings.new_connections_burst,
+        );
+
+        Ok(Self {
+            socket,
+            local_addr,
+            config,
+            listener_label,
+            listener_tls_store,
+            tls_reload_generation,
+            quic_config,
+            h3_config,
+            transport_pool: Arc::clone(&shared_state.transport_pool),
+            backend_endpoints: Arc::clone(&shared_state.backend_endpoints),
+            backend_resolution_store: Arc::clone(&shared_state.backend_resolution_store),
+            backend_dns_resolver: shared_state.backend_dns_resolver.clone(),
+            upstream_policies: Arc::clone(&shared_state.upstream_policies),
+            upstream_pools: shared_state.upstream_pools.clone(),
+            upstream_inflight: shared_state.upstream_inflight.clone(),
+            global_inflight: Arc::clone(&shared_state.global_inflight),
+            routing_index: Arc::clone(&shared_state.routing_index),
+            metrics: Arc::clone(&shared_state.metrics),
+            resilience: Arc::clone(&shared_state.resilience),
+            watchdog: Arc::clone(&shared_state.watchdog),
+            draining: false,
+            drain_start: None,
+            watchdog_worker_drained: false,
+            drain_timeout: settings.drain_timeout,
+            backend_timeout: settings.backend_timeout,
+            backend_body_idle_timeout: settings.backend_body_idle_timeout,
+            backend_body_total_timeout: settings.backend_body_total_timeout,
+            client_body_idle_timeout: settings.client_body_idle_timeout,
+            backend_total_request_timeout: settings.backend_total_request_timeout,
+            inflight_acquire_wait: settings.inflight_acquire_wait,
+            max_active_connections: settings.max_active_connections,
+            max_streams_per_connection: settings.max_streams_per_connection,
+            max_request_body_bytes: settings.max_request_body_bytes,
+            max_response_body_bytes: settings.max_response_body_bytes,
+            request_buffer_global_cap_bytes: settings.request_buffer_global_cap_bytes,
+            unknown_length_response_prebuffer_bytes: settings
+                .unknown_length_response_prebuffer_bytes,
+            require_client_cert,
+            runtime_bundle: None,
+            runtime_generation: 0,
+            recv_buf: Box::new([0; crate::constants::MAX_DATAGRAM_SIZE_BYTES]),
+            send_buf: Box::new([0; crate::constants::MAX_DATAGRAM_SIZE_BYTES]),
+            connections: HashMap::new(),
+            cid_routes: HashMap::new(),
+            peer_routes: HashMap::new(),
+            cid_radix: crate::cid_radix::CidRadix::new(),
+            conn_rate_limiter,
+        })
+    }
+
+    pub fn with_runtime_bundle(mut self, runtime_bundle: Arc<RuntimeBundleHandle>) -> Self {
+        self.runtime_generation = runtime_bundle.generation();
+        self.runtime_bundle = Some(runtime_bundle);
+        self
+    }
+
+    fn resolve_bind_addr(config: &ListenerRuntimeConfig) -> Result<SocketAddr, ProxyError> {
+        let socket_address = format!(
+            "{}:{}",
+            config.listen.listen.address, config.listen.listen.port
+        );
+        socket_address
+            .to_socket_addrs()
+            .map_err(|err| {
+                ProxyError::Transport(format!(
+                    "failed to resolve listen address '{}': {}",
+                    socket_address, err
+                ))
+            })?
+            .next()
+            .ok_or_else(|| {
+                ProxyError::Transport(format!("no socket addresses found for '{socket_address}'"))
+            })
+    }
+
+    fn create_udp_socket(
+        bind_addr: SocketAddr,
+        reuse_port: bool,
+        udp_recv_buffer_bytes: usize,
+        udp_send_buffer_bytes: usize,
+    ) -> Result<UdpSocket, ProxyError> {
+        let domain = if bind_addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).map_err(|err| {
+            ProxyError::Transport(format!("failed to create UDP socket: {}", err))
+        })?;
+        socket
+            .set_reuse_address(true)
+            .map_err(|err| ProxyError::Transport(format!("failed to set SO_REUSEADDR: {}", err)))?;
+        socket
+            .set_recv_buffer_size(udp_recv_buffer_bytes)
+            .map_err(|err| {
+                ProxyError::Transport(format!(
+                    "failed to set UDP recv buffer size ({}): {}",
+                    udp_recv_buffer_bytes, err
+                ))
+            })?;
+        socket
+            .set_send_buffer_size(udp_send_buffer_bytes)
+            .map_err(|err| {
+                ProxyError::Transport(format!(
+                    "failed to set UDP send buffer size ({}): {}",
+                    udp_send_buffer_bytes, err
+                ))
+            })?;
+
+        #[cfg(all(
+            unix,
+            not(target_os = "solaris"),
+            not(target_os = "illumos"),
+            not(target_os = "cygwin")
+        ))]
+        {
+            socket.set_reuse_port(reuse_port).map_err(|err| {
+                ProxyError::Transport(format!("failed to set SO_REUSEPORT: {}", err))
+            })?;
+        }
+
+        socket.bind(&bind_addr.into()).map_err(|err| {
+            ProxyError::Transport(format!(
+                "failed to bind UDP socket on '{}': {}",
+                bind_addr, err
+            ))
+        })?;
+
+        match (socket.recv_buffer_size(), socket.send_buffer_size()) {
+            (Ok(actual_recv), Ok(actual_send)) => {
+                debug!(
+                    "UDP socket buffers on {}: recv={} (requested={}) send={} (requested={}) reuseport={}",
+                    bind_addr,
+                    actual_recv,
+                    udp_recv_buffer_bytes,
+                    actual_send,
+                    udp_send_buffer_bytes,
+                    reuse_port
+                );
+            }
+            _ => {
+                debug!(
+                    "UDP socket bound on {} with requested buffers recv={} send={} reuseport={}",
+                    bind_addr, udp_recv_buffer_bytes, udp_send_buffer_bytes, reuse_port
+                );
+            }
+        }
+
+        Ok(socket.into())
+    }
+}

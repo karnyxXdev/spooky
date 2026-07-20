@@ -6,6 +6,10 @@ use std::{
 use log::{debug, error, info, warn};
 
 use super::*;
+use crate::runtime::backend::{
+    event::{BackendLifecycleMutation, BackendRefreshOutcome},
+    lifecycle::RuntimeBackendLifecycleState,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BackendDnsRefreshOutcome {
@@ -51,7 +55,7 @@ impl QUICListener {
             return;
         }
 
-        if backend_resolution_store.hostname_entries().is_empty() {
+        if backend_resolution_store.hostname_backends().is_empty() {
             debug!("backend DNS refresh disabled: no hostname-based backends configured");
             return;
         }
@@ -84,7 +88,7 @@ impl QUICListener {
 
                 loop {
                     ticker.tick().await;
-                    for backend in backend_resolution_store.hostname_entries() {
+                    for backend in backend_resolution_store.hostname_backends() {
                         match refresh_backend_hostname(
                             &backend,
                             &transport_pool,
@@ -178,20 +182,20 @@ impl QUICListener {
 }
 
 async fn refresh_backend_hostname(
-    backend: &RuntimeBackendResolution,
+    backend: &RuntimeBackendLifecycleState,
     transport_pool: &UpstreamTransportPool,
     backend_resolution_store: &RuntimeBackendResolutionStore,
     backend_dns_resolver: &SharedDnsResolver,
 ) -> BackendDnsRefreshOutcome {
-    let resolved = match tokio::net::lookup_host((backend.authority_host.as_str(), 0)).await {
+    let resolved = match tokio::net::lookup_host((backend.resolution.authority_host.as_str(), 0)).await {
         Ok(addrs) => addrs
-            .map(|addr| SocketAddr::new(addr.ip(), backend.authority_port))
+            .map(|addr| SocketAddr::new(addr.ip(), backend.resolution.authority_port))
             .collect::<Vec<_>>(),
         Err(err) => {
             return BackendDnsRefreshOutcome::LookupFailed {
-                backend_addr: backend.backend_addr.clone(),
-                authority_host: backend.authority_host.clone(),
-                retained_addrs: backend.resolved_addrs.clone(),
+                backend_addr: backend.identity.backend_addr.clone(),
+                authority_host: backend.resolution.authority_host.clone(),
+                retained_addrs: backend.resolution.resolved_addrs.clone(),
                 error: err.to_string(),
             };
         }
@@ -199,60 +203,93 @@ async fn refresh_backend_hostname(
 
     if resolved.is_empty() {
         return BackendDnsRefreshOutcome::EmptyAnswerRetained {
-            backend_addr: backend.backend_addr.clone(),
-            authority_host: backend.authority_host.clone(),
-            retained_addrs: backend.resolved_addrs.clone(),
+            backend_addr: backend.identity.backend_addr.clone(),
+            authority_host: backend.resolution.authority_host.clone(),
+            retained_addrs: backend.resolution.resolved_addrs.clone(),
         };
     }
 
     let refreshed_at = SystemTime::now();
-    let Some(update) = backend_resolution_store.update_hostname_resolution(
-        &backend.backend_addr,
+    let Some(mutation) = backend_resolution_store.apply_resolution_refresh(
+        &backend.identity.backend_addr,
         resolved.clone(),
         refreshed_at,
     ) else {
         return BackendDnsRefreshOutcome::LookupFailed {
-            backend_addr: backend.backend_addr.clone(),
-            authority_host: backend.authority_host.clone(),
-            retained_addrs: backend.resolved_addrs.clone(),
+            backend_addr: backend.identity.backend_addr.clone(),
+            authority_host: backend.resolution.authority_host.clone(),
+            retained_addrs: backend.resolution.resolved_addrs.clone(),
             error: "hostname backend disappeared from resolution store".to_string(),
         };
     };
 
     let _ = backend_dns_resolver.replace_host_addrs(
-        &backend.authority_host,
+        &backend.resolution.authority_host,
         resolved
             .into_iter()
             .map(|addr| SocketAddr::new(ip_only(addr), 0)),
     );
 
-    let client_rotated = if update.changed() {
+    let BackendLifecycleMutation::ResolutionUpdated { result, .. } = mutation else {
+        return BackendDnsRefreshOutcome::LookupFailed {
+            backend_addr: backend.identity.backend_addr.clone(),
+            authority_host: backend.resolution.authority_host.clone(),
+            retained_addrs: backend.resolution.resolved_addrs.clone(),
+            error: "unexpected backend lifecycle mutation during dns refresh".to_string(),
+        };
+    };
+
+    let client_rotated = if matches!(result.outcome, BackendRefreshOutcome::Updated { .. }) {
         matches!(
-            transport_pool.rotate_backend_client(&update.backend_addr),
+            transport_pool.rotate_backend_client(&result.identity.backend_addr),
             Ok(true)
         )
     } else {
         false
     };
 
-    if update.changed() {
-        BackendDnsRefreshOutcome::Updated {
-            backend_addr: update.backend_addr,
-            authority_host: update.authority_host,
-            previous_addrs: update.previous_addrs,
-            current_addrs: update.current_addrs,
-            generation: update.refresh_generation,
+    match result.outcome {
+        BackendRefreshOutcome::Updated {
+            previous_addrs,
+            current_addrs,
             refreshed_at,
+            refresh_generation,
+        } => BackendDnsRefreshOutcome::Updated {
+            backend_addr: result.identity.backend_addr,
+            authority_host: backend.resolution.authority_host.clone(),
+            previous_addrs,
+            current_addrs,
+            generation: refresh_generation,
+            refreshed_at: refreshed_at.unwrap_or_else(SystemTime::now),
             client_rotated,
-        }
-    } else {
-        BackendDnsRefreshOutcome::Unchanged {
-            backend_addr: update.backend_addr,
-            authority_host: update.authority_host,
-            current_addrs: update.current_addrs,
-            generation: update.refresh_generation,
+        },
+        BackendRefreshOutcome::Unchanged {
+            current_addrs,
             refreshed_at,
+            refresh_generation,
+        } => BackendDnsRefreshOutcome::Unchanged {
+            backend_addr: result.identity.backend_addr,
+            authority_host: backend.resolution.authority_host.clone(),
+            current_addrs,
+            generation: refresh_generation,
+            refreshed_at: refreshed_at.unwrap_or_else(SystemTime::now),
+        },
+        BackendRefreshOutcome::EmptyAnswerRetained { retained_addrs } => {
+            BackendDnsRefreshOutcome::EmptyAnswerRetained {
+                backend_addr: result.identity.backend_addr,
+                authority_host: backend.resolution.authority_host.clone(),
+                retained_addrs,
+            }
         }
+        BackendRefreshOutcome::LookupFailed {
+            retained_addrs,
+            error,
+        } => BackendDnsRefreshOutcome::LookupFailed {
+            backend_addr: result.identity.backend_addr,
+            authority_host: backend.resolution.authority_host.clone(),
+            retained_addrs,
+            error,
+        },
     }
 }
 

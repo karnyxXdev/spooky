@@ -65,7 +65,7 @@ use crate::{
     resilience::runtime::RuntimeResilience,
     routing::{decision::RouteDecisionReason, index::RouteIndex},
     runtime::{
-        backend::{resolution::RuntimeBackendResolution, store::RuntimeBackendResolutionStore},
+        backend::store::RuntimeBackendResolutionStore,
         bundle::{RuntimeBundle, RuntimeBundleHandle},
         connection::{
             guardrails::{

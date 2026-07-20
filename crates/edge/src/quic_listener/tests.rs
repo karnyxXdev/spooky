@@ -775,19 +775,19 @@ fn build_shared_state_separates_backend_identity_from_resolution_state() {
     let dns_backend = snapshot
         .get("backend.internal:8443")
         .expect("dns backend resolution");
-    assert!(dns_backend.is_hostname());
-    assert_eq!(dns_backend.authority_host, "backend.internal");
-    assert_eq!(dns_backend.authority_port, 8443);
-    assert!(dns_backend.resolved_addrs.is_empty());
+    assert!(dns_backend.resolution.is_hostname());
+    assert_eq!(dns_backend.resolution.authority_host, "backend.internal");
+    assert_eq!(dns_backend.resolution.authority_port, 8443);
+    assert!(dns_backend.resolution.resolved_addrs.is_empty());
 
     let ip_backend = snapshot
         .get("10.0.0.10:9443")
         .expect("ip backend resolution");
-    assert!(!ip_backend.is_hostname());
-    assert_eq!(ip_backend.authority_host, "10.0.0.10");
-    assert_eq!(ip_backend.authority_port, 9443);
+    assert!(!ip_backend.resolution.is_hostname());
+    assert_eq!(ip_backend.resolution.authority_host, "10.0.0.10");
+    assert_eq!(ip_backend.resolution.authority_port, 9443);
     assert_eq!(
-        ip_backend.resolved_addrs,
+        ip_backend.resolution.resolved_addrs,
         vec!["10.0.0.10:9443".parse().expect("addr")]
     );
 }

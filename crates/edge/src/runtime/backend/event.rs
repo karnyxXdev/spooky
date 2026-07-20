@@ -23,7 +23,7 @@ pub enum BackendLifecycleMutation {
     ResolutionUpdated {
         identity: BackendIdentity,
         state: BackendResolutionState,
-        changed: bool,
+        result: BackendRefreshResult,
     },
     HealthUpdated {
         identity: BackendIdentity,

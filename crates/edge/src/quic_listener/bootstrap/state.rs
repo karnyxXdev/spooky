@@ -54,16 +54,18 @@ pub(in crate::quic_listener) fn build_bootstrap_startup_state(
     config: &ListenerRuntimeConfig,
     shared_state: &SharedRuntimeState,
 ) -> BootstrapStartupState {
+    let shared = shared_state.shared_services();
+    let generation = shared_state.generation_state();
     BootstrapStartupState {
         listener_config: config.clone(),
-        listener_tls_store: Arc::clone(&shared_state.listener_tls_store),
-        transport_pool: Arc::clone(&shared_state.transport_pool),
-        backend_endpoints: Arc::clone(&shared_state.backend_endpoints),
-        upstream_policies: Arc::clone(&shared_state.upstream_policies),
-        metrics: Arc::clone(&shared_state.metrics),
-        resilience: Arc::clone(&shared_state.resilience),
-        upstream_pools: shared_state.upstream_pools.clone(),
-        routing_index: Arc::clone(&shared_state.routing_index),
+        listener_tls_store: Arc::clone(&shared.listener_tls_store),
+        transport_pool: Arc::clone(&shared.transport_pool),
+        backend_endpoints: Arc::clone(&generation.backend_endpoints),
+        upstream_policies: Arc::clone(&generation.upstream_policies),
+        metrics: Arc::clone(&shared.metrics),
+        resilience: Arc::clone(&generation.resilience),
+        upstream_pools: generation.upstream_pools.clone(),
+        routing_index: Arc::clone(&generation.routing_index),
     }
 }
 
@@ -83,17 +85,19 @@ pub(in crate::quic_listener) fn bootstrap_connection_state(
         upstream_pools,
         routing_index,
     ) = if let Some(handle) = runtime_bundle {
-        let runtime = handle.current();
+        let runtime = handle.current_view();
+        let shared = runtime.shared_services();
+        let generation = runtime.state();
         (
             runtime.listener_runtime_config(listener_label)?,
-            runtime.shared_state.listener_tls_store.clone(),
-            runtime.shared_state.transport_pool.clone(),
-            runtime.shared_state.backend_endpoints.clone(),
-            runtime.shared_state.upstream_policies.clone(),
-            runtime.shared_state.metrics.clone(),
-            runtime.shared_state.resilience.clone(),
-            runtime.shared_state.upstream_pools.clone(),
-            runtime.shared_state.routing_index.clone(),
+            shared.listener_tls_store.clone(),
+            shared.transport_pool.clone(),
+            generation.backend_endpoints.clone(),
+            generation.upstream_policies.clone(),
+            shared.metrics.clone(),
+            generation.resilience.clone(),
+            generation.upstream_pools.clone(),
+            generation.routing_index.clone(),
         )
     } else {
         (

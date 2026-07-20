@@ -353,6 +353,7 @@ fn listener_tls_reload_store_refreshes_inventory_and_generation() {
     let shared = super::QUICListener::build_shared_state(&runtime).expect("shared state");
     let listener_label = "127.0.0.1:0";
     let initial_inventory = shared
+        .shared_services()
         .listener_tls_store
         .inventory(listener_label)
         .expect("initial inventory");
@@ -362,19 +363,24 @@ fn listener_tls_reload_store_refreshes_inventory_and_generation() {
         .serial_hex
         .clone();
     assert_eq!(
-        shared.listener_tls_store.generation(listener_label),
+        shared
+            .shared_services()
+            .listener_tls_store
+            .generation(listener_label),
         Some(0)
     );
 
     let (_rotated_cert, _rotated_key) =
         write_test_cert_for_name(dir.path(), "server", "api.example.com");
     let listener_config = shared
+        .generation_state()
         .listener_runtime_configs
         .get(listener_label)
         .expect("listener runtime config");
     let reloaded_state = super::QUICListener::build_listener_tls_reload_state(listener_config)
         .expect("reloaded tls state");
     let generation = shared
+        .shared_services()
         .listener_tls_store
         .replace_listener(
             listener_label,
@@ -385,6 +391,7 @@ fn listener_tls_reload_store_refreshes_inventory_and_generation() {
     assert_eq!(generation, 1);
 
     let refreshed_inventory = shared
+        .shared_services()
         .listener_tls_store
         .inventory(listener_label)
         .expect("refreshed inventory");
@@ -411,7 +418,7 @@ fn quic_listener_syncs_tls_generation_after_reload() {
         super::QUICListener::tls_reload_generation_if_needed(
             &listener_label,
             0,
-            &shared.listener_tls_store
+            &shared.shared_services().listener_tls_store
         )
         .expect("initial generation"),
         None
@@ -422,6 +429,7 @@ fn quic_listener_syncs_tls_generation_after_reload() {
     let reloaded_state = super::QUICListener::build_listener_tls_reload_state(&listener_config)
         .expect("reloaded tls state");
     shared
+        .shared_services()
         .listener_tls_store
         .replace_listener(
             &listener_label,
@@ -434,7 +442,7 @@ fn quic_listener_syncs_tls_generation_after_reload() {
         super::QUICListener::tls_reload_generation_if_needed(
             &listener_label,
             0,
-            &shared.listener_tls_store
+            &shared.shared_services().listener_tls_store
         )
         .expect("reloaded generation"),
         Some(1)
@@ -452,17 +460,19 @@ fn bootstrap_connection_state_prefers_reloaded_runtime_settings() {
         .expect("startup listener config");
     let startup_shared =
         Arc::new(super::QUICListener::build_shared_state(&startup_runtime).expect("shared"));
+    let startup_services = startup_shared.shared_services();
+    let startup_generation = startup_shared.generation_state();
     let listener_label = super::QUICListener::listener_label(&startup_listener_config);
     let startup_state = super::BootstrapStartupState {
         listener_config: startup_listener_config.clone(),
-        listener_tls_store: Arc::clone(&startup_shared.listener_tls_store),
-        transport_pool: Arc::clone(&startup_shared.transport_pool),
-        backend_endpoints: Arc::clone(&startup_shared.backend_endpoints),
-        upstream_policies: Arc::clone(&startup_shared.upstream_policies),
-        metrics: Arc::clone(&startup_shared.metrics),
-        resilience: Arc::clone(&startup_shared.resilience),
-        upstream_pools: startup_shared.upstream_pools.clone(),
-        routing_index: Arc::clone(&startup_shared.routing_index),
+        listener_tls_store: Arc::clone(&startup_services.listener_tls_store),
+        transport_pool: Arc::clone(&startup_services.transport_pool),
+        backend_endpoints: Arc::clone(&startup_generation.backend_endpoints),
+        upstream_policies: Arc::clone(&startup_generation.upstream_policies),
+        metrics: Arc::clone(&startup_services.metrics),
+        resilience: Arc::clone(&startup_generation.resilience),
+        upstream_pools: startup_generation.upstream_pools.clone(),
+        routing_index: Arc::clone(&startup_generation.routing_index),
     };
 
     let mut reloaded = startup.clone();
@@ -507,6 +517,7 @@ fn metrics_endpoint_state_prefers_reloaded_runtime_settings() {
     let startup_runtime = RuntimeConfig::from_config(&startup).expect("startup runtime");
     let startup_shared =
         Arc::new(super::QUICListener::build_shared_state(&startup_runtime).expect("shared"));
+    let startup_metrics = Arc::clone(&startup_shared.shared_services().metrics);
 
     let mut reloaded = startup.clone();
     reloaded.observability.metrics.enabled = true;
@@ -523,17 +534,23 @@ fn metrics_endpoint_state_prefers_reloaded_runtime_settings() {
     .expect("reloaded bundle");
     let runtime_handle = Arc::new(super::RuntimeBundleHandle::new(reloaded_bundle));
 
-    let state = super::QUICListener::metrics_endpoint_state(
+    let state = super::QUICListener::current_metrics_endpoint_state(
         Some(&runtime_handle),
-        "/metrics-startup".to_string(),
-        5,
-        Duration::from_millis(500),
-        Arc::clone(&startup_shared.metrics),
+        &super::metrics_endpoint::MetricsEndpointState {
+            endpoint: spooky_config::config::MetricsEndpoint {
+                enabled: true,
+                path: "/metrics-startup".to_string(),
+                max_connections: 5,
+                connection_timeout_ms: 500,
+                ..Default::default()
+            },
+            metrics: startup_metrics,
+        },
     );
 
-    assert_eq!(state.metrics_path, "/metrics-live");
-    assert_eq!(state.max_connections, 29);
-    assert_eq!(state.connection_timeout, Duration::from_millis(3456));
+    assert_eq!(state.endpoint.path, "/metrics-live");
+    assert_eq!(state.endpoint.max_connections, 29);
+    assert_eq!(state.endpoint.connection_timeout_ms, 3456);
 }
 
 #[test]
@@ -753,7 +770,7 @@ fn build_shared_state_separates_backend_identity_from_resolution_state() {
     let runtime =
         RuntimeConfig::from_config(&dns_resolution_test_config(cert, key)).expect("runtime");
     let shared = super::QUICListener::build_shared_state(&runtime).expect("shared state");
-    let snapshot = shared.backend_resolution_store.snapshot();
+    let snapshot = shared.shared_services().backend_resolution_store.snapshot();
 
     let dns_backend = snapshot
         .get("backend.internal:8443")

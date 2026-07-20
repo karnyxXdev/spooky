@@ -47,6 +47,7 @@ pub(in crate::quic_listener) fn prepare_bootstrap_listener_startup(
     let connection_timeout = timeout_policy.client_body_idle;
     let listener_label = QUICListener::listener_label(config);
     shared_state
+        .shared_services()
         .listener_tls_store
         .bootstrap_server_config(&listener_label)
         .ok_or_else(|| {

@@ -98,6 +98,8 @@ fn control_api_state_with_runtime_bundle(
 ) -> ControlApiState {
     let startup_bundle = runtime_bundle_from_config("startup.yaml", startup);
     let reloaded_bundle = runtime_bundle_from_config("reloaded.yaml", reloaded);
+    let startup_shared = startup_bundle.shared_state.shared_services();
+    let startup_generation = startup_bundle.shared_state.generation_state();
     let listener_config = startup_bundle
         .runtime_config
         .primary_listener_runtime_config()
@@ -109,12 +111,12 @@ fn control_api_state_with_runtime_bundle(
             .observability
             .control_api
             .clone(),
-        metrics: Arc::clone(&startup_bundle.shared_state.metrics),
-        resilience: Arc::clone(&startup_bundle.shared_state.resilience),
-        watchdog: Arc::clone(&startup_bundle.shared_state.watchdog),
-        upstream_pools: startup_bundle.shared_state.upstream_pools.clone(),
-        listener_runtime_configs: Arc::clone(&startup_bundle.shared_state.listener_runtime_configs),
-        listener_tls_store: Arc::clone(&startup_bundle.shared_state.listener_tls_store),
+        metrics: Arc::clone(&startup_shared.metrics),
+        resilience: Arc::clone(&startup_generation.resilience),
+        watchdog: Arc::clone(&startup_shared.watchdog),
+        upstream_pools: startup_generation.upstream_pools.clone(),
+        listener_runtime_configs: Arc::clone(&startup_generation.listener_runtime_configs),
+        listener_tls_store: Arc::clone(&startup_shared.listener_tls_store),
         primary_listener_label: QUICListener::listener_label(&listener_config),
         expected_workers: 1,
         started_at: Instant::now(),
@@ -125,6 +127,8 @@ fn control_api_state_with_runtime_bundle(
 fn runtime_bundle_control_api_state(
     bundle: RuntimeBundle,
 ) -> (ControlApiState, Arc<RuntimeBundleHandle>) {
+    let bundle_shared = bundle.shared_state.shared_services();
+    let bundle_generation = bundle.shared_state.generation_state();
     let listener_config = bundle
         .runtime_config
         .primary_listener_runtime_config()
@@ -132,12 +136,12 @@ fn runtime_bundle_control_api_state(
     let runtime_handle = Arc::new(RuntimeBundleHandle::new(bundle.clone()));
     let state = ControlApiState {
         control_api: bundle.runtime_config.observability.control_api.clone(),
-        metrics: Arc::clone(&bundle.shared_state.metrics),
-        resilience: Arc::clone(&bundle.shared_state.resilience),
-        watchdog: Arc::clone(&bundle.shared_state.watchdog),
-        upstream_pools: bundle.shared_state.upstream_pools.clone(),
-        listener_runtime_configs: Arc::clone(&bundle.shared_state.listener_runtime_configs),
-        listener_tls_store: Arc::clone(&bundle.shared_state.listener_tls_store),
+        metrics: Arc::clone(&bundle_shared.metrics),
+        resilience: Arc::clone(&bundle_generation.resilience),
+        watchdog: Arc::clone(&bundle_shared.watchdog),
+        upstream_pools: bundle_generation.upstream_pools.clone(),
+        listener_runtime_configs: Arc::clone(&bundle_generation.listener_runtime_configs),
+        listener_tls_store: Arc::clone(&bundle_shared.listener_tls_store),
         primary_listener_label: QUICListener::listener_label(&listener_config),
         expected_workers: 1,
         started_at: Instant::now(),
@@ -260,6 +264,46 @@ fn control_api_state_uses_live_primary_listener_label_after_runtime_swap() {
     assert_eq!(
         state.current_primary_listener_label().as_deref(),
         Some("127.0.0.1:9890")
+    );
+}
+
+#[test]
+fn control_api_state_sees_the_active_runtime_generation_after_bundle_replace() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+    let mut startup = test_config(cert.clone(), key.clone());
+    startup.observability.control_api.enabled = true;
+    startup.observability.control_api.runtime_path = "/runtime-startup".to_string();
+
+    let startup_bundle = runtime_bundle_from_config("startup.yaml", &startup);
+    let (state, runtime_handle) = runtime_bundle_control_api_state(startup_bundle);
+
+    let current = state.current_generation().expect("current generation");
+    assert_eq!(current.generation(), 0);
+    assert_eq!(
+        state.current_paths().runtime_path,
+        "/runtime-startup".to_string()
+    );
+
+    let mut reloaded = startup.clone();
+    reloaded.observability.control_api.runtime_path = "/runtime-reloaded".to_string();
+    reloaded.observability.metrics.path = "/metrics-reloaded".to_string();
+
+    let mut reloaded_bundle = runtime_bundle_from_config("reloaded.yaml", &reloaded);
+    reloaded_bundle.generation = 1;
+    runtime_handle
+        .replace(reloaded_bundle)
+        .expect("replace runtime bundle");
+
+    let current = state.current_generation().expect("reloaded generation");
+    assert_eq!(current.generation(), 1);
+    assert_eq!(
+        current.runtime_config().observability.metrics.path,
+        "/metrics-reloaded"
+    );
+    assert_eq!(
+        state.current_paths().runtime_path,
+        "/runtime-reloaded".to_string()
     );
 }
 
@@ -502,8 +546,9 @@ async fn runtime_bundle_cert_reload_ignores_unrelated_config_drift_and_bundle_sw
     drifted.performance.control_plane_threads =
         live.performance.control_plane_threads.saturating_add(1);
     let drifted_bundle = runtime_bundle_from_config("drifted.yaml", &drifted);
+    let current_runtime = runtime_handle.current_view();
     let full_reload_issues = QUICListener::validate_startup_owned_reload_compatibility(
-        runtime_handle.current().as_ref(),
+        current_runtime.bundle(),
         &drifted_bundle,
     );
     assert!(
@@ -513,26 +558,18 @@ async fn runtime_bundle_cert_reload_ignores_unrelated_config_drift_and_bundle_sw
         "expected a full reload blocker from on-disk drift, got: {full_reload_issues:?}"
     );
 
-    let generation_before = runtime_handle.generation();
-    let tls_generation_before = runtime_handle
-        .current()
-        .shared_state
+    let generation_before = runtime_handle.current_generation();
+    let live_runtime = runtime_handle.current_view();
+    let tls_generation_before = live_runtime
+        .shared_services()
         .listener_tls_store
         .generation(&state.primary_listener_label)
         .unwrap_or(0);
 
     let response = QUICListener::reload_listener_certs(
-        runtime_handle
-            .current()
-            .shared_state
-            .listener_runtime_configs
-            .as_ref(),
-        runtime_handle
-            .current()
-            .shared_state
-            .listener_tls_store
-            .as_ref(),
-        runtime_handle.current().shared_state.metrics.as_ref(),
+        live_runtime.state().listener_runtime_configs.as_ref(),
+        live_runtime.shared_services().listener_tls_store.as_ref(),
+        live_runtime.shared_services().metrics.as_ref(),
     );
     assert_eq!(response.status(), StatusCode::ACCEPTED);
 
@@ -545,15 +582,15 @@ async fn runtime_bundle_cert_reload_ignores_unrelated_config_drift_and_bundle_sw
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("response json");
     assert_eq!(payload["reloaded"], serde_json::Value::Bool(true));
 
-    let current_runtime = runtime_handle.current();
-    assert_eq!(current_runtime.generation, generation_before);
+    let current_runtime = runtime_handle.current_view();
+    assert_eq!(current_runtime.generation(), generation_before);
     assert_eq!(
-        current_runtime.runtime_config.observability.metrics.path,
+        current_runtime.runtime_config().observability.metrics.path,
         "/metrics-live"
     );
     assert!(
         current_runtime
-            .shared_state
+            .shared_services()
             .listener_tls_store
             .generation(&state.primary_listener_label)
             .unwrap_or(0)
@@ -594,14 +631,26 @@ async fn reload_listener_certs_is_atomic_when_any_listener_reload_fails() {
     ];
 
     let bundle = runtime_bundle_from_config("current.yaml", &config);
-    let generations_before = bundle.shared_state.listener_tls_store.generations();
+    let generations_before = bundle
+        .shared_state
+        .shared_services()
+        .listener_tls_store
+        .generations();
 
     std::fs::write(&cert2, "not a valid certificate").expect("corrupt cert");
 
     let response = QUICListener::reload_listener_certs(
-        bundle.shared_state.listener_runtime_configs.as_ref(),
-        bundle.shared_state.listener_tls_store.as_ref(),
-        bundle.shared_state.metrics.as_ref(),
+        bundle
+            .shared_state
+            .generation_state()
+            .listener_runtime_configs
+            .as_ref(),
+        bundle
+            .shared_state
+            .shared_services()
+            .listener_tls_store
+            .as_ref(),
+        bundle.shared_state.shared_services().metrics.as_ref(),
     );
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -615,7 +664,11 @@ async fn reload_listener_certs_is_atomic_when_any_listener_reload_fails() {
     assert_eq!(payload["reloaded"], serde_json::Value::Bool(false));
 
     assert_eq!(
-        bundle.shared_state.listener_tls_store.generations(),
+        bundle
+            .shared_state
+            .shared_services()
+            .listener_tls_store
+            .generations(),
         generations_before
     );
 }

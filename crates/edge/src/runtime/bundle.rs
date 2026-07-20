@@ -1,28 +1,83 @@
-use std::sync::{Arc, RwLock};
-
-use spooky_config::{
-    config::Log,
-    runtime::{ListenerRuntimeConfig, RuntimeConfig},
+use std::{
+    sync::{Arc, RwLock},
+    time::Duration,
 };
+
+use spooky_config::runtime::{ListenerRuntimeConfig, RuntimeConfig};
 use spooky_errors::ProxyError;
 
-use crate::runtime::{shared_state::SharedRuntimeState, tasks::RuntimeTaskRegistry};
+use crate::runtime::{
+    generation::{
+        RuntimeGenerationState, RuntimeGenerationView, RuntimeSharedServices,
+        StartupOwnedRuntimeState,
+    },
+    shared_state::SharedRuntimeState,
+};
 
 #[derive(Clone)]
 pub struct RuntimeBundle {
     pub generation: u64,
-    pub config_path: String,
-    pub log_config: Log,
+    pub startup: StartupOwnedRuntimeState,
     pub runtime_config: RuntimeConfig,
     pub shared_state: Arc<SharedRuntimeState>,
 }
 
 impl RuntimeBundle {
+    pub fn startup(&self) -> &StartupOwnedRuntimeState {
+        &self.startup
+    }
+
+    pub fn generation_view(&self) -> RuntimeGenerationView<'_> {
+        RuntimeGenerationView {
+            generation: self.generation,
+            startup: &self.startup,
+            runtime_config: &self.runtime_config,
+            shared: self.shared_state.shared_services(),
+            state: self.shared_state.generation_state(),
+        }
+    }
+
     pub fn listener_runtime_config(&self, label: &str) -> Option<ListenerRuntimeConfig> {
-        self.shared_state
-            .listener_runtime_configs
-            .get(label)
-            .cloned()
+        self.generation_view().listener_runtime_config(label)
+    }
+}
+
+#[derive(Clone)]
+pub struct ActiveRuntimeGeneration {
+    bundle: Arc<RuntimeBundle>,
+}
+
+impl ActiveRuntimeGeneration {
+    pub fn bundle(&self) -> &RuntimeBundle {
+        self.bundle.as_ref()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.bundle.generation
+    }
+
+    pub fn startup(&self) -> &StartupOwnedRuntimeState {
+        &self.bundle.startup
+    }
+
+    pub fn runtime_config(&self) -> &RuntimeConfig {
+        &self.bundle.runtime_config
+    }
+
+    pub fn shared_services(&self) -> &RuntimeSharedServices {
+        self.bundle.shared_state.shared_services()
+    }
+
+    pub fn state(&self) -> &RuntimeGenerationState {
+        self.bundle.shared_state.generation_state()
+    }
+
+    pub fn view(&self) -> RuntimeGenerationView<'_> {
+        self.bundle.generation_view()
+    }
+
+    pub fn listener_runtime_config(&self, label: &str) -> Option<ListenerRuntimeConfig> {
+        self.bundle.listener_runtime_config(label)
     }
 }
 
@@ -45,21 +100,32 @@ impl RuntimeBundleHandle {
             .unwrap_or_else(|_| panic!("runtime bundle lock poisoned"))
     }
 
-    pub fn generation(&self) -> u64 {
-        self.current().generation
+    pub fn current_view(&self) -> ActiveRuntimeGeneration {
+        ActiveRuntimeGeneration {
+            bundle: self.current(),
+        }
     }
 
-    pub fn replace(
-        &self,
-        bundle: RuntimeBundle,
-    ) -> Result<(u64, Arc<RuntimeTaskRegistry>), ProxyError> {
+    pub fn current_generation(&self) -> u64 {
+        self.current_view().generation()
+    }
+
+    pub fn with_current_generation<R>(&self, f: impl FnOnce(ActiveRuntimeGeneration) -> R) -> R {
+        f(self.current_view())
+    }
+
+    pub fn with_current_view<R>(&self, f: impl FnOnce(RuntimeGenerationView<'_>) -> R) -> R {
+        self.with_current_generation(|current| f(current.view()))
+    }
+
+    pub fn replace(&self, bundle: RuntimeBundle) -> Result<u64, ProxyError> {
         let generation = bundle.generation;
-        let next_tasks = Arc::clone(&bundle.shared_state.generation_tasks);
+        let next_tasks = Arc::clone(&bundle.shared_state.generation_state().generation_tasks);
         let previous = {
             let mut guard = match self.inner.write() {
                 Ok(guard) => guard,
                 Err(_) => {
-                    next_tasks.abort_all();
+                    next_tasks.abort_generation();
                     return Err(ProxyError::Transport(
                         "runtime bundle lock poisoned".to_string(),
                     ));
@@ -67,7 +133,11 @@ impl RuntimeBundleHandle {
             };
             std::mem::replace(&mut *guard, Arc::new(bundle))
         };
-        let retired_tasks = Arc::clone(&previous.shared_state.generation_tasks);
-        Ok((generation, retired_tasks))
+        previous
+            .shared_state
+            .generation_state()
+            .generation_tasks
+            .retire_generation(Duration::from_secs(5));
+        Ok(generation)
     }
 }

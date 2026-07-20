@@ -21,6 +21,7 @@ use crate::{
     runtime::{
         backend::{resolution::RuntimeBackendResolution, store::RuntimeBackendResolutionStore},
         bundle::{RuntimeBundle, RuntimeBundleHandle},
+        generation::{RuntimeGenerationState, RuntimeSharedServices, StartupOwnedRuntimeState},
         listener::QUICListener,
         shared_state::SharedRuntimeState,
         tasks::RuntimeTaskRegistry,
@@ -322,30 +323,34 @@ impl QUICListener {
             Self::update_listener_tls_expiry_metrics(&metrics, &listener_label, &inventory);
         }
 
-        Ok(SharedRuntimeState {
-            listener_runtime_configs: Arc::new(listener_runtime_configs),
-            listener_tls_store,
-            transport_pool,
-            backend_endpoints: Arc::new(backend_endpoints),
-            backend_health_checks: Arc::new(backend_health_checks),
-            backend_resolution_store,
-            backend_dns_resolver,
-            upstream_policies: Arc::new(
-                config
-                    .upstreams
-                    .iter()
-                    .map(|(name, upstream)| (name.clone(), upstream.policy.clone()))
-                    .collect(),
-            ),
-            upstream_pools,
-            upstream_inflight,
-            global_inflight: Arc::new(Semaphore::new(global_inflight_limit)),
-            routing_index,
-            metrics,
-            resilience,
-            watchdog,
-            generation_tasks: Arc::new(RuntimeTaskRegistry::new()),
-        })
+        Ok(SharedRuntimeState::from_parts(
+            RuntimeSharedServices {
+                listener_tls_store,
+                transport_pool,
+                backend_resolution_store,
+                backend_dns_resolver,
+                metrics,
+                watchdog,
+            },
+            RuntimeGenerationState {
+                listener_runtime_configs: Arc::new(listener_runtime_configs),
+                backend_endpoints: Arc::new(backend_endpoints),
+                backend_health_checks: Arc::new(backend_health_checks),
+                upstream_policies: Arc::new(
+                    config
+                        .upstreams
+                        .iter()
+                        .map(|(name, upstream)| (name.clone(), upstream.policy.clone()))
+                        .collect(),
+                ),
+                upstream_pools,
+                upstream_inflight,
+                global_inflight: Arc::new(Semaphore::new(global_inflight_limit)),
+                routing_index,
+                resilience,
+                generation_tasks: Arc::new(RuntimeTaskRegistry::new()),
+            },
+        ))
     }
 
     pub fn build_runtime_bundle(
@@ -356,8 +361,10 @@ impl QUICListener {
         let shared_state = Arc::new(Self::build_shared_state(runtime_config)?);
         Ok(RuntimeBundle {
             generation: 0,
-            config_path,
-            log_config,
+            startup: StartupOwnedRuntimeState {
+                config_path,
+                log_config,
+            },
             runtime_config: runtime_config.clone(),
             shared_state,
         })
@@ -407,7 +414,9 @@ impl QUICListener {
         debug!("Listening on {}", local_addr);
 
         let listener_label = Self::listener_label(&config);
-        let listener_tls_store = Arc::clone(&shared_state.listener_tls_store);
+        let shared_services = shared_state.shared_services();
+        let generation_state = shared_state.generation_state();
+        let listener_tls_store = Arc::clone(&shared_services.listener_tls_store);
         let tls_reload_generation =
             listener_tls_store
                 .generation(&listener_label)
@@ -443,18 +452,18 @@ impl QUICListener {
             tls_reload_generation,
             quic_config,
             h3_config,
-            transport_pool: Arc::clone(&shared_state.transport_pool),
-            backend_endpoints: Arc::clone(&shared_state.backend_endpoints),
-            backend_resolution_store: Arc::clone(&shared_state.backend_resolution_store),
-            backend_dns_resolver: shared_state.backend_dns_resolver.clone(),
-            upstream_policies: Arc::clone(&shared_state.upstream_policies),
-            upstream_pools: shared_state.upstream_pools.clone(),
-            upstream_inflight: shared_state.upstream_inflight.clone(),
-            global_inflight: Arc::clone(&shared_state.global_inflight),
-            routing_index: Arc::clone(&shared_state.routing_index),
-            metrics: Arc::clone(&shared_state.metrics),
-            resilience: Arc::clone(&shared_state.resilience),
-            watchdog: Arc::clone(&shared_state.watchdog),
+            transport_pool: Arc::clone(&shared_services.transport_pool),
+            backend_endpoints: Arc::clone(&generation_state.backend_endpoints),
+            backend_resolution_store: Arc::clone(&shared_services.backend_resolution_store),
+            backend_dns_resolver: shared_services.backend_dns_resolver.clone(),
+            upstream_policies: Arc::clone(&generation_state.upstream_policies),
+            upstream_pools: generation_state.upstream_pools.clone(),
+            upstream_inflight: generation_state.upstream_inflight.clone(),
+            global_inflight: Arc::clone(&generation_state.global_inflight),
+            routing_index: Arc::clone(&generation_state.routing_index),
+            metrics: Arc::clone(&shared_services.metrics),
+            resilience: Arc::clone(&generation_state.resilience),
+            watchdog: Arc::clone(&shared_services.watchdog),
             draining: false,
             drain_start: None,
             watchdog_worker_drained: false,
@@ -485,8 +494,32 @@ impl QUICListener {
         })
     }
 
+    pub fn new_with_socket_and_runtime_bundle(
+        listener_label: &str,
+        socket: UdpSocket,
+        runtime_bundle: Arc<RuntimeBundleHandle>,
+    ) -> Result<Self, ProxyError> {
+        let runtime = runtime_bundle.current_view();
+        let listener_config = runtime
+            .listener_runtime_config(listener_label)
+            .ok_or_else(|| {
+                ProxyError::Transport(format!(
+                    "runtime reload dropped listener '{}'",
+                    listener_label
+                ))
+            })?;
+        let mut listener = Self::new_with_socket_and_shared_state(
+            listener_config,
+            socket,
+            Arc::clone(&runtime.bundle().shared_state),
+        )?;
+        listener.runtime_generation = runtime.generation();
+        listener.runtime_bundle = Some(runtime_bundle);
+        Ok(listener)
+    }
+
     pub fn with_runtime_bundle(mut self, runtime_bundle: Arc<RuntimeBundleHandle>) -> Self {
-        self.runtime_generation = runtime_bundle.generation();
+        self.runtime_generation = runtime_bundle.current_generation();
         self.runtime_bundle = Some(runtime_bundle);
         self
     }
